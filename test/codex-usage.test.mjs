@@ -4,7 +4,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { codexUsage, codexUsageSuffix, recordCodexRun, usageFile } from '../pipeline/lib/codex-usage.mjs';
 
 // scripts/test.mjs points the whole suite at a scratch ledger through the environment; these tests choose their own.
@@ -98,6 +98,6 @@ test('codexUsageSuffix: nothing when no run; "xhigh" only when X > 0', () => {
 });
 
 test('usageFile: PIPELINE_CODEX_USAGE_FILE moves the ledger in a checkout; an injected file wins', () => {
-  assert.equal(usageFile({ env: { PIPELINE_CODEX_USAGE_FILE: '/tmp/x/u.jsonl' } }), '/tmp/x/u.jsonl');
-  assert.equal(usageFile({ file: '/tmp/y/u.jsonl', env: { PIPELINE_CODEX_USAGE_FILE: '/tmp/x/u.jsonl' } }), '/tmp/y/u.jsonl');
+  assert.equal(usageFile({ env: { PIPELINE_CODEX_USAGE_FILE: '/tmp/x/u.jsonl' } }), resolve('/tmp/x/u.jsonl')); // (the file is resolved: on Windows a rooted path gains the current drive)
+  assert.equal(usageFile({ file: '/tmp/y/u.jsonl', env: { PIPELINE_CODEX_USAGE_FILE: '/tmp/x/u.jsonl' } }), resolve('/tmp/y/u.jsonl'));
 });
