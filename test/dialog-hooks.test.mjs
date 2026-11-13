@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { approveDialogHooks, checkDialogHooks, commandTarget, dialogHandlers, dialogHooksFile, hookCheck, matcherMatchesDialog, resolveCommand, tilde } from '../pipeline/hooks/lib/dialog-hooks.mjs';
+import { approveDialogHooks, checkDialogHooks, commandTarget, dialogHandlers, dialogHooksFile, hookCheck, matcherMatchesDialog, resolveCommand, scriptTarget, tilde } from '../pipeline/hooks/lib/dialog-hooks.mjs';
 import { run } from '../pipeline/commands/owner-go.mjs';
 import { toPosix as posix } from '../pipeline/lib/paths.mjs';
 
@@ -537,4 +537,19 @@ test('windows: the display shortens the home to ~/ with forward slashes (case an
   assert.equal(tilde('D:\\elsewhere\\a.mjs', WIN_HOME, 'win32'), 'D:\\elsewhere\\a.mjs');
   assert.equal(tilde('/home/me/.claude/a.mjs', '/home/me', 'linux'), '~/.claude/a.mjs');
   assert.equal(tilde('/home/me2/a.mjs', '/home/me', 'linux'), '/home/me2/a.mjs');
+});
+
+test('#269 R28: a control character in a hook command, or a marker-like character in an args word, is refused: it could pose as the home / plugin-root placeholder', () => {
+  const o = { home: '/h', platform: 'linux', pluginRoot: '/opt/p' };
+  for (const cmd of ['node \u0002/hooks/a.mjs', 'node \u0001HOME\u0001/a.mjs', 'node /x/a.mjs\u0007', 'node /x/a.mjs\nnode /y/b.mjs', 'node "/x/\u001b.mjs"'])
+    assert.equal(commandTarget(cmd, o), null, JSON.stringify(cmd));
+  assert.equal(commandTarget('node \u0002/hooks/a.mjs', { home: '/h', platform: 'linux' }), null);
+  assert.equal(commandTarget('node\t/x/a.mjs', o), '/x/a.mjs'); // a tab is plain whitespace
+  // the args form (no shell): its words never carry markers, so a marker character is refused, not expanded
+  assert.equal(scriptTarget(['node', '\u0002/hooks/a.mjs'], '/h', 'linux', '/opt/p'), null);
+  assert.equal(scriptTarget(['node', '\u0001HOME\u0001/a.mjs'], '/h', 'linux'), null);
+  assert.equal(scriptTarget(['node', '/x/a.mjs'], '/h', 'linux'), '/x/a.mjs');
+  // the markers commandTarget itself puts in still expand
+  assert.equal(commandTarget('node ~/a.mjs', o), '/h/a.mjs');
+  assert.equal(commandTarget('node ${CLAUDE_PLUGIN_ROOT}/hooks/a.mjs', o), '/opt/p/hooks/a.mjs');
 });

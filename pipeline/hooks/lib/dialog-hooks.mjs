@@ -140,21 +140,25 @@ export function resolveCommand(command, opts = {}) {
 // resolveCommand without the look at the file: the script path the command names, or null. (Pure, so the Windows forms can be tested on any machine through `platform`.)
 export function commandTarget(command, { home, pluginRoot = null, platform = process.platform } = {}) {
   if (typeof command !== 'string' || command.trim() === '') return null;
+  if (/[\u0000-\u0008\u000a-\u001f\u007f]/.test(command)) return null; // (#269 R28) a control character could pose as the home / plugin-root markers below: refused
   let text = command.trim();
   // (the install path never passes the shell-word rules: its own separators are the platform's, while anything the author typed after the variable still does; it goes in after the split, like the home folder)
   if (pluginRoot) text = text.replace(/\$\{CLAUDE_PLUGIN_ROOT\}|\$CLAUDE_PLUGIN_ROOT(?![A-Za-z0-9_])/g, () => ROOT_MARK);
   text = text.replace(/\$\{HOME\}|\$HOME(?![A-Za-z0-9_])/g, () => HOME_MARK).replace(/(^|[\s"'])~(?=\/)/g, (_m, lead) => lead + HOME_MARK);
   const w = words(text, !!pluginRoot && /[\s*?[\]{}!#$`&;<>()|'"]/.test(pluginRoot)); // (a $ left after the expansions above is not a home reference: words() refuses it)
-  return scriptTarget(w, home, platform, pluginRoot);
+  return scriptTarget(w, home, platform, pluginRoot, true);
 }
 
 const isFile = (p) => { try { return statSync(p).isFile(); } catch { return false; } };
 
 // The script path a list of words names (see resolveCommand), or null; the file itself is not looked at. A Windows path is normalised (one separator form, so `~/x` + a backslash home gives the same string as path.join).
-export function scriptTarget(w, home, platform = process.platform, pluginRoot = null) {
+export function scriptTarget(w, home, platform = process.platform, pluginRoot = null, marked = false) {
   if (!w || w.length === 0) return null;
   const P = pathOf(platform);
-  const real = (s) => s.replaceAll(HOME_MARK, home).replaceAll(ROOT_MARK, pluginRoot ?? '');
+  // (#269 R28) a word that holds a control character other than through the markers commandTarget put in (an `args` word, or a marker with no plugin root) is refused, never substituted
+  const MARKED = marked ? /\u0001HOME\u0001|\u0002/g : /(?!)/g; // only commandTarget's own words carry markers; `args` words never do
+  if (w.some((s) => typeof s !== 'string' || /[\u0000-\u001f\u007f]/.test(s.replace(MARKED, '')) || (!pluginRoot && s.includes(ROOT_MARK)))) return null;
+  const real = (s) => s.replaceAll(HOME_MARK, home).replaceAll(ROOT_MARK, pluginRoot);
   let target;
   if (INTERPRETERS.includes(w[0])) {
     if (w.length < 2) return null;
