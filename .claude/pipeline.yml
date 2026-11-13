@@ -54,14 +54,12 @@ risk:
   # the commands that read or write a gate input or proof (state, model-floor, verify, ci-wait, plus the risk, hardstops, integrity and
   # preflight wrappers, and the owner-only, command-guard and ci-wait libs they use), the claude-ancestry and branch-protection libs, the
   # comment command, the update command and its schedule lib (the set also covers the owner-only guards: update and the model-floor
-  # reset), and the render (markers, forgery defence), upstream, private-tmp and auto-update libs. A test then checks every file those
-  # named files import DIRECTLY (depth 1, plus finalgate.mjs and review-publish.mjs): each must be matched here, or sit in the test's
-  # DEPTH1_EXEMPT map with a one-line reason it decides no gate, proof, trust or install. The files that check added here (remote-url,
-  # repo, identity, review-lease, queue-sweep, run-events) are NOT themselves checked: their own imports are not followed, depth 1 is
-  # counted from the named set only (issue #356, owner chose the named set 2026-11-13). Only the import closure of risk.mjs is checked
-  # in full. A PR touching one stays high and gets Fable. A NEW file in pipeline/commands/ or a NEW import deeper than depth 1 is NOT
-  # covered automatically (the CLI entry loads commands by name, so no import reaches them): add it here by hand when it decides a gate
-  # or a proof.
+  # reset), and the render (markers, forgery defence), upstream, private-tmp and auto-update libs.
+  # The model is roots, leaves and exemptions (issue #356, owner chose it 2026-11-13). Every LITERAL .mjs path here is a depth-1 ROOT: a test
+  # checks that each file it imports directly is listed here or sits in the test's DEPTH1_EXEMPT map with a true one-line reason. The ones
+  # in the test's DEPTH1_LEAVES set are LEAVES: listed only because a root imports them, their own imports are not followed. Globs are never
+  # roots. Only the import closure of risk.mjs is checked in full. A NEW file in pipeline/commands/ or a NEW import deeper than depth 1 is NOT
+  # covered automatically (the CLI entry loads commands by name): add it here by hand when it decides a gate or a proof.
   high_risk_paths: [
     "pipeline/hooks/**", "pipeline/lib/hardstops.mjs", "pipeline/lib/finalgate.mjs", "install.mjs", "pipeline/lib/installer.mjs",
     "pipeline/lib/risk.mjs", "pipeline/lib/config.mjs", "pipeline/commands/codex-review.mjs", "pipeline/commands/review-complete.mjs",
@@ -87,6 +85,8 @@ risk:
     "pipeline/lib/render.mjs", "pipeline/lib/upstream.mjs", "pipeline/lib/private-tmp.mjs", "pipeline/lib/auto-update.mjs",
     "pipeline/lib/remote-url.mjs", "pipeline/lib/repo.mjs", "pipeline/lib/identity.mjs", "pipeline/lib/review-lease.mjs",
     "pipeline/lib/queue-sweep.mjs", "pipeline/lib/run-events.mjs",
+    "pipeline/lib/run-record.mjs", "pipeline/lib/claude-code-version.mjs", "pipeline/lib/queue-route.mjs", "pipeline/lib/updatebranch.mjs",
+    "pipeline/lib/live-work-scan.mjs", "pipeline/lib/stacks/paths.mjs", "pipeline/lib/stacks/uninstall.mjs", "pipeline/lib/queue-sweep-schedule.mjs",
     "install.sh", "install.ps1"]
   # Every path here is a hard stop (hard_stops.paths ["**"]), so every PR would rate high. These two rules no longer raise the
   # LEVEL (round-1 Codex effort, judge vs Fable); their hits still make the merge an owner item. Editing this file or other
