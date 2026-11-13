@@ -9,9 +9,12 @@
 // not a finite number (a string compares wrongly, NaN never trips) must never quietly downgrade a PR to "low".
 import { diffStats } from './diff.mjs';
 import { matchAny } from './glob.mjs';
-import { DEFAULTS } from './config.mjs';
+import { DEFAULTS, RISK_IGNORABLE_RULES, baseConfigAt } from './config.mjs';
+import { collectHardStops } from './hardstops.mjs';
+import { diffFiles, mergeBase, reviewBaseRef } from './git.mjs';
 
 const LEVELS = ['low', 'medium', 'high'];
+export const SIZE_ONLY_NOTE = 'medium for size only: Sonnet judge (review.size_only_medium_reviewer)';
 const matches = (p, globs) => matchAny(p, globs, { nocase: true });
 
 // A threshold: the config value when given, the default when absent (undefined), a TypeError when present but not finite.
@@ -43,7 +46,25 @@ function thresholds(config) {
   };
 }
 
-// { level: 'low'|'medium'|'high', reasons[], changedLines, fileCount }
+// risk.ignore_hard_stop_rules: hits of these rules do not count toward the level. Only the allowlisted rules are honoured, whatever the config
+// says (config validation refuses the rest; this is the second line of defence), and a list that is not an array of strings is a TypeError.
+// The self-lowering guard: a PR that edits the config that rates it (adds an ignore rule, drops a high-risk path) changes .claude/pipeline.yml,
+// which is an R4-pipeline hit (never ignorable) and so high; and rateBranch also rates under the base branch's committed config, stricter wins.
+function ignoredRules(config) {
+  const rules = globList(config?.risk?.ignore_hard_stop_rules, 'risk.ignore_hard_stop_rules', DEFAULTS.risk.ignore_hard_stop_rules);
+  return rules.filter((r) => RISK_IGNORABLE_RULES.includes(r));
+}
+
+// The hits that count toward the risk level: all of them except the rules risk.ignore_hard_stop_rules lists. Everything else (the hit list, the
+// owner-merge items, the final gate, the light lane) keeps using the raw list.
+export function riskHits(hits, config) {
+  if (!Array.isArray(hits)) throw new TypeError('riskHits: hits must be an array');
+  const ignored = ignoredRules(config);
+  return ignored.length === 0 ? [...hits] : hits.filter((h) => !ignored.includes(h?.rule));
+}
+
+// { level: 'low'|'medium'|'high', reasons[], changedLines, fileCount, drivers: {hardStop, advisory, path, size}, sizeOnly }
+// sizeOnly: the level is medium, size is the only thing that raised it, and the raw hit list is empty (an ignored, report-only or R0 hit all make it false).
 export function assessRisk({ files, hits, config }) {
   if (!Array.isArray(files)) throw new TypeError('assessRisk: files must be an array');
   if (!Array.isArray(hits)) throw new TypeError('assessRisk: hits must be an array');
@@ -61,8 +82,9 @@ export function assessRisk({ files, hits, config }) {
   // report-only hit counts as heavy: a malformed entry must never lower the level.
   const isReportOnly = (h) => h?.advisory === true && h.ownerMerge !== true;
   const rules = (list) => [...new Set(list.map((h) => h?.rule))].join(', ');
-  const heavy = hits.filter((h) => !isReportOnly(h));
-  const reportOnly = hits.filter(isReportOnly);
+  const counted = riskHits(hits, config);
+  const heavy = counted.filter((h) => !isReportOnly(h));
+  const reportOnly = counted.filter(isReportOnly);
   if (heavy.length > 0) {
     raise('high');
     reasons.push(`hard-stop: ${rules(heavy)}`);
@@ -78,21 +100,30 @@ export function assessRisk({ files, hits, config }) {
     reasons.push(`high-risk path: ${listed(riskyPaths)}`);
   }
 
+  let size = false;
   if (changedLines > risk.high_lines) {
     raise('high');
+    size = true;
     reasons.push(`${changedLines} changed lines > ${risk.high_lines}`);
   } else if (changedLines > risk.medium_lines) {
     raise('medium');
+    size = true;
     reasons.push(`${changedLines} changed lines > ${risk.medium_lines}`);
   }
 
   if (fileCount > risk.medium_files) {
     raise('medium');
+    size = true;
     reasons.push(`${fileCount} files > ${risk.medium_files}`);
   }
 
   if (reasons.length === 0) reasons.push('small change');
-  return { level, reasons, changedLines, fileCount };
+  // Said out loud, so the report never hides that hits were discounted.
+  const discounted = hits.filter((h) => !counted.includes(h));
+  if (discounted.length > 0) reasons.push(`ignored hard-stop rules: ${rules(discounted)} (risk.ignore_hard_stop_rules)`);
+  const drivers = { hardStop: heavy.length > 0, advisory: reportOnly.length > 0, path: riskyPaths.length > 0, size };
+  const sizeOnly = level === 'medium' && size && hits.length === 0 && riskyPaths.length === 0;
+  return { level, reasons, changedLines, fileCount, drivers, sizeOnly };
 }
 
 // The light lane skips the arbiter, so it is only for changes that are low risk, hit nothing, and are small.
@@ -115,15 +146,104 @@ export function isSensitivePath(file, config) {
 // Which reviewer follows Codex. `fable`: one Fable pass per round that rules on every Codex item AND reviews the diff itself
 // (agents/arbiter.md), for a medium or high PR or one touching a sensitive path (risk.high_risk_paths or
 // review.arbiter_always_paths, matched like high_risk_paths). `judge`: the Sonnet judge, for everything else.
-// -> { reviewer: 'fable'|'judge', reasons[], sensitivePaths[] }; sensitivePaths also gets Codex its attacker's brief.
-export function reviewLane({ level, files, config }) {
+// A medium PR whose level came from its size alone (`sizeOnly`, assessRisk) with no sensitive path goes to the judge too, unless
+// review.size_only_medium_reviewer is 'fable'. A missing or false sizeOnly keeps Fable (fail toward the stronger reviewer).
+// -> { reviewer: 'fable'|'judge', reasons[], sensitivePaths[], sizeOnlyJudge?: true, note?: string }; sensitivePaths also gets Codex its attacker's brief.
+export function reviewLane({ level, files, config, sizeOnly = false }) {
   if (!LEVELS.includes(level)) throw new TypeError(`reviewLane: level must be one of ${LEVELS.join('|')}`);
   if (!Array.isArray(files)) throw new TypeError('reviewLane: files must be an array');
   const { high_risk_paths: highRisk } = thresholds(config);
   const always = globList(config?.review?.arbiter_always_paths, 'review.arbiter_always_paths', DEFAULTS.review.arbiter_always_paths);
   const sensitivePaths = files.filter((f) => pathsOf(f).some((p) => matches(p, highRisk) || matches(p, always))).map(shownPath);
   const reasons = [];
+  const preference = config?.review?.size_only_medium_reviewer ?? DEFAULTS.review.size_only_medium_reviewer;
+  if (level === 'medium' && sizeOnly === true && sensitivePaths.length === 0 && preference === 'judge') {
+    return { reviewer: 'judge', reasons, sensitivePaths, sizeOnlyJudge: true, note: SIZE_ONLY_NOTE };
+  }
   if (level !== 'low') reasons.push(`${level} risk`);
   if (sensitivePaths.length > 0) reasons.push(`sensitive path: ${listed(sensitivePaths)}`);
   return { reviewer: reasons.length > 0 ? 'fable' : 'judge', reasons, sensitivePaths };
+}
+
+// ---- the whole decision, under the working-tree config AND the trusted base config ------------------------------------------------
+//
+// One shared function for codex-review, review-complete and `pipeline risk`: the hard-stop scan, the level and the lane are worked out twice, once with
+// the working-tree config and once with the config COMMITTED at mergeBase(origin/<default_branch>, head) (never the PR's own base branch), and the
+// stricter result wins on every axis. A PR (committed, staged or unstaged edits of .claude/pipeline.yml) therefore cannot loosen the thresholds, the
+// sensitive paths, the hard-stop paths, the ignore list or the size-only reviewer that rate it. The same config twice is evaluated once. A base config
+// that is missing, unreadable or invalid means the rating cannot be trusted: the reviewer is Fable, whatever the level.
+// A PR whose base branch is not the default branch (a stack) never gets the size-only judge: it is rated from the default branch's fork point by
+// review-complete, and from its own base by codex-review, and the two must agree.
+// `base` (optional) is the ref the diff starts from; it defaults to the trusted fork point (codex-review passes its own, stack-aware, fork point).
+// Throws what the scan throws (the callers decide how to fail closed). -> {
+//   level, reasons, changedLines, fileCount, drivers, sizeOnly, reviewer, laneReasons, sensitivePaths, sizeOnlyJudge, note, hits, files, lightLane,
+//   trustedFork, baseConfig: { ok, reason? }, stacked }
+export async function rateBranch({ root, head, config, defaultBranch = config.default_branch, prBase = defaultBranch, base }) {
+  const o = { cwd: root };
+  const trustedFork = mergeBase(reviewBaseRef(defaultBranch, o), head, o);
+  const from = base ?? trustedFork;
+  const stacked = prBase !== defaultBranch;
+  const trusted = baseConfigAt(trustedFork, root);
+  const sameConfig = trusted.ok && JSON.stringify(trusted.config) === JSON.stringify(config);
+  const configs = [['', config], ...(trusted.ok && !sameConfig ? [['base config: ', trusted.config]] : [])];
+  const files = diffFiles(from, head, o);
+
+  const rated = [];
+  for (const [label, cfg] of configs) {
+    const hits = await collectHardStops({ base: from, head, cwd: root, config: cfg });
+    const risk = assessRisk({ files, hits, config: cfg });
+    const lane = reviewLane({ level: risk.level, files, config: cfg, sizeOnly: risk.sizeOnly && !stacked });
+    const lightLane = isLightLane({ level: risk.level, changedLines: risk.changedLines, hits, config: cfg });
+    rated.push({ label, hits, risk, lane, lightLane });
+  }
+
+  const level = LEVELS[Math.max(...rated.map((r) => LEVELS.indexOf(r.risk.level)))];
+  const ordered = (pick) => {
+    const seen = new Set();
+    const out = [];
+    for (const r of rated) {
+      for (const x of pick(r)) {
+        if (seen.has(x)) continue;
+        seen.add(x);
+        out.push(r.label + x);
+      }
+    }
+    return out;
+  };
+  const reasons = ordered((r) => r.risk.reasons);
+  const laneReasons = ordered((r) => r.lane.reasons);
+  const sizeCandidate = rated.some((r) => r.risk.sizeOnly);
+  if (stacked && sizeCandidate) reasons.push(`stacked PR: base is ${prBase} (no size-only judge)`);
+  if (!trusted.ok) laneReasons.push(`trusted base config unreadable: ${trusted.reason}`);
+  // The collector's own identity (hardstops.mjs makeSink: rule, file, line; the detail when there is no line), and the stricter status
+  // (blocking > ownerMerge > report-only) when both configs report the same hit.
+  const strength = (h) => (h?.advisory !== true ? 2 : h.ownerMerge === true ? 1 : 0);
+  const merged = new Map();
+  for (const h of rated.flatMap((r) => r.hits)) {
+    const key = `${h?.rule}\0${h?.file}\0${h?.line ?? ''}\0${h?.line === undefined ? h?.detail : ''}`;
+    const seen = merged.get(key);
+    if (seen === undefined || strength(h) > strength(seen)) merged.set(key, h);
+  }
+  const hits = [...merged.values()];
+  const sensitivePaths = [...new Set(rated.flatMap((r) => r.lane.sensitivePaths))];
+  // Size alone raised the level in at least one evaluation and every other evaluation is plainly low (no raw hit, no sensitive path): the judge
+  // lane review-complete accepts. A low evaluation next to a size-only medium one (the configs disagree on a threshold) must not deadlock it.
+  const sizeOnly = trusted.ok && !stacked && rated.some((r) => r.risk.sizeOnly)
+    && rated.every((r) => r.risk.sizeOnly || (r.risk.level === 'low' && r.hits.length === 0));
+  // A medium that is not size-only overall (one evaluation's size-only judge lane next to another's low-with-a-hit) is Fable: review-complete
+  // accepts a recorded medium on judge rounds only when sizeOnly is true, so the lane and that check must agree.
+  const mediumNotSizeOnly = level === 'medium' && !sizeOnly;
+  if (mediumNotSizeOnly && !laneReasons.some((x) => x.endsWith('medium risk'))) laneReasons.push('medium risk');
+  const reviewer = !trusted.ok || mediumNotSizeOnly || rated.some((r) => r.lane.reviewer === 'fable') ? 'fable' : 'judge';
+  const sizeOnlyJudge = reviewer === 'judge' && rated.some((r) => r.lane.sizeOnlyJudge === true);
+  const first = rated[0].risk;
+  return {
+    level, reasons, changedLines: first.changedLines, fileCount: first.fileCount,
+    drivers: {
+      hardStop: rated.some((r) => r.risk.drivers.hardStop), advisory: rated.some((r) => r.risk.drivers.advisory),
+      path: rated.some((r) => r.risk.drivers.path), size: rated.some((r) => r.risk.drivers.size),
+    },
+    sizeOnly, reviewer, laneReasons, sensitivePaths, ...(sizeOnlyJudge ? { sizeOnlyJudge: true, note: SIZE_ONLY_NOTE } : {}),
+    hits, files, lightLane: rated.every((r) => r.lightLane), trustedFork, baseConfig: trusted.ok ? { ok: true, same: sameConfig } : { ok: false, reason: trusted.reason }, stacked,
+  };
 }

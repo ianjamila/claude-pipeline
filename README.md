@@ -3,7 +3,7 @@
 A global **build → verify → review → merge → production check** pipeline for Claude Code. Once a
 repo is onboarded, asking Claude to build or fix something runs the build and review unattended: a
 branch and worktree, the change plus tests, a quick local check, a draft pull request, a cross-model
-review loop (Codex finds, a Sonnet judge triages low-risk PRs, a Fable pass rules on and reviews every medium/high-risk or sensitive PR), then CI (the full proof) on the
+review loop (Codex finds, a Sonnet judge triages low-risk PRs (and medium ones that are medium only for their size; `review.size_only_medium_reviewer`), a Fable pass rules on and reviews every other medium/high-risk or sensitive PR. Set `risk.ignore_hard_stop_rules` and `review.size_only_medium_reviewer` only after the installed pipeline is updated AND `pipeline vendor` has re-copied `risk.mjs` and `config.mjs` into the project (older validators reject unknown keys)), then CI (the full proof) on the
 exact commit. You merge: the agent hands you the exact merge request and never merges itself. Nothing reaches `main` without proof, and anything sensitive stops for you.
 
 Design: [`docs/specs/2026-10-01-claude-pipeline-design.md`](docs/specs/2026-10-01-claude-pipeline-design.md) ·
@@ -388,8 +388,9 @@ violations no longer fail CI, the review skill stops before the merge, lists the
 required on top of `ci.required_checks`; `false` only for a repo that does not run `pipeline-guards.yml`), `ci.review_check`
 (default `false`; `true` makes the guards also post `Cross-model review`, green only when the newest review-complete comment
 names the head's content hash, and every required-check list includes it; turn it on together with branch protection), `ci.draft_while_iterating` (default `false`; `true` makes `pipeline redraft` turn a ready PR back to draft before a fix push, so
-the heavy CI runs once when it is marked ready again; set it only when every heavy required workflow skips drafts and lists
-`converted_to_draft` in its `pull_request` types or shares one concurrency group per PR)
+the heavy CI runs once when it is marked ready again; set it only when every heavy required workflow skips drafts, lists
+`ready_for_review` and `converted_to_draft` in its `pull_request` types (a bare `pull_request:` gets neither) and puts one PR's
+runs in one concurrency group with `cancel-in-progress`)
 and `ci.approvers` (logins whose approval labels count; required for org-owned repos, otherwise approvals
 fail closed with `org-repo-needs-ci.approvers`). `pipeline config` prints `warnings` for config that is valid
 but suspicious. Documentation and test files are exempt from the content rules (sensitive terms, SQL, auth) but keep

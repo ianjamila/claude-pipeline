@@ -19,13 +19,12 @@ import { EXIT } from './cli.mjs';
 import { assignIds, buildReviewPrompt, largeBinaryNote, renderFindingsMarkdown } from './codex.mjs';
 import { Fail } from './cmd-common.mjs';
 import {
-  GitError, NETWORK_TIMEOUT_MS, diffFiles, effectiveReviewBase, git, headSha, mergeBase, resolutionReviewBase, reviewPatch, showFile,
+  GitError, NETWORK_TIMEOUT_MS, effectiveReviewBase, git, headSha, mergeBase, resolutionReviewBase, reviewPatch, showFile,
 } from './git.mjs';
-import { collectHardStops } from './hardstops.mjs';
 import { createGitHub } from './github.mjs';
 import { assertPublishedHistory } from './review-publish.mjs';
 import { GhError } from './proc.mjs';
-import { assessRisk, isLightLane, isSensitivePath, reviewLane } from './risk.mjs';
+import { isSensitivePath, rateBranch } from './risk.mjs';
 import { addRound, emptyState, higherRisk, loadState, maxRiskOf, saveState } from './state.mjs';
 import { baseEffort, codexSpend, decideRoute, protectedKindsFor, wholePrOwed } from './review-route.mjs';
 import { readWeeklyUsage } from './codex-usage.mjs';
@@ -149,7 +148,7 @@ export const checkCap = (c, st, flags, { already = false } = {}) => {
 };
 
 // Phase one. `base` and `head` are full SHAs (head is the checked-out HEAD). Returns the admitted round (opaque to the caller except
-// for these fields): { state, view, slug, ghRepo, forkPoint, level, lane, fable, lightLane, review: {base, kind}, resolution,
+// for these fields): { state, view, slug, ghRepo, forkPoint, level, rated, lane, fable, lightLane, review: {base, kind}, resolution,
 // resolutionOnly, resolutionView, resolutionIneligible, baseOnly, patch, largeBinaries, preAdmission, priorRulings, confirmItems,
 // hashAtHead, dir } plus the inputs it was given.
 export async function admitRound({ root, config, ctx, pr, round, base, head }) {
@@ -189,14 +188,14 @@ export async function admitRound({ root, config, ctx, pr, round, base, head }) {
 
   // Risk and light lane describe the whole PR (merge base..head), whatever slice this round reviews. A later round can
   // only take a PR off the light lane, never put it on.
-  const files = diffFiles(forkPoint, head, o);
-  const hits = await collectHardStops({ base: forkPoint, head, cwd: root, config });
-  const { level, changedLines } = assessRisk({ files, hits, config });
+  // The rating is worked out under the working-tree config AND the one committed at the default branch's fork point, stricter wins (risk.mjs#rateBranch).
+  const rated = await rateBranch({ root, head, config, defaultBranch: config.default_branch, prBase, base: forkPoint });
+  const { level } = rated;
+  const lane = { reviewer: rated.reviewer, reasons: rated.laneReasons, sensitivePaths: rated.sensitivePaths };
   // The reviewer after Codex: a PR that was ever reviewed by Fable stays with Fable (a later round can only escalate), and a
   // Fable PR is never on the light lane (that lane exists to skip the second reviewer).
-  const lane = reviewLane({ level, files, config });
   const fable = lane.reviewer === 'fable' || state?.reviewer === 'fable';
-  const lightLane = !fable && (state ? state.lightLane === true : true) && isLightLane({ level, changedLines, hits, config });
+  const lightLane = !fable && (state ? state.lightLane === true : true) && rated.lightLane;
 
   // What the reviewer is shown (and what the fix commits are measured against) is exactly this range. Round 1 starts at the merge
   // base; a later round starts where the previous one ended, with the base branch's commits merged in since then taken out.
@@ -223,6 +222,13 @@ export async function admitRound({ root, config, ctx, pr, round, base, head }) {
       }
     }
   }
+  // A PR the judge has been reviewing that now needs Fable (it gained a hit or a sensitive path, or grew past risk.high_lines): this round reviews the
+  // WHOLE PR, so the Fable pass sees everything the judge-only rounds covered (never a resolution-only round: that is a slice by definition).
+  const escalated = state?.rounds.length > 0 && state.reviewer === 'judge' && lane.reviewer === 'fable';
+  if (escalated) {
+    review = { base: forkPoint, kind: 'whole-pr' };
+    resolution = null;
+  }
   const resolutionOnly = resolution !== null;
   // Large binary documents would overflow the buffer; they are named at the end of the patch and in the prompt instead.
   const { patch, skipped: largeBinaries } = reviewPatch(review.base, head, o);
@@ -235,9 +241,11 @@ export async function admitRound({ root, config, ctx, pr, round, base, head }) {
   // merge that leaves the content hash alone is exactly that case, so refusing it as empty-range (#1658) was wrong. Still before
   // checkCap and before anything is written. base == head is kind 'previous' with an empty patch, so never baseOnly.
   const hasAccepted = allItems(state ?? { rounds: [] }).some((i) => i.final?.decision === 'ACCEPT');
-  if (state && hasAccepted && !baseOnly && !wholePr && (base === head || currentContentHash(root, config) === state.rounds.at(-1)?.contentHashAtToHead)) {
+  // An escalated round (judge to Fable) reviews the whole PR whatever changed since the last round, so with no accepted item waiting for its fix it is
+  // never empty: review-complete needs that Fable round and nothing else can produce it (a config change merged in from main moves no content).
+  const waiting = state ? roundOutcome(state).newAccepted : [];
+  if (state && hasAccepted && !baseOnly && !wholePr && !(escalated && waiting.length === 0) && (base === head || currentContentHash(root, config) === state.rounds.at(-1)?.contentHashAtToHead)) {
     const last = state.rounds.at(-1).n;
-    const waiting = roundOutcome(state).newAccepted;
     throw new Fail(EXIT.USAGE, {
       ok: false, error: 'empty-range',
       message: waiting.length > 0
@@ -266,7 +274,7 @@ export async function admitRound({ root, config, ctx, pr, round, base, head }) {
   const confirmItems = baseOnly ? [] : priorItems.filter((i) => i.implementedVia === 'other-files' && !confirmed.has(i.id));
 
   return {
-    ...c, state, view, slug, level, lane, fable, lightLane, review, resolution, resolutionOnly, resolutionView,
+    ...c, state, view, slug, level, rated, lane, fable, lightLane, review, resolution, resolutionOnly, resolutionView,
     baseOnly, patch, largeBinaries, preAdmission, priorRulings, confirmItems, hashAtHead: currentContentHash(root, config),
   };
 }

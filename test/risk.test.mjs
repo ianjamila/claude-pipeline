@@ -237,3 +237,106 @@ test('reviewLane throws TypeError on bad inputs instead of answering judge', () 
   assert.throws(() => reviewLane({ ...ok, config: { review: { arbiter_always_paths: 'lib/**' } } }), TypeError);
   assert.throws(() => reviewLane({ ...ok, config: { review: { arbiter_always_paths: [1] } } }), TypeError);
 });
+
+// ---- sizeOnly, drivers, ignored rules, the size-only judge lane ---------------------------------------------------------
+
+import { riskHits } from '../pipeline/lib/risk.mjs';
+
+const ownerHit = (rule = 'P-path', f = 'lib/a.ts') => ({ rule, file: f, detail: 'x', advisory: true, ownerMerge: true });
+const reportOnlyHit = (rule = 'R5-major-dep', f = 'package.json') => ({ rule, file: f, detail: 'x', advisory: true });
+const withIgnore = (rules, risk = {}) => {
+  const c = config(risk);
+  c.risk.ignore_hard_stop_rules = rules;
+  return c;
+};
+
+test('sizeOnly: true for a lines-only and a files-only medium PR; drivers say what raised it', () => {
+  const lines = assessRisk({ files: [file('lib/a.ts', 200)], hits: [], config: config() });
+  assert.equal(lines.sizeOnly, true);
+  assert.deepEqual(lines.drivers, { hardStop: false, advisory: false, path: false, size: true });
+  const many = assessRisk({ files: Array.from({ length: 11 }, (_, i) => file(`lib/f${i}.ts`, 2)), hits: [], config: config() });
+  assert.equal(many.sizeOnly, true);
+  assert.equal(many.level, 'medium');
+  // the reasons text is the same as before
+  assert.match(lines.reasons[0], /^200 changed lines > 150$/);
+});
+
+test('sizeOnly: false at low and at high, and with any hit or a high-risk path', () => {
+  assert.equal(assessRisk({ files: [file('lib/a.ts', 10)], hits: [], config: config() }).sizeOnly, false);
+  assert.equal(assessRisk({ files: [file('lib/a.ts', 700)], hits: [], config: config() }).sizeOnly, false);
+  const big = [file('lib/a.ts', 200)];
+  for (const [name, h] of [['blocking', hit('R2-auth')], ['ownerMerge', ownerHit()], ['report-only', reportOnlyHit()], ['R0', hit('R0-unscannable')]]) {
+    const r = assessRisk({ files: big, hits: [h], config: config() });
+    assert.equal(r.sizeOnly, false, name);
+  }
+  const path = assessRisk({ files: [file('supabase/migrations/1_x.sql', 200)], hits: [], config: config() });
+  assert.equal(path.sizeOnly, false);
+  assert.equal(path.drivers.path, true);
+  const adv = assessRisk({ files: big, hits: [reportOnlyHit()], config: config() });
+  assert.deepEqual(adv.drivers, { hardStop: false, advisory: true, path: false, size: true });
+  const heavy = assessRisk({ files: big, hits: [hit('R2-auth')], config: config() });
+  assert.deepEqual(heavy.drivers, { hardStop: true, advisory: false, path: false, size: true });
+});
+
+test('ignore_hard_stop_rules: P-path and R4-config hits stop counting toward the level, stay in hits, and are named in the reasons', () => {
+  const c = withIgnore(['P-path', 'R4-config']);
+  const hits = [ownerHit('P-path'), ownerHit('R4-config', 'CLAUDE.md')];
+  assert.deepEqual(riskHits(hits, c), []);
+  const r = assessRisk({ files: [file('lib/a.ts', 10)], hits, config: c });
+  assert.equal(r.level, 'low');
+  assert.match(r.reasons.join('|'), /ignored hard-stop rules: P-path, R4-config \(risk\.ignore_hard_stop_rules\)/);
+  // without the list the same hits are high
+  assert.equal(assessRisk({ files: [file('lib/a.ts', 10)], hits, config: config() }).level, 'high');
+  // only the listed rule is ignored
+  assert.equal(assessRisk({ files: [file('lib/a.ts', 10)], hits, config: withIgnore(['P-path']) }).level, 'high');
+  // an ignored hit still makes sizeOnly false (the raw list decides) and still blocks the light lane
+  const big = assessRisk({ files: [file('lib/a.ts', 200)], hits: [ownerHit('P-path')], config: c });
+  assert.equal(big.level, 'medium');
+  assert.equal(big.sizeOnly, false);
+  assert.equal(isLightLane({ level: r.level, changedLines: r.changedLines, hits, config: c }), false);
+});
+
+test('ignore_hard_stop_rules never discounts anything outside the allowlist (R4-pipeline, R3, R1, R0, P-pattern), even when the list asks', () => {
+  const c = withIgnore(['R4-pipeline', 'R3-secrets', 'R1-destructive', 'R0-unscannable', 'P-pattern', 'R2-auth']);
+  for (const rule of ['R4-pipeline', 'R3-secrets', 'R1-destructive', 'R0-unscannable', 'P-pattern', 'R2-auth']) {
+    assert.equal(riskHits([hit(rule)], c).length, 1, rule);
+    assert.equal(assessRisk({ files: [file('lib/a.ts', 2)], hits: [hit(rule)], config: c }).level, 'high', rule);
+  }
+  // a malformed list is a TypeError, never a quiet discount
+  assert.throws(() => riskHits([hit('P-path')], withIgnore('P-path')), TypeError);
+});
+
+test('self-lowering guard: the edit that adds an ignore rule is itself an R4-pipeline hit, which is never ignorable', () => {
+  const c = withIgnore(['P-path', 'R4-config']);
+  const r = assessRisk({ files: [file('.claude/pipeline.yml', 2)], hits: [hit('R4-pipeline', '.claude/pipeline.yml'), ownerHit('P-path', '.claude/pipeline.yml')], config: c });
+  assert.equal(r.level, 'high');
+  assert.match(r.reasons[0], /hard-stop: R4-pipeline/);
+});
+
+test('reviewLane: a size-only medium PR goes to the judge with a note; the opt-out, a sensitive path, an omitted or false sizeOnly keep Fable', () => {
+  const files = [file('lib/a.ts', 200)];
+  const judged = reviewLane({ level: 'medium', files, config: config(), sizeOnly: true });
+  assert.equal(judged.reviewer, 'judge');
+  assert.equal(judged.sizeOnlyJudge, true);
+  assert.deepEqual(judged.reasons, []);
+  assert.match(judged.note, /medium for size only: Sonnet judge \(review\.size_only_medium_reviewer\)/);
+  const optOut = config();
+  optOut.review.size_only_medium_reviewer = 'fable';
+  const fable = reviewLane({ level: 'medium', files, config: optOut, sizeOnly: true });
+  assert.equal(fable.reviewer, 'fable');
+  assert.equal(fable.sizeOnlyJudge, undefined);
+  assert.deepEqual(fable.reasons, ['medium risk']);
+  assert.equal(reviewLane({ level: 'medium', files, config: config(), sizeOnly: false }).reviewer, 'fable');
+  assert.equal(reviewLane({ level: 'medium', files, config: config() }).reviewer, 'fable');
+  const sensitive = reviewLane({ level: 'medium', files: [file('supabase/migrations/1.sql', 200)], config: config(), sizeOnly: true });
+  assert.equal(sensitive.reviewer, 'fable');
+  assert.equal(reviewLane({ level: 'high', files, config: config(), sizeOnly: true }).reviewer, 'fable');
+  assert.equal(reviewLane({ level: 'low', files, config: config(), sizeOnly: true }).sizeOnlyJudge, undefined);
+  const bad = config();
+  bad.review.size_only_medium_reviewer = 'sonnet';
+  assert.equal(reviewLane({ level: 'medium', files, config: bad, sizeOnly: true }).reviewer, 'fable', 'an unknown value fails toward Fable');
+  // arbiter_always_paths is a sensitive path too
+  const always = config();
+  always.review.arbiter_always_paths = ['lib/**'];
+  assert.equal(reviewLane({ level: 'medium', files, config: always, sizeOnly: true }).reviewer, 'fable');
+});

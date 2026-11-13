@@ -32,10 +32,9 @@ test('defer-fixes: main merged in between the fix and the revert: the issue comp
   assert.ok(JSON.parse(post.stdin).body.includes(`git diff ${revert} ${merge}`), JSON.parse(post.stdin).body);
 });
 
-test('defer-fixes: main merged in between the fix and the revert without moving the PR\'s content (no base-only round): the anchor stays the reviewed head and the compare warning is returned (R1-F1)', (t) => {
-  const w = roundWorld(t);
+// main changes a file the PR does not touch and is merged in on top of the fix: the PR's own patch (and so the content hash) is unchanged. -> { h1, h2 (fix), merge, revert }
+function mergedBetween(w) {
   const { h1, h2 } = w.atCap();
-  // main changes a file the PR does not touch and is merged in on top of the fix: the PR's own patch (and so the content hash) is unchanged
   w.repo.git(['checkout', '-q', 'main']);
   w.repo.write('src/other.js', 'export const other = 1;\n');
   w.repo.commit('main edits elsewhere');
@@ -45,10 +44,70 @@ test('defer-fixes: main merged in between the fix and the revert without moving 
   const revert = w.revert(h2);
   w.prHead(revert);
   assert.equal(w.state().rounds.at(-1).baseOnly, undefined, 'no base-only round was recorded');
-  const ok = w.cli(['triage', 'defer-fixes', '--pr', '7', '--ids', 'R2-S1', '--fix-head', merge, '--reason', 'minor, file it']);
+  return { h1, h2, merge, revert };
+}
+const deferAt = (w, merge) => w.cli(['triage', 'defer-fixes', '--pr', '7', '--ids', 'R2-S1', '--fix-head', merge, '--reason', 'minor, file it']);
+
+test('defer-fixes: main merged in between the fix and the revert without moving the PR\'s content (no base-only round): the anchor is HEAD, the pushed head, and the compare shows just the fix (R1-F1, #325)', (t) => {
+  const w = roundWorld(t);
+  const { merge, revert } = mergedBetween(w);
+  const ok = deferAt(w, merge);
+  assertExit(ok, 0, ok.stderr + ok.stdout);
+  assert.deepEqual(ok.json.warnings ?? [], []);
+  assert.equal(w.item('R2-S1').roundCapDeferral.reviewedHead, revert);
+  assert.equal(w.item('R2-S1').final.claude.reviewedHead, revert);
+  // the compare holds the fix and nothing of the merge (the content hash excludes the agent log, so log lines may show too)
+  const files = w.repo.git(['diff', '--name-only', revert, merge]).trim().split('\n').filter((f) => !f.includes('agent-log'));
+  assert.deepEqual(files, ['src/fix2.js']);
+  const filed = w.cli(['followups', 'create', '--round', '2']);
+  assertExit(filed, 0, filed.stderr + filed.stdout);
+  const post = w.fake.calls().find((c) => c.argv.join(' ').startsWith(`api -X POST repos/${w.slug}/issues `));
+  assert.ok(JSON.parse(post.stdin).body.includes(`git diff ${revert} ${merge}`), JSON.parse(post.stdin).body);
+});
+
+test('defer-fixes: main merged in again after the revert, so HEAD\'s merge base is not the fix head\'s: the anchor stays the reviewed head and the compare warning is returned (#325)', (t) => {
+  const w = roundWorld(t);
+  const { h1, merge } = mergedBetween(w);
+  w.repo.git(['checkout', '-q', 'main']);
+  w.repo.write('src/other2.js', 'export const other2 = 1;\n');
+  w.repo.commit('main edits elsewhere again');
+  w.repo.git(['checkout', '-q', 'feat/x']);
+  w.repo.git(['merge', '--no-edit', 'main']);
+  w.prHead(w.repo.git(['rev-parse', 'HEAD']).trim());
+  const ok = deferAt(w, merge);
   assertExit(ok, 0, ok.stderr + ok.stdout);
   assert.equal((ok.json.warnings ?? []).length, 1, JSON.stringify(ok.json.warnings));
   assert.match(ok.json.warnings[0], /the default branch merged into the fix head is not the same one/);
-  // the last round (not HEAD) was reviewed before the merge, so it is not a better anchor than the one found by ancestry
   assert.equal(w.item('R2-S1').roundCapDeferral.reviewedHead, h1);
+});
+
+test('defer-fixes: HEAD is not the head GitHub has for the PR: the anchor stays the reviewed head and the compare warning is returned (#325)', (t) => {
+  const w = roundWorld(t);
+  const { h1, merge } = mergedBetween(w);
+  w.prHead(merge);
+  const ok = deferAt(w, merge);
+  assertExit(ok, 0, ok.stderr + ok.stdout);
+  assert.equal((ok.json.warnings ?? []).length, 1, JSON.stringify(ok.json.warnings));
+  assert.match(ok.json.warnings[0], /the default branch merged into the fix head is not the same one/);
+  assert.equal(w.item('R2-S1').roundCapDeferral.reviewedHead, h1);
+});
+
+test('defer-fixes: the PR\'s head cannot be read from GitHub: the anchor stays the reviewed head and the compare warning is returned (#325)', (t) => {
+  const w = roundWorld(t);
+  const { h1, merge } = mergedBetween(w);
+  w.prHead(undefined);
+  const ok = deferAt(w, merge);
+  assertExit(ok, 0, ok.stderr + ok.stdout);
+  assert.equal((ok.json.warnings ?? []).length, 1, JSON.stringify(ok.json.warnings));
+  assert.equal(w.item('R2-S1').roundCapDeferral.reviewedHead, h1);
+});
+
+test('defer-fixes: a fix head with the reviewed content is still refused whatever HEAD is (the fixHash refusal is unchanged, #325)', (t) => {
+  const w = roundWorld(t);
+  const { h1 } = mergedBetween(w);
+  const before = w.stateText();
+  const r = deferAt(w, h1);
+  assert.equal(r.code, 1, r.stdout + r.stderr);
+  assert.match(r.json.reason, /has the reviewed content/);
+  assert.equal(w.stateText(), before);
 });

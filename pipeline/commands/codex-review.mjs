@@ -67,8 +67,11 @@ export const meta = {
     '  exit 2 {error:stale-history | unpublished-history | history-unreadable} for a COUNTED round, before Codex runs (read again under the final lock): the PR\'s triage comment is the',
     '    published history. stale-history: this copy lacks a published round or owner grant (run `pipeline state show --pr N`); unpublished-history: this copy holds rounds the PR',
     '    lacks, an earlier publish failed (run `pipeline comment --pr N --kind triage`); history-unreadable: the comment holds no readable state. No triage comment: no check',
-    '  reviewer: fable (medium/high risk or a sensitive path: risk.high_risk_paths, review.arbiter_always_paths) records the round as fableRequired',
-    '    (the Fable pass must run: arbiter needed/apply) and gives Codex an attacker\'s brief for the sensitive files; judge otherwise. Once fable, always fable',
+    '  reviewer: fable (medium/high risk, except medium for size only, or a sensitive path: risk.high_risk_paths, review.arbiter_always_paths) records the round as fableRequired',
+    '    (the Fable pass must run: arbiter needed/apply) and gives Codex an attacker\'s brief for the sensitive files; judge otherwise. Once fable, always fable.',
+    '    The judge also reviews a medium PR that is medium ONLY for its size (no hard-stop hit of any kind, no sensitive path, base branch = the default branch) unless',
+    '    review.size_only_medium_reviewer is fable; the output then has sizeOnly:true and laneNote. The rating uses the working-tree config AND the one committed at the',
+    '    default branch\'s fork point (stricter wins; an unreadable one means fable). A PR that goes from judge to fable reviews the WHOLE PR in that round (kind whole-pr)',
     '  confirm fixed: an accepted item that a forced or Claude ruling marked implemented through files other than the one it names (state mark-implemented,',
     '    implementedVia other-files) is listed in the prompt of the next round that runs Codex (not a base-only one), with its original finding fenced as untrusted',
     '    text: Codex says whether it is really fixed and raises it again as BLOCKING when it is not. The round records round.confirmFixed:[ids] (absent when none)',
@@ -78,8 +81,6 @@ export const meta = {
     '    {resolutionOnly:true, conflicted, conflictedCount}; the round is a real review but does not count toward the cap. Otherwise',
     '    the whole PR is reviewed as before (a counted round) and {resolutionIneligible:"<reason>"} says why the resolution was not',
     '    taken alone',
-    '  redraftAdvice: a COUNTED round of a repo with ci.draft_while_iterating on a PR that is READY adds {redraftAdvice:true, warnings:[...]}: run `pipeline redraft --pr N` before',
-    '    the first fix push (never a failure; a draft PR, a base-only or resolution-only round, or a PR that cannot be read gets no advice)',
     '  exit 3 {ok:false, unavailable:true, reason: quota|auth|unavailable|error|malformed|github} when Codex or GitHub could not deliver. A Codex failure also carries',
     '    substitute:{eligible, why, agent, resetAt, waitUntil?}: eligible only for a real quota stop (Codex\'s own turn.failed event, confirmed by its session log when found) with',
     '    review.substitute.mode auto; agent is substitute-fable once the PR was ever high risk (maxRisk), else substitute-opus; review.substitute.min_wait_minutes above 0 and a',
@@ -102,15 +103,6 @@ const planOutput = (p) => ({
   budget: p.budget, governor: p.governor === null ? null : { usedPct: p.governor.usedPct, soft: p.governor.soft, hard: p.governor.hard, observedAt: p.governor.observedAt },
   facts: { changedLines: Number.isFinite(p.facts.changedLines) ? p.facts.changedLines : null, newFile: p.facts.newFile, sensitive: p.facts.sensitive },
 });
-
-// true only when GitHub says the PR is a ready (non-draft) PR; a failed read, or any other answer, is false.
-function prIsReady(gh, pr) {
-  try {
-    return gh.prView(pr, ['isDraft']).isDraft === false;
-  } catch {
-    return false;
-  }
-}
 
 export const run = guarded(async (argv, ctx) => {
   const { values } = parseCommandArgs(argv, {
@@ -286,10 +278,6 @@ export const run = guarded(async (argv, ctx) => {
   // Codex answered: the PR is no longer waiting for it and its last outage is over (best effort).
   const warnings = baseOnly ? [] : await noteCodexAnswered({ pr, repo: repoSlug, env: ctx.env });
 
-  // A COUNTED round of a repo that iterates in draft (ci.draft_while_iterating): if the PR is READY, every fix push of this round would re-run the heavy
-  // CI, so say so now (the review skill's Rule 8: `pipeline redraft` before the first fix push). Advice only: an unreadable PR is no advice, never a failure.
-  const redraftAdvice = config.ci.draft_while_iterating === true && !baseOnly && !resolutionOnly && prIsReady(createGitHub({ cwd: root, env: ctx.env }), pr);
-
   return {
     exitCode: EXIT.OK,
     output: {
@@ -309,11 +297,10 @@ export const run = guarded(async (argv, ctx) => {
       preRuled: items.filter((i) => i.final).length,
       lightLane: state.lightLane,
       reviewer: state.reviewer,
+      ...(adm.rated.sizeOnly ? { sizeOnly: true } : {}),
+      ...(adm.rated.note && state.reviewer === 'judge' ? { laneNote: adm.rated.note } : {}),
       reviewerReasons: state.rounds.at(-1)?.fableReasons ?? [],
       path: dir,
-      ...(redraftAdvice
-        ? { redraftAdvice: true, warnings: [...warnings, `PR #${pr} is ready and this repo iterates in draft (ci.draft_while_iterating): run \`pipeline redraft --pr ${pr}\` BEFORE you push any fix from this round, so CI waits for the re-ready instead of running on every fix push`] }
-        : {}),
     },
   };
 });

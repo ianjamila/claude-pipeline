@@ -4,7 +4,7 @@
 // rulings count. Anything unproven or unparseable marks every arbitrated item needsHuman: a ruling that cannot be
 // shown to come from the pinned model must not steer the decision.
 //
-// A Fable review round (the round has `fableRequired`: the PR is medium/high risk or touches a sensitive path) is the other
+// A Fable review round (the round has `fableRequired`: the PR is medium/high risk, other than medium for size only, or touches a sensitive path) is the other
 // mode of the same two steps: `needed` ALWAYS sends the round to Fable, even with zero Codex items, with the diff to review
 // (the whole PR the first time, the round's slice after a proven Fable round) pinned by its digest; `apply` also takes
 // Fable's own `findings` as new items. Until a proven pass is applied the round is not clean (triage.mjs#fablePendingRounds),
@@ -14,11 +14,10 @@ import { EXIT, UsageError, intOption, parseCommandArgs } from '../lib/cli.mjs';
 import { Fail, guarded, resolveRepo } from '../lib/cmd-common.mjs';
 import { fingerprint, largeBinaryNote, resolutionBaseNote, resolutionSection } from '../lib/codex.mjs';
 import { GitError, ReviewBaseUnavailable, diffFiles, ensureReviewBase, reviewPatch, showFile } from '../lib/git.mjs';
-import { loadConfig, validateConfig } from '../lib/config.mjs';
-import { parseYaml } from '../lib/yaml.mjs';
+import { baseConfigAt, loadConfig } from '../lib/config.mjs';
 import { collectHardStops } from '../lib/hardstops.mjs';
 import { BRIEFS, BRIEF_FIX_VERIFY, BRIEF_FULL, acceptedEfforts, expectationOf, fixRoundCandidate } from '../lib/fix-verify.mjs';
-import { assessRisk, reviewLane } from '../lib/risk.mjs';
+import { assessRisk, reviewLane, riskHits } from '../lib/risk.mjs';
 import { claudeCodeStatus } from '../lib/claude-code-version.mjs';
 import { floorBypass, floorOutput, judgeAndPublish } from '../lib/floor-proof.mjs';
 import { readReviewGate } from '../lib/model-floor.mjs';
@@ -275,26 +274,6 @@ function reviewSection(state, round, diff, fix = null) {
 // -> { expectation, fix, reason }: `reason` says why (also the message of an error that was caught on the way), printed and stored as briefReason.
 const msgOf = (err) => String(err?.message ?? err).split('\n')[0];
 
-// The config as the base side (the PR's fork point) has it: { ok: true, config } | { ok: false, reason }.
-function baseConfigAt(forkPoint, root) {
-  if (typeof forkPoint !== 'string' || forkPoint === '') return { ok: false, reason: 'the round records no fork point' };
-  let text;
-  try {
-    text = showFile(forkPoint, '.claude/pipeline.yml', { cwd: root });
-  } catch (err) {
-    return { ok: false, reason: `could not read .claude/pipeline.yml at the fork point: ${msgOf(err)}` };
-  }
-  if (text === null) return { ok: false, reason: 'the fork point has no .claude/pipeline.yml' };
-  let parsed;
-  try {
-    parsed = validateConfig(parseYaml(text));
-  } catch (err) {
-    return { ok: false, reason: `the fork point's .claude/pipeline.yml cannot be parsed: ${msgOf(err)}` };
-  }
-  if (!parsed.ok) return { ok: false, reason: `the fork point's .claude/pipeline.yml is not a valid config: ${parsed.errors.slice(0, 2).join('; ')}` };
-  return { ok: true, config: parsed.config };
-}
-
 async function chooseBrief(state, round, diff, root, { forceFull = false } = {}) {
   const full = (reason) => ({ expectation: BRIEFS[BRIEF_FULL], fix: null, reason });
   if (forceFull) return full('forced by --full');
@@ -311,7 +290,8 @@ async function chooseBrief(state, round, diff, root, { forceFull = false } = {})
     const files = diffFiles(diff.from, round.toHead, { cwd: root });
     for (const [label, config] of configs) {
       const hits = await collectHardStops({ base: diff.from, head: round.toHead, cwd: root, config });
-      if (hits.length > 0) return full(`hard-stop hit in the round range (${label} config)`);
+      // risk.ignore_hard_stop_rules (P-path / R4-config only) lets a repo whose every file is a P-path hit still get the fix-verify brief; every other hit forces the full one.
+      if (riskHits(hits, config).length > 0) return full(`hard-stop hit in the round range (${label} config)`);
       if (reviewLane({ level: 'low', files, config }).sensitivePaths.length > 0) return full(`sensitive path in the round range (${label} config)`);
       const risk = assessRisk({ files, hits, config });
       if (risk.level !== 'low') return full(`the round's own range is ${risk.level} risk (${label} config): ${risk.reasons.join('; ')}`);

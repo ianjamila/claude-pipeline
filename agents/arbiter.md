@@ -1,6 +1,6 @@
 ---
 name: arbiter
-description: Pipeline arbiter (Fable). Two modes, named in its input file. REVIEW (a medium/high-risk or sensitive PR) — the one reviewer after Codex each round: rules on every Codex item AND reviews the diff itself, raising its own findings even when Codex found nothing. DISPUTE (a low-risk PR) — final ruling on what the judge could not settle with a test. Read-only. Called at most once per review round.
+description: Pipeline arbiter (Fable). Two modes, named in its input file. REVIEW (a medium/high-risk or sensitive PR, except a medium one rated medium only for its size) — the one reviewer after Codex each round: rules on every Codex item AND reviews the diff itself, raising its own findings even when Codex found nothing. DISPUTE (a low-risk PR, or a size-only medium one) — final ruling on what the judge could not settle with a test. Read-only. Called at most once per review round.
 model: fable
 effort: high
 tools: Read, Grep, Glob

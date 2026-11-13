@@ -27,7 +27,7 @@ number, `R` a review round, `<slug>` 2–5 lowercase words from the request.
 6. The whole suite is CI's job: locally you run only `verify.quick`, on the changed area. Never run `verify.full` here.
 7. **Stop ritual.** Every stop below names its outcome. Once the PR exists, run `P summary --pr N --outcome <outcome> --built "<one line: what was built>"`
    (it renders the cost bookings into the PR comment), then `P agent-log publish --line "<agentLogLine from the summary JSON>"`, then tell the owner.
-8. Before ANY `git push` to a READY PR (fix, settle test, owner override build, docs-exempt row, conflict resolution, owner-requested change): `P redraft --pr N` first (`--reason ci-failed` for a CI-red fix); it releases the merge hold and, with `ci.draft_while_iterating`, turns the PR to draft so CI waits; 3.2 marks it ready again. `not-open` / `merge-in-progress` ⇒ don't push, tell the owner; exit 3 with `stage:read` ⇒ retry once, then don't push, tell the owner; exit 3 with `stage:convert` / `convert-failed` ⇒ retry once, then push anyway and say so. Pushes the pipeline makes itself (`update-branch`, `P merge` catch-ups) are not yours.
+8. Before ANY `git push` to a READY PR (fix, settle test, owner override build, docs-exempt row, conflict resolution, owner-requested change): `P redraft --pr N` first (`--reason ci-failed` for a CI-red fix); it releases the merge hold and, with `ci.draft_while_iterating`, turns the PR to draft so CI waits; 3.2 marks it ready again. `not-open` / `merge-in-progress` ⇒ don't push, tell the owner; exit 0 with `autoMergeDisabled: true` ⇒ the PR is now a draft: don't push, tell the owner their merge was cancelled, wait for their word; `autoMergeDisabled: false` ⇒ auto-merge is STILL armed: don't push or mark ready until the owner disables it by hand (they run `gh pr merge N --disable-auto`) and it is confirmed off: tell them, then wait for their word; exit 3 with `stage:read` ⇒ retry once, then don't push, tell the owner; exit 3 with `stage:convert` / `convert-failed` ⇒ retry once, then push anyway and say so. A push to a READY PR that went out WITHOUT redraft: run `P redraft --pr N` right after it (`converted_to_draft` cancels the running suite, so most of the wasted run is saved). Pushes the pipeline makes itself (`update-branch`, `P merge` catch-ups) are not yours. Exception: no `P redraft` on a queue-removed removal itself or the re-queue of the SAME head (a draft makes `P merge` refuse it; reference/owner-merge.md); only the fix push after it follows this rule.
 
 Opt-out: `PIPELINE_OFF=1` or the user says not to use the pipeline ⇒ do the task normally (still never push to main).
 
@@ -42,7 +42,7 @@ Picking up an existing `awaiting-review` PR (Codex was unavailable): `P state sh
 1. `git fetch origin <default_branch>` and `git worktree add --no-track -b agent/<slug> <worktree_dir>/agent-<slug> origin/<default_branch>`
    (`--no-track`: a branch tracking `origin/main` can make a bare push target main). All work happens there; give subagents its absolute path.
 2. ONE `implementer` dispatch builds the whole change (task list in order, commits in small steps): hand it the tasks, worktree path, acceptance criteria, the tests to write
-   (a bug ⇒ the failing test first, its failing output kept), `verify.quick`, and the commit trailer your system context prescribes (pass it verbatim). More dispatches only when the
+   (a bug ⇒ the failing test first, its failing output kept), `verify.quick`, and the commit trailer your system context prescribes (pass it verbatim). Tell it: return immediately when done; no background work; waits only via `job wait` (max 3), else `Status: waiting-on-job <name> <runId>`. More dispatches only when the
    change is big: > ~500 changed non-test lines expected, more than one subsystem, or parts on disjoint files worth running in parallel (only on different files). An implementer that
    stops before it is done (call budget, context) ⇒ continue THE SAME agent once (SendMessage with what is left; extend its budget once) before a fresh dispatch, which gets only the rest.
 3. Quick check on the changed area (`verify.quick`) after each dispatch and before every push. Red ⇒ implementer with the failing
@@ -70,8 +70,8 @@ Round `R`; `P codex-review` itself refuses any other round (`round-cap`). Comman
    `baseOnly: true` (only main merged in): Codex did not run, no items, not counted; it carries the last reviewed result forward.
    `resolutionOnly: true` (a main conflict resolved by choosing lines): a real review of just the resolution, triaged as usual
    (an ACCEPT still needs its fix round) but not counted; `resolutionIneligible: "<reason>"` ⇒ a normal counted round.
-2. **Who reviews.** The output names `reviewer`. `fable` (medium/high risk, `risk.high_risk_paths` or `review.arbiter_always_paths`):
-   skip the judge; the arbiter pass (step 4) is the review every round, even with zero Codex items. `judge`: `P triage light-lane --round R`
+2. **Who reviews.** The output names `reviewer`. `fable` (medium/high risk, `risk.high_risk_paths` or `review.arbiter_always_paths`; a PR rated medium only for its size, with no hard-stop hit and no sensitive path, gets the judge unless
+   `review.size_only_medium_reviewer` is `fable`, and a stacked PR, base not the default branch, never does): skip the judge; the arbiter pass (step 4) is the review every round, even with zero Codex items. `judge`: `P triage light-lane --round R`
    when `P risk` said `lightLane` and Codex returned only WORTH CONSIDERING items, else the judge below.
 3. **Judge.** Only for items without a `final` yet. `d8` = first 8 characters of `shasum -a 256 .review/round-R/codex.json`. Invoke `judge`
    with description `pipeline-judge R<R> <d8>` and a prompt of: worktree path, `.review/round-R/codex.json`, `.review/round-R/diff.patch`, PR title, risk,
@@ -89,7 +89,7 @@ Round `R`; `P codex-review` itself refuses any other round (`round-cap`). Comman
    `model-floor-unwritable` ⇒ no new Fable pass can fix it: do NOT re-run the arbiter; stop `blocked` exactly like the `restartRequired` stop, posting the CLI's `advice`.
    Any other exit 1 ⇒ the items are `needsHuman` (Fable round: run `needed` and the arbiter once more; failing twice ⇒ park, cause `arbiter:model-proof`).
 5. **Publish and fix.** `P comment --pr N --kind triage` FIRST, then `P followups create --round R` for FOLLOW-UP items, then the triage comment again
-   (issue links). ACCEPT items: one `implementer` dispatch with `P state show --round R --accepted`; it fixes, adds tests, runs `verify.quick`, commits;
+   (issue links). ACCEPT items: one `implementer` dispatch with `P state show --round R --accepted`; it fixes, adds tests, runs `verify.quick`, commits (same line: return immediately when done; no background work; waits only via `job wait`, max 3);
    push (Rule 8). Then **`P state mark-implemented --ids <ids>`** for each fixed ACCEPT item: `review-complete` refuses an ACCEPT that is not marked, from ANY round,
    and exit 2 `no-code-change` means the fix changed no code (back to the implementer; marking never replaces a fix).
 6. **Outcome.** `P state outcome`: `clean` ⇒ leave the loop; `needsHuman` non-empty ⇒ see Rulings; more rounds left ⇒ round R+1 (the Codex fix
