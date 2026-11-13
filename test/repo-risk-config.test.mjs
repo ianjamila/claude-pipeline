@@ -6,6 +6,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseYaml } from '../pipeline/lib/yaml.mjs';
 import { validateConfig } from '../pipeline/lib/config.mjs';
+import { matchAny } from '../pipeline/lib/glob.mjs';
 
 const root = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
 const raw = parseYaml(fs.readFileSync(path.join(root, '.claude', 'pipeline.yml'), 'utf8'));
@@ -33,7 +34,42 @@ test('repo config: the rating tests read this same high_risk_paths list (no hand
   assert.match(src, /CP_HIGH = parseYaml\(.*\.claude\/pipeline\.yml.*\)\.risk\.high_risk_paths/, 'risk-rate-branch.test.mjs must read the real list, not a copy');
   const list = raw.risk.high_risk_paths;
   assert.equal(new Set(list).size, list.length);
-  for (const p of ['pipeline/lib/glob.mjs', 'pipeline/lib/git.mjs', 'pipeline/lib/diff.mjs', 'pipeline/lib/doc-paths.mjs', 'pipeline/lib/docs-exempt.mjs', 'pipeline/lib/yaml.mjs', 'install.sh', 'install.ps1']) {
+  for (const p of ['pipeline/lib/glob.mjs', 'pipeline/lib/git.mjs', 'pipeline/lib/diff.mjs', 'pipeline/lib/doc-paths.mjs', 'pipeline/lib/docs-exempt.mjs', 'pipeline/lib/yaml.mjs', 'pipeline/vendor/**', 'pipeline/lib/proc.mjs', 'pipeline/lib/paths.mjs', 'pipeline/lib/resolution.mjs', 'pipeline/lib/seams.mjs', 'pipeline/lib/shell-words.mjs', 'install.sh', 'install.ps1']) {
     assert.ok(list.includes(p), p);
   }
+});
+
+// Static relative imports of a source file: `import ... from './x.mjs'`, `export ... from '../x.mjs'`, bare `import './x.mjs'`, also over several lines.
+// A statement must start a line, so a commented-out import is not followed. Bare specifiers (node:fs, packages) are ignored.
+const IMPORT_RE = /(?:^|\n)[ \t]*(?:import|export)\s+(?:[^'";]*?\s+from\s+)?['"]([^'"]+)['"]/g;
+
+function importClosure(startRel) {
+  const seen = new Set();
+  const queue = [startRel];
+  while (queue.length) {
+    const rel = queue.pop();
+    if (seen.has(rel)) continue;
+    const abs = path.join(root, rel);
+    assert.ok(fs.existsSync(abs), `${rel} is imported but does not exist`);
+    seen.add(rel);
+    for (const m of fs.readFileSync(abs, 'utf8').matchAll(IMPORT_RE)) {
+      if (!m[1].startsWith('./') && !m[1].startsWith('../')) continue;
+      queue.push(path.relative(root, path.resolve(path.dirname(abs), m[1])).split(path.sep).join('/'));
+    }
+  }
+  return [...seen].sort();
+}
+
+test('repo config: the import walker finds multi-line, export-from and bare imports and skips bare specifiers and comments', () => {
+  const src = "import a from './a.mjs';\nimport {\n  b,\n  c,\n} from '../b.mjs';\nexport { d } from './d.mjs';\nimport './e.mjs';\nimport fs from 'node:fs';\n// import x from './nope.mjs';\nexport const s = './f.mjs';\n";
+  const found = [...src.matchAll(IMPORT_RE)].map((m) => m[1]);
+  assert.deepEqual(found, ['./a.mjs', '../b.mjs', './d.mjs', './e.mjs', 'node:fs']);
+});
+
+test('repo config: every file the risk rating imports (transitively) is covered by risk.high_risk_paths', () => {
+  const list = raw.risk.high_risk_paths;
+  const closure = importClosure('pipeline/lib/risk.mjs');
+  assert.ok(closure.length > 5, `suspiciously small import closure: ${closure.join(', ')}`);
+  const uncovered = closure.filter((f) => !matchAny(f, list, { nocase: true }));
+  assert.deepEqual(uncovered, [], `imported by pipeline/lib/risk.mjs but not in risk.high_risk_paths: ${uncovered.join(', ')}`);
 });
