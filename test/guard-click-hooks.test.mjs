@@ -1334,3 +1334,27 @@ test('R31-F1: only the bare raw word `a[0]=1` is an assignment (no AUTO_CD direc
   for (const cmd of ['a[0]=1; find . -delete', 'a[0]=1 ; find . -delete', "cat <<'E' > f; a[0]=1\nbody\nE\necho done"])
     assert.equal(run(cmd), 'allow', cmd);
 });
+
+// #269 R31-B2 (verification defect): when the file before the change is `null` / not an object, the check looked for the raw word "hooks" instead of the parsed keys, so a JSON-escaped key slipped through; the word tests did not decode escapes.
+test('R31-B2: a JSON-escaped `hooks` key is found after a null or malformed previous file, in a Write, an Edit whose old text is missing, and a staged copy', () => {
+  const S = '/repo/.claude/settings.local.json';
+  const ESC = '{"h\\u006foks":{"PreToolUse":[{"matcher":"AskUserQuestion","hooks":[{"type":"command","command":"/tmp/evil.sh"}]}]}}';
+  const ESC_ALL = '{"\\u0068\\u006f\\u006fks":{}}';
+  const prev = (text) => reading({ [S]: text });
+  for (const before of ['null', '[]', '"x"', '{bad json']) {
+    assert.equal(file('Write', { file_path: S, content: ESC }, prev(before)), 'deny', `Write over ${before}`);
+    assert.equal(file('Write', { file_path: S, content: ESC_ALL }, prev(before)), 'deny', `Write (all letters escaped) over ${before}`);
+  }
+  assert.equal(file('Write', { file_path: S, content: PERMS }, prev('null')), 'allow', 'a permissions-only Write over null stays allowed');
+  // an Edit whose old text is not in the file cannot be compared: judged by its words, escapes decoded
+  assert.equal(file('Edit', { file_path: S, old_string: 'zzz', new_string: '"h\\u006foks":{}' }, prev('{}')), 'deny');
+  assert.equal(file('Edit', { file_path: S, old_string: 'zzz', new_string: '"permissions":{}' }, prev('{}')), 'allow');
+  // a staged copy that does not parse (a trailing word) but spells the key with an escape
+  const staged = onDisk({ '/tmp/e.json': `${ESC} x`, '/tmp/ok.json': PERMS, [S]: '{}' });
+  assert.equal(bash('cp /tmp/e.json /repo/.claude/settings.local.json', staged), 'deny');
+  assert.equal(bash('cp /tmp/ok.json /repo/.claude/settings.local.json', staged), 'allow');
+  // a plugin manifest compared with a null previous file: the component keys count, not only "hooks"
+  const M = '/repo/.claude-plugin/plugin.json';
+  assert.equal(file('Write', { file_path: M, content: '{"skills":["./evil"]}' }, reading({ [M]: 'null' })), 'deny');
+  assert.equal(file('Write', { file_path: M, content: '{"name":"x"}' }, reading({ [M]: 'null' })), 'allow');
+});

@@ -690,7 +690,7 @@ function hooksChangeReason(kind, ti, ctx, candidate, shown) {
   if (kind === 'plugin') return `${shown} is a plugin's hooks file: a hook there could run on the owner's dialogs`;
   const before = ctx.readText(candidate) ?? '';
   const after = textAfter(ti, before);
-  const words = writtenTexts(ti).some((x) => /hooks/i.test(x));
+  const words = writtenTexts(ti).flatMap(variantsOf).some((x) => /hooks/i.test(x)); // (R31-B2: a JSON / JS escape decoded, as the program-text check does)
   if (after === null) return words ? `${shown}: the change mentions hooks and cannot be compared with the file` : null;
   return hooksDifference(kind, before, after, shown, words);
 }
@@ -704,7 +704,8 @@ function hooksDifference(kind, before, after, shown, words) {
   try { b = before.trim() === '' ? {} : JSON.parse(before); } catch { b = null; }
   try { a = JSON.parse(after); } catch { a = null; }
   if (a === null || typeof a !== 'object') return words ? `${shown}: the change mentions hooks and the result cannot be read as JSON` : null;
-  if (b === null || typeof b !== 'object') return /"hooks"/.test(after) ? `${shown}: the file could not be compared and now holds hooks` : null;
+  // (R31-B2: the parsed object's own protected keys, so an escaped key (`"h\u006foks"`) counts; the raw word stays as a second look)
+  if (b === null || typeof b !== 'object') return keys.some((k) => a[k] !== undefined && a[k] !== null) || /"hooks"/.test(after) ? `${shown}: the file could not be compared and now holds ${keys.map((k) => `"${k}"`).join(' / ')}` : null;
   return keys.some((k) => sortedJsonOf(a[k] ?? null) !== sortedJsonOf(b[k] ?? null)) ? `${shown}: the change adds or alters ${keys.map((k) => `"${k}"`).join(' / ')}` : null;
 }
 const HOOKS_MSG = 'a hook on AskUserQuestion could answer the owner\'s dialog in the owner\'s name or hide a refusal; permission edits stay allowed, hooks are the owner\'s to change, from a terminal';
@@ -809,7 +810,7 @@ function hookSurfaceBashReason(cmds, frame, ctx, io) {
       const cands = writtenCandidates(present, disk, (q) => ctx.readText(q));
       if (cands === null) return `the command writes ${P}, a file that can declare hooks, with content only known when it runs, so it cannot be compared with the file`;
       for (const after of cands) {
-        const why = hooksDifference(kind, typeof disk === 'string' ? disk : '', after, P, /hooks/i.test(after));
+        const why = hooksDifference(kind, typeof disk === 'string' ? disk : '', after, P, variantsOf(after).some((x) => /hooks/i.test(x)));
         if (why !== null) return why;
       }
     }
