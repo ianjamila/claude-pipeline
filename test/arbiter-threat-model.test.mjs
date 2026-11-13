@@ -28,7 +28,7 @@ const MODEL_TEXT = 'Attackers are other repo users, not the owner. An owner-only
 const yml = (paths = '[src/a.js]', text = MODEL_TEXT) => `${pipelineYml()}review:\n  arbiter_always_paths: [src/a.js]\n  threat_models:\n    - name: guards\n      paths: ${paths}\n      text: "${text}"\n`;
 
 function world(t, { baseYml = yml(), prYml, parentYml, prBase = 'main' } = {}) {
-  const repo = createTmpRepo();
+  const repo = createTmpRepo({ highEffort: true });
   t.after(() => repo.cleanup());
   repo.write('.claude/pipeline.yml', baseYml);
   repo.write('.gitignore', '.review/\n');
