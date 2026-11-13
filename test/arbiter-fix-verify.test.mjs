@@ -11,7 +11,7 @@ import { fileURLToPath } from 'node:url';
 import { assertExit } from './helpers/assert-exit.mjs';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
 import { SHARED_FLOOR_DIR, floorEnv } from './helpers/floor-env.mjs';
-import { createFakeGh, pipelineYml, REPO_VIEW } from './helpers/fakegh-env.mjs';
+import { createFakeGh, NO_COMMENTS, pipelineYml, REPO_VIEW } from './helpers/fakegh-env.mjs';
 import { BRIEFS, acceptedEfforts, effortsAtLeast, expectationOf, fixRoundCandidate, previousAccepts } from '../pipeline/lib/fix-verify.mjs';
 import { proveModel } from '../pipeline/lib/transcript.mjs';
 import { buildAgentLogLine, countArbiterCalls, countFixVerifyCalls } from '../pipeline/lib/agentlog.mjs';
@@ -32,6 +32,7 @@ const fenced = (obj) => `Done.\n\n\`\`\`json\n${JSON.stringify(obj)}\n\`\`\``;
 const GH = [
   { match: '^pr view 7', stdoutJson: { title: 'Add compute', body: 'Adds compute() to a.js', headRefName: 'feat/x' } },
   { match: '^repo view', stdoutJson: REPO_VIEW },
+  ...NO_COMMENTS,
 ];
 
 // Every Fable round here comes from src/a.js being a path the config sends to Fable each round; src/b.js is the "fix" file.
@@ -539,4 +540,18 @@ test('telemetry: the agent-log line shows the Fable passes and how many were fix
   assert.match(buildAgentLogLine({ state, pr: 9, title: 't', outcome: 'merged', now: new Date('2026-11-11T00:00:00Z') }), /rounds 5 · arbiter 3 \(fix-verify 2\) · merged$/);
   assert.equal(agentLogLine({ date: '2026-11-11', pr: 1, title: 't', risk: 'low', rounds: 2, arbiterCalls: 1, outcome: 'merged' }), '- 2026-11-11 · #1 · t · risk low · rounds 2 · arbiter 1 · merged');
   assert.equal(agentLogLine({ date: '2026-11-11', pr: 1, title: 't', risk: 'low', rounds: 2, arbiterCalls: 2, fixVerifyCalls: 1, outcome: 'merged' }), '- 2026-11-11 · #1 · t · risk low · rounds 2 · arbiter 2 (fix-verify 1) · merged');
+});
+
+test('arbiter needed: a P-path-only round range is the fix-verify brief when risk.ignore_hard_stop_rules lists P-path in BOTH configs, the full brief when it does not', (t) => {
+  const ignoring = 'risk:\n  ignore_hard_stop_rules: [P-path]\n';
+  const w = fixWorld(t, { yml: YML(`hard_stops:\n  paths: [src/hard.js]\n${ignoring}`), files: { 'src/b.js': bFile(true), 'src/hard.js': 'export const h = 1;\n' } });
+  const r = w.needed(2);
+  assertExit(r, 0, r.stdout + r.stderr);
+  assert.deepEqual([r.json.scope, r.json.brief, r.json.agent], ['round', 'fix-verify', 'arbiter-fix']);
+  // the list is only in the working tree: the committed (base) config still counts the hit, so the brief is full
+  const w2 = fixWorld(t, { yml: YML('hard_stops:\n  paths: [src/hard.js]\n'), files: { 'src/b.js': bFile(true), 'src/hard.js': 'export const h = 1;\n' } });
+  writeFileSync(join(w2.repo.dir, '.claude', 'pipeline.yml'), YML(`hard_stops:\n  paths: [src/hard.js]\n${ignoring}`));
+  const r2 = w2.needed(2);
+  assertExit(r2, 0, r2.stdout + r2.stderr);
+  assert.deepEqual([r2.json.scope, r2.json.brief], ['round', 'full']);
 });

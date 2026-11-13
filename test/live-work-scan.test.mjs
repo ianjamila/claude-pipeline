@@ -13,7 +13,8 @@ import { ScanDeadline, scanLiveWork } from '../pipeline/lib/live-work-scan.mjs';
 import { release, tryAcquire } from '../pipeline/lib/locks.mjs';
 import { openRecord } from '../pipeline/lib/merge-queue.mjs';
 import { knownRepos, registerRepo } from '../pipeline/lib/queue-sweep.mjs';
-import { openOrRenewLease } from '../pipeline/lib/review-lease.mjs';
+import { onlyScanErrors } from '../pipeline/lib/auto-update.mjs';
+import { closeLease, openOrRenewLease, sweepDeadLeases } from '../pipeline/lib/review-lease.mjs';
 
 const MACHINE = 'test-machine-id';
 process.env.PIPELINE_MACHINE_ID ||= MACHINE;
@@ -360,15 +361,27 @@ test('a repository whose `git worktree list` fails is a scan-error entry, not ju
   assert.match(e.detail, /git worktree list/);
 });
 
-test('a jobs folder that cannot be listed (not ENOENT) is a scan-error; a missing one is simply no jobs', () => {
+test('a jobs folder that cannot be listed (not ENOENT / ENOTDIR) is a scan-error; a missing one, or one under a file, is simply no jobs', { skip: process.platform === 'win32' || process.getuid?.() === 0 }, (t) => {
   const w = world();
   const a = repoIn(w, 'a');
   const b = repoIn(w, 'b');
-  mkdirSync(join(a, '.review'), { recursive: true });
-  writeFileSync(join(a, '.review', 'jobs'), 'a file where the jobs folder should be');
+  mkdirSync(join(a, '.review', 'jobs'), { recursive: true });
+  chmodSync(join(a, '.review', 'jobs'), 0o000);
+  t.after(() => chmodSync(join(a, '.review', 'jobs'), 0o700));
   const live = w.scan({ repos: [a, b] });
   assert.equal(live.filter((x) => x.kind === 'scan-error' && x.worktree === a).length, 1, JSON.stringify(live));
   assert.equal(live.some((x) => x.worktree === b), false, 'no jobs folder at all is not an error');
+});
+
+test('#259: a jobs folder under a FILE (ENOTDIR) is no jobs, not a scan-error: a job needs .review/jobs/<name>/', () => {
+  const w = world();
+  const a = repoIn(w, 'a');
+  mkdirSync(join(a, '.review'), { recursive: true });
+  writeFileSync(join(a, '.review', 'jobs'), 'a file where the jobs folder should be');
+  assert.deepEqual(w.scan({ repos: [a] }), []);
+  rmSync(join(a, '.review'), { recursive: true, force: true }); // ENOTDIR one level up as well
+  writeFileSync(join(a, '.review'), 'a file');
+  assert.deepEqual(w.scan({ repos: [a] }), []);
 });
 
 test('a job folder whose record cannot be read counts as live; a stray file in the jobs folder does not', () => {
@@ -414,4 +427,89 @@ test('R3-B1 / R3-F2: a meta.json of {} / [] / 1, or an exit.json of {} next to a
   assert.match(live[0].detail, /^job odd has an unreadable record \(exit\.json\), treated as running: remove /);
   writeFileSync(join(dir, 'exit.json'), JSON.stringify({ code: 0, finishedAt: new Date().toISOString() }));
   assert.deepEqual(w.scan({ repos: [repo] }), [], 'a well-formed exit.json: done');
+});
+
+// ---- #258: the remove hint is its own field; #259 / #249: an uncertain lease is a scan-error -----------------------------------------------
+
+test('#258: an unreadable job record keeps the legacy text in detail (old installed readers) AND carries the same instruction as a `hint` field; a running job has no hint', () => {
+  const w = world();
+  const repo = repoIn(w);
+  const bad = jobIn(repo, 'broken', { runnerPid: process.pid });
+  writeFileSync(join(bad, 'meta.json'), '{ not json');
+  jobIn(repo, 'fine', { runnerPid: process.pid });
+  const live = w.scan({ repos: [repo] });
+  const e = live.find((x) => /job broken/.test(x.detail));
+  assert.equal(e.kind, 'job');
+  assert.equal(e.hint, 'remove .review/jobs/broken in that worktree if it is stale');
+  assert.match(e.detail, /^job broken has an unreadable record \(.+\), treated as running: remove \.review\/jobs\/broken in that worktree if it is stale$/);
+  const ok = live.find((x) => /job fine/.test(x.detail));
+  assert.equal('hint' in ok, false);
+});
+
+const START = 'Thu Nov 12 07:00:00 2026';
+const esrch = () => { throw Object.assign(new Error('gone'), { code: 'ESRCH' }); };
+// A terminal process lease in the scratch lease folder (the real file shape), judged with the given ps / kill answers.
+async function procLease(w, wt, { pid = 4242, hex = '0123abcd' } = {}) {
+  const base = { ...w.leaseOpts, env: {}, ancestorPid: null, now: Date.now(), starts: () => new Map([[pid, START]]), kill: () => {}, jobLive: () => false };
+  const holder = { sessionId: `proc-${pid}-${hex}`, pid, pidStart: START };
+  const { generation } = await openOrRenewLease({ worktree: wt, repoId: 'acme/app', pr: 7, command: 'codex-review', processHolder: holder, ...base });
+  return { base, holder, generation, file: join(w.leases, `${holder.sessionId}.json`) };
+}
+
+test('#249 / #259: a live terminal-process lease stays a lease and gains command / holder / pid; an UNCERTAIN one (ps cannot answer) is a scan-error naming session, worktree, cause and the hint', async () => {
+  const w = world();
+  const wt = join(w.root, 'wt');
+  mkdirSync(wt, { recursive: true });
+  const p = await procLease(w, wt);
+  const [lease] = w.scan({ leaseOpts: p.base });
+  assert.equal(lease.kind, 'lease');
+  assert.deepEqual({ command: lease.command, holder: lease.holder, pid: lease.pid }, { command: 'codex-review', holder: 'process', pid: 4242 });
+  assert.equal('hint' in lease, false);
+  const uncertain = w.scan({ leaseOpts: { ...p.base, starts: () => null } });
+  const [err] = uncertain;
+  assert.equal(err.kind, 'scan-error');
+  assert.equal(err.sessionId, p.holder.sessionId);
+  assert.equal(err.worktree, wt);
+  assert.ok(err.detail.startsWith(`cannot judge the review lease of ${p.holder.sessionId} on ${wt}: cannot confirm that terminal process 4242 (pipeline codex-review) has ended: ps unavailable`), err.detail);
+  assert.equal(err.hint, `delete ${p.file} if no pipeline command is running in a terminal`);
+  assert.equal(err.detail.includes(err.hint), false, 'the hint is its own field, not inside the detail');
+  assert.equal(onlyScanErrors(uncertain), true);
+});
+
+test('an unreadable proc- / job- lease file is a scan-error with the delete hint; any other unreadable lease file stays a lease', () => {
+  const w = world();
+  mkdirSync(w.leases, { recursive: true });
+  writeFileSync(join(w.leases, 'proc-4242-0123abcd.json'), '{ not json');
+  writeFileSync(join(w.leases, 'job-0123456789abcdef.json'), '{}');
+  writeFileSync(join(w.leases, 'sess-odd.json'), '[]');
+  const live = w.scan();
+  const by = Object.fromEntries(live.map((e) => [e.sessionId, e]));
+  for (const id of ['proc-4242-0123abcd', 'job-0123456789abcdef']) {
+    assert.equal(by[id].kind, 'scan-error', id);
+    assert.equal(by[id].hint, `delete ${join(w.leases, `${id}.json`)} if no pipeline command is running in a terminal`);
+    assert.ok(by[id].detail.startsWith(`cannot judge the review lease of ${id}: unreadable lease file`), by[id].detail);
+  }
+  assert.equal(by['sess-odd'].kind, 'lease');
+  assert.equal(onlyScanErrors(live), false, 'the odd session file is a lease, so not only scan errors');
+});
+
+test('#259 integration: an unreadable jobs folder behind a dead process lease: the sweep keeps it, the scan reports one scan-error (only scan errors), close says jobRunning unknown and keeps it', async () => {
+  const w = world();
+  const wt = join(w.root, 'wt');
+  mkdirSync(wt, { recursive: true });
+  const p = await procLease(w, wt);
+  const unreadable = { ...p.base, starts: () => new Map(), kill: esrch, jobLive: () => ({ unreadable: 'EACCES' }) };
+  assert.deepEqual((await sweepDeadLeases(unreadable)).removed, [], 'the sweep keeps a lease it cannot clear');
+  const live = w.scan({ leaseOpts: unreadable });
+  assert.equal(live.length, 1, JSON.stringify(live));
+  assert.equal(live[0].kind, 'scan-error');
+  assert.match(live[0].detail, /jobs folder .* cannot be read \(EACCES\)/);
+  assert.equal(onlyScanErrors(live), true);
+  const closed = await closeLease({ worktree: wt, generation: p.generation, processHolder: p.holder, ...unreadable });
+  assert.equal(closed.jobRunning, 'unknown');
+  const after = w.scan({ leaseOpts: unreadable });
+  assert.equal(after.length, 1, 'the job-scoped lease is kept');
+  assert.equal(after[0].kind, 'scan-error');
+  assert.equal(onlyScanErrors(after), true);
+  assert.deepEqual(w.scan({ leaseOpts: { ...unreadable, jobLive: () => false } }), [], 'readable again and no job: dead, nothing live');
 });

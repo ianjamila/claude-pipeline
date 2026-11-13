@@ -10,15 +10,17 @@
 // while the agent was still working (a queued prompt records nothing).
 try {
   const { readHookInput } = await import('./lib/hook-io.mjs');
-  const { recordApproval, recordRuling, recordRoundGrant, rulingNudge, queuedNudge } = await import('./lib/owner-go.mjs');
+  const { recordApproval, recordRuling, recordRoundGrant, recordPastRoundGrant, rulingNudge, queuedNudge } = await import('./lib/owner-go.mjs');
   const input = await readHookInput();
   const record = recordApproval(input);
   const ruling = recordRuling(input);
   const round = recordRoundGrant(input);
+  const past = recordPastRoundGrant(input); // (the 🔂 line and the 🔁 line are exclusive: at most one of round / past records)
   // (#191 F3) a queued answer records nothing; its nudge takes precedence over the ruling nudge
-  const nudge = ruling || round ? null : (queuedNudge(input) ?? rulingNudge(input));
+  const nudge = ruling || round || past ? null : (queuedNudge(input) ?? rulingNudge(input));
   if (ruling) process.stdout.write(`[claude-pipeline owner-go] the owner's ruling is recorded for ${ruling.repo} #${ruling.pr}: ${ruling.ids.join(', ')} (pass words from it as --owner-quote).\n`);
   if (round) process.stdout.write(`[claude-pipeline owner-go] the owner's extra round is recorded for ${round.repo} #${round.pr} counted round ${round.k} head ${round.head.slice(0, 12)}: run P codex-review --pr ${round.pr} --round <the n from round-request>\n`);
+  else if (past) process.stdout.write(`[claude-pipeline owner-go] the owner's past-round approval is recorded for ${past.repo} #${past.pr} counted round ${past.k} head ${past.head.slice(0, 12)}: run P state past-round-grant --pr ${past.pr} --round <the n from round-request --past>\n`);
   else if (nudge) process.stdout.write(`${nudge}\n`);
   if (record) {
     const shown = record.requests.map((q) => `${q.repo ?? '(no repo: approves nothing)'} #${q.pr} head ${q.head} items ${q.items}`);

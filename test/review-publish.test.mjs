@@ -16,8 +16,8 @@ import { assertExit } from './helpers/assert-exit.mjs';
 import { addRound, decodeFromComment, emptyState, saveState } from '../pipeline/lib/state.mjs';
 import { MARKERS, triageComment } from '../pipeline/lib/render.mjs';
 import { REVIEW_COMPLETE_MARKER } from '../pipeline/lib/review-marker.mjs';
-import { establishBaseline, readBaseline, readPublished, publishTriage, reviewContentHash, writeBaseline } from '../pipeline/lib/review-publish.mjs';
-import { reviewLockName } from '../pipeline/lib/review-context.mjs';
+import { assertPublishedHistory, establishBaseline, readBaseline, readPublished, publishTriage, reviewContentHash, writeBaseline } from '../pipeline/lib/review-publish.mjs';
+import { adoptPublishedGrants, compareHistory, historyPreserved, reviewLockName } from '../pipeline/lib/review-context.mjs';
 import { reviewEligibilityProblems, rulingContentDigest, rulingsBlock, rulingsDigest, rulingsInventory } from '../pipeline/lib/triage.mjs';
 import { buildReviewPrompt } from '../pipeline/lib/codex.mjs';
 
@@ -176,6 +176,138 @@ test('publishTriage: a failed upsert leaves the baseline alone', (t) => {
   assert.equal(readBaseline(root, 7), null);
 });
 
+// ---- published history: rounds and owner grants are add-only (plan 2026-11-12-legacy-round-grants.md, A) ---------------------------------
+
+const GRANT = { grantId: 'g-3', k: 3, quote: 'extra round', ownerTs: '2026-11-05T10:00:00.000Z' };
+// A state with rounds 1..count (one item each); every round has its own toHead so an identity mismatch is easy to make.
+const history = (count, { grants = {} } = {}) => {
+  let st = emptyState({ repo: 'acme/widgets', pr: 7, branch: 'feat/x' });
+  for (let n = 1; n <= count; n += 1) {
+    st = addRound(st, {
+      n, fromHead: String(n - 1).repeat(40), toHead: String(n).repeat(40), contentHashAtToHead: H(String(n)), items: [it(`R${n}-B1`)],
+      ...(grants[n] ? { ownerGrant: grants[n] } : {}),
+    });
+  }
+  return st;
+};
+const withRound = (state, n, over) => ({ ...state, rounds: state.rounds.map((r) => (r.n === n ? { ...r, ...over } : r)) });
+const refused = (fn, error) => assert.throws(fn, (e) => { assert.equal(e.exitCode, 1); assert.equal(e.output.error, error); return true; });
+
+test('historyPreserved / compareHistory: rounds by identity, grants add-only, decisions free', () => {
+  const pub = history(3, { grants: { 3: GRANT } });
+  const ok = (local) => historyPreserved(local, pub);
+  assert.deepEqual(ok(pub), { ok: true, lostRounds: [], lostGrants: [] });
+  assert.equal(ok(change(pub, 'R1-B1', { final: decided({ reason: 'another decision' }) })).ok, true, 'decisions may differ');
+  assert.equal(ok(history(4, { grants: { 3: GRANT } })).ok, true, 'a trailing round is fine');
+  assert.deepEqual(ok(history(2)), { ok: false, lostRounds: [3], lostGrants: [] }, 'a dropped round');
+  assert.deepEqual(ok(emptyState({ repo: 'acme/widgets', pr: 7, branch: 'b' })).lostRounds, [1, 2, 3]);
+  assert.deepEqual(ok(withRound(pub, 2, { toHead: 'e'.repeat(40) })).lostRounds, [2], 'another round wearing the number');
+  assert.deepEqual(ok(withRound(pub, 2, { contentHashAtToHead: H('e') })).lostRounds, [2]);
+  assert.deepEqual(ok(history(3)), { ok: false, lostRounds: [], lostGrants: [3] }, 'a dropped grant');
+  assert.deepEqual(ok(history(3, { grants: { 3: { ...GRANT, quote: 'edited' } } })).lostGrants, [3], 'an altered grant');
+  assert.equal(historyPreserved(history(3, { grants: { 1: GRANT } }), history(3)).ok, true, 'a grant only the local side holds is an addition');
+  assert.equal(historyPreserved(null, history(0)).ok, true);
+
+  assert.equal(compareHistory(pub, pub), 'in-sync');
+  assert.equal(compareHistory(change(pub, 'R1-B1', { reason: 'x' }), pub), 'in-sync', 'decisions are not history');
+  assert.equal(compareHistory(history(4, { grants: { 3: GRANT } }), pub), 'local-ahead');
+  assert.equal(compareHistory(history(3, { grants: { 3: GRANT, 1: GRANT } }), pub), 'local-ahead', 'a grant added on an identity-equal round');
+  assert.equal(compareHistory(history(2), pub), 'local-behind');
+  assert.equal(compareHistory(null, pub), 'local-behind');
+  assert.equal(compareHistory(history(3), pub), 'local-behind', 'the PR holds a grant this copy lacks');
+  assert.equal(compareHistory(history(4), pub), 'diverged', 'ahead by a round, behind by a grant');
+  assert.equal(compareHistory(withRound(pub, 2, { toHead: 'e'.repeat(40) }), pub), 'diverged');
+  assert.equal(compareHistory(history(3, { grants: { 3: { ...GRANT, quote: 'edited' } } }), pub), 'diverged');
+  // a local round numbered below the newest published one, which the PR lacks, is no trailing round
+  const gap = { ...history(3), rounds: history(3).rounds.filter((r) => r.n !== 2) };
+  assert.equal(compareHistory(history(3), gap), 'diverged');
+  assert.equal(compareHistory(history(0), history(0)), 'in-sync');
+});
+
+test('adoptPublishedGrants: copies the PR\'s grant (and its admission) onto an identity-equal round and touches nothing else', () => {
+  const pub = history(3, { grants: { 3: GRANT } });
+  const local = change(history(4), 'R1-B1', { reason: 'local decision' });
+  const { state, restored } = adoptPublishedGrants(local, pub);
+  assert.deepEqual(restored, [3]);
+  assert.deepEqual(state.rounds[2].ownerGrant, GRANT);
+  assert.equal(state.rounds[2].admission, 'owner');
+  assert.equal(state.rounds.length, 4, 'the trailing round stays');
+  assert.equal(state.rounds[0].items[0].reason, 'local decision');
+  assert.equal(adoptPublishedGrants(pub, pub).state, pub, 'nothing to copy: the same object');
+  assert.deepEqual(adoptPublishedGrants(withRound(history(3), 3, { toHead: 'e'.repeat(40) }), pub).restored, [], 'another round is not given the grant');
+});
+
+test('publishTriage: refuses history-loss on the baseline path (dropped rounds, a dropped or altered grant) while decisions may still change', (t) => {
+  const pub = history(3, { grants: { 3: GRANT } });
+  const attempt = (local, name) => {
+    const root = tmpRoot(t);
+    const gh = memGh([mine(pub)]);
+    writeBaseline(root, 7, reviewContentHash(pub)); // what a forged or merely current baseline looks like: equal to the PR's hash
+    const body = gh.comments[0].body;
+    return { root, gh, body, run: () => publishTriage({ gh, root, pr: 7, state: local }), name };
+  };
+  for (const [name, local, re] of [
+    ['dropped rounds', change(history(1), 'R1-B1', { reason: 'edited' }), /rounds 2, 3/],
+    ['dropped round', history(2, { grants: {} }), /round 3/],
+    ['dropped grant', change(history(3), 'R1-B1', { reason: 'edited' }), /owner grant on round 3/],
+    ['altered grant', history(3, { grants: { 3: { ...GRANT, ownerTs: '2026-11-06T10:00:00.000Z' } } }), /owner grant on round 3/],
+    ['another round 2', withRound(pub, 2, { toHead: 'e'.repeat(40) }), /round 2/],
+  ]) {
+    const a = attempt(local, name);
+    assert.throws(a.run, (e) => {
+      assert.equal(e.exitCode, 1, name);
+      assert.equal(e.output.error, 'history-loss', name);
+      assert.match(e.output.reason, re, name);
+      assert.match(e.output.reason, /pipeline state show --pr 7/, name);
+      assert.equal(e.output.pr, 7);
+      return true;
+    }, name);
+    assert.equal(a.gh.upserts, 0, `${name}: nothing was written`);
+    assert.equal(a.gh.comments[0].body, a.body, `${name}: the comment is unchanged`);
+    assert.equal(readBaseline(a.root, 7), reviewContentHash(pub), `${name}: the baseline did not move`);
+  }
+  // decisions changing, a grant being added and a trailing round all publish on that same baseline
+  const root = tmpRoot(t);
+  const gh = memGh([mine(pub)]);
+  writeBaseline(root, 7, reviewContentHash(pub));
+  const next = change(withRound(history(4, { grants: { 3: GRANT } }), 2, { ownerGrant: { ...GRANT, grantId: 'g-2', k: 2 } }), 'R1-B1', { final: decided({ reason: 'changed' }) });
+  assert.equal(publishTriage({ gh, root, pr: 7, state: next }).action, 'updated');
+  assert.equal(readBaseline(root, 7), reviewContentHash(next));
+});
+
+test('publishTriage: refuses history-loss on the no-baseline path too, ahead of stale-publication', (t) => {
+  const pub = history(3, { grants: { 3: GRANT } });
+  for (const [name, local] of [['a shorter history', history(1)], ['a dropped grant', history(3)]]) {
+    const root = tmpRoot(t);
+    const gh = memGh([mine(pub)]);
+    const body = gh.comments[0].body;
+    refused(() => publishTriage({ gh, root, pr: 7, state: local }), 'history-loss');
+    assert.equal(gh.upserts, 0, name);
+    assert.equal(gh.comments[0].body, body, name);
+    assert.equal(readBaseline(root, 7), null, `${name}: no baseline was invented`);
+  }
+  // a decision-only difference without a baseline is still the old stale-publication question, not history-loss
+  const root = tmpRoot(t);
+  refused(() => publishTriage({ gh: memGh([mine(pub)]), root, pr: 7, state: change(pub, 'R1-B1', { final: decided({ reason: 'other' }) }) }), 'stale-publication');
+});
+
+test('assertPublishedHistory: no comment passes; unreadable, behind, diverged and ahead are refused with their remedy', () => {
+  const pub = history(2, { grants: { 2: { ...GRANT, k: 2 } } });
+  const check = (comments, state) => () => assertPublishedHistory({ gh: memGh(comments), pr: 7, state });
+  const fails = (fn, error, re) => assert.throws(fn, (e) => { assert.equal(e.exitCode, 2); assert.equal(e.output.error, error); assert.match(e.output.message, re); return true; });
+  check([], null)();
+  check([], history(2))();
+  check([{ ...mine(pub), user: { login: 'mallory' } }], null)(); // someone else's comment is no history
+  check([mine(pub)], pub)();
+  check([mine(pub)], change(pub, 'R1-B1', { reason: 'x' }))(); // decisions are not history
+  fails(check([{ ...mine(pub), body: `${MARKERS.triage}\nno state` }], null), 'history-unreadable', /comment --pr 7 --kind triage/);
+  fails(check([mine(pub)], null), 'stale-history', /rounds 1, 2.*pipeline state show --pr 7/);
+  fails(check([mine(pub)], history(1)), 'stale-history', /pipeline state show --pr 7/);
+  fails(check([mine(pub)], history(2)), 'stale-history', /owner grant on round 2/);
+  fails(check([mine(pub)], history(3, { grants: { 2: { ...GRANT, k: 2 } } })), 'unpublished-history', /comment --pr 7 --kind triage/);
+  fails(check([mine(pub)], withRound(pub, 1, { toHead: 'e'.repeat(40) })), 'stale-history', /pipeline state show --pr 7/);
+});
+
 test('establishBaseline (R6-F1): with a baseline already present it makes no GitHub read; without one it reads once and writes it when the states are equal', (t) => {
   const root = tmpRoot(t);
   const s = mk([it('R1-B1')]);
@@ -209,19 +341,19 @@ test('establishBaseline (R7-F1): a passed published result is used as is, with n
 
 const CHAT_YML = `${pipelineYml()}owner_approval: chat\n`;
 
-function world(t, { origin = null } = {}) {
+function world(t, { origin = null, yml = CHAT_YML, gh = [] } = {}) {
   const scratch = realpathSync.native(mkdtempSync(join(tmpdir(), 'cp-pubw-')));
   t.after(() => rmSync(scratch, { recursive: true, force: true }));
   const repo = createTmpRepo();
   t.after(() => repo.cleanup());
-  repo.write('.claude/pipeline.yml', CHAT_YML);
+  repo.write('.claude/pipeline.yml', yml);
   repo.write('.gitignore', '.review/\n');
   repo.write('src/a.js', 'export const a = 1;\n');
   repo.commit('init');
   if (origin) repo.git(['remote', 'add', 'origin', origin]);
   const dirB = join(scratch, 'wt-b');
   repo.git(['worktree', 'add', '-q', dirB, '-b', 'other']);
-  const fake = createCommentsGh([{ match: '^repo view', stdoutJson: { ...REPO_VIEW, nameWithOwner: 'acme/widgets', url: 'https://github.com/acme/widgets' } }]);
+  const fake = createCommentsGh([{ match: '^repo view', stdoutJson: { ...REPO_VIEW, nameWithOwner: 'acme/widgets', url: 'https://github.com/acme/widgets' } }, ...gh]);
   const lockDir = join(scratch, 'locks');
   const w = {
     A: repo.dir, B: dirB, fake, lockDir, scratch, repo,
@@ -293,6 +425,61 @@ test('comment --kind triage takes the review lock: a holder in another worktree 
   await new Promise((resolve) => holder.once('exit', resolve));
   assertExit(w.comment(w.B), 0);
   assert.equal(w.fake.comments().length, 1);
+});
+
+// ---- the redraft advice (plan 2026-11-12-redraft-fix-rounds): the triage publication of a round with a fix coming, on a READY PR of a repo that iterates in draft ----
+
+const ITERATING_YML = `${CHAT_YML}`.replace('  guard_checks: false\n', '  guard_checks: false\n  draft_while_iterating: true\n');
+const prReads = (w) => w.fake.lines().filter((l) => /^pr view 7 --json isDraft$/.test(l));
+const readyGh = (view) => [{ match: '^pr view 7 --json isDraft$', ...view }];
+
+test('comment --kind triage advice: an ACCEPT item still to fix on a READY PR of an iterating repo warns to run `pipeline redraft --pr N`, the publication still succeeds', (t) => {
+  const w = world(t, { yml: ITERATING_YML, gh: readyGh({ stdoutJson: { isDraft: false } }) });
+  saveState(w.A, mk([it('R1-B1'), it('R1-S1', { bucket: 'SUGGESTION', final: decided({ decision: 'REJECT' }) })]));
+  const r = w.comment(w.A);
+  assertExit(r, 0, r.stdout + r.stderr);
+  assert.equal(r.json.ok, true);
+  assert.equal(r.json.action, 'created');
+  assert.equal(r.json.redraftAdvice, true);
+  assert.equal(r.json.warnings.length, 1);
+  assert.match(r.json.warnings[0], /PR #7 is ready/);
+  assert.match(r.json.warnings[0], /`pipeline redraft --pr 7`/);
+  assert.equal(w.fake.comments().length, 1);
+});
+
+test('comment --kind triage advice: none when nothing is left to fix (no ACCEPT, an implemented ACCEPT, a needs-human one), and then the PR is not read', (t) => {
+  for (const [name, items] of [
+    ['no ACCEPT', [it('R1-B1', { final: decided({ decision: 'REJECT' }) }), it('R1-S1', { bucket: 'SUGGESTION', final: decided({ decision: 'FOLLOW-UP' }) })]],
+    ['implemented', [it('R1-B1', { implemented: true })]],
+    ['needs human', [it('R1-B1', { final: waiting() })]],
+  ]) {
+    const w = world(t, { yml: ITERATING_YML, gh: readyGh({ stdoutJson: { isDraft: false } }) });
+    saveState(w.A, mk(items));
+    const r = w.comment(w.A);
+    assertExit(r, 0, name + r.stdout + r.stderr);
+    assert.equal(r.json.ok, true, name);
+    assert.equal('redraftAdvice' in r.json, false, name);
+    assert.equal('warnings' in r.json, false, name);
+    assert.deepEqual(prReads(w), [], `${name}: the PR is not read`);
+  }
+});
+
+test('comment --kind triage advice: none for a draft PR, a repo that does not iterate (PR not read), or an unreadable PR (never a failure)', (t) => {
+  const none = (w, why) => {
+    saveState(w.A, mk([it('R1-B1')]));
+    const r = w.comment(w.A);
+    assertExit(r, 0, why + r.stdout + r.stderr);
+    assert.equal(r.json.ok, true, why);
+    assert.equal(r.json.action, 'created', why);
+    assert.equal('redraftAdvice' in r.json, false, why);
+    assert.equal('warnings' in r.json, false, why);
+    return r;
+  };
+  none(world(t, { yml: ITERATING_YML, gh: readyGh({ stdoutJson: { isDraft: true } }) }), 'draft: ');
+  const plain = world(t, { gh: readyGh({ stdoutJson: { isDraft: false } }) });
+  none(plain, 'not iterating: ');
+  assert.deepEqual(prReads(plain), [], 'not iterating: the PR is not read');
+  none(world(t, { yml: ITERATING_YML, gh: readyGh({ code: 1, stderr: 'gh: Server Error (HTTP 502)' }) }), 'unreadable: ');
 });
 
 test('comment --kind triage: other kinds take no lock, and a state of another PR is refused', async (t) => {
@@ -628,6 +815,67 @@ test('state discard-round: refused while the round holds a second-review verdict
 });
 
 // ---- the lock key -------------------------------------------------------------------------------
+
+test('history-loss, Fable trigger B: a fresh worktree that ran round 1 cannot publish over the longer published history', (t) => {
+  const w = world(t);
+  const pub = history(3, { grants: { 3: GRANT } });
+  saveState(w.A, pub);
+  assertExit(w.comment(w.A), 0);
+  const before = w.fake.comments().map((c) => c.body);
+  // B never restored: no state, no baseline. It started its own round 1 (codex-review now refuses that; this is the publish side of the defence).
+  saveState(w.B, history(1));
+  const r = w.comment(w.B);
+  assertExit(r, 1, r.stdout + r.stderr);
+  assert.equal(r.json.error, 'history-loss');
+  assert.match(r.json.reason, /rounds 2, 3/);
+  assert.deepEqual(w.fake.comments().map((c) => c.body), before, 'the PR still holds the full history');
+  assert.ok(!existsSync(join(w.B, '.review', 'published-baseline.json')), 'no baseline was written');
+  assert.equal(w.state(w.B).rounds.length, 1, 'the local state is unchanged');
+});
+
+test('history-loss, Fable trigger A: a stale checkout with a forged baseline equal to the published hash cannot publish a shorter history', (t) => {
+  const w = world(t);
+  const pub = history(3, { grants: { 3: GRANT } });
+  saveState(w.A, pub);
+  assertExit(w.comment(w.A), 0);
+  const before = w.fake.comments().map((c) => c.body);
+  const stale = change(history(1), 'R1-B1', { final: decided({ reason: 'edited here' }) });
+  saveState(w.B, stale);
+  writeBaseline(w.B, 7, reviewContentHash(pub)); // the forgery the guard now blocks for agents: the baseline file claims this copy saw the PR's state
+  const r = w.comment(w.B);
+  assertExit(r, 1, r.stdout + r.stderr);
+  assert.equal(r.json.error, 'history-loss');
+  assert.match(r.json.reason, /rounds 2, 3/);
+  assert.deepEqual(w.fake.comments().map((c) => c.body), before);
+  assert.deepEqual(w.baseline(w.B), { pr: 7, hash: reviewContentHash(pub) }, 'the baseline file is as it was');
+  assert.equal(reviewContentHash(w.state(w.B)), reviewContentHash(stale), 'the local state is unchanged');
+});
+
+test('state show: owner grants the PR holds are copied onto the local rounds, local trailing rounds and decisions are kept, nothing is quarantined', (t) => {
+  const w = world(t);
+  const pub = history(2, { grants: { 2: { ...GRANT, k: 2 } } });
+  w.fake.addComment({ body: triageBody(pub) }); // published by another checkout of ours
+  const local = history(3); // no grant on round 2, a trailing round 3
+  saveState(w.A, local);
+  writeBaseline(w.A, 7, H('f')); // an older baseline
+  const r = w.show(w.A);
+  assertExit(r, 0, r.stdout + r.stderr);
+  assert.equal(r.json.source, 'local');
+  assert.deepEqual(r.json.grantsRestored, [2]);
+  assert.equal(readdirSync(join(w.A, '.review')).filter((n) => n.startsWith('stale-')).length, 0, 'nothing was quarantined');
+  const after = w.state(w.A);
+  assert.deepEqual(after.rounds[1].ownerGrant, { ...GRANT, k: 2 });
+  assert.equal(after.rounds[1].admission, 'owner');
+  assert.equal(after.rounds.length, 3, 'the trailing round is kept');
+  assert.equal(reviewContentHash({ rounds: after.rounds.slice(0, 2) }), reviewContentHash(pub), 'the published rounds are as published now');
+  assert.deepEqual(w.baseline(w.A), { pr: 7, hash: reviewContentHash(pub) });
+  // and the copy can publish now, adding its trailing round
+  assert.equal(w.comment(w.A).json.action, 'updated');
+  assert.equal(w.pub().rounds.length, 3);
+  assert.deepEqual(w.pub().rounds[1].ownerGrant, { ...GRANT, k: 2 });
+  // asked again: nothing left to copy
+  assert.equal(w.show(w.A).json.grantsRestored, undefined);
+});
 
 test('reviewLockName: one name per repository and PR across worktrees and clones; no origin and no repository never throw', (t) => {
   const w = world(t, { origin: 'https://github.com/Acme/Widgets.git' });

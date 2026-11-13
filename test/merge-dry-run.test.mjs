@@ -550,3 +550,18 @@ test('dry run --owner-go with merge.hold_* keys: queue OFF reports a hold ahead;
   assert.equal('holdEligible' in d.r.json.ownerStep, false);
   assert.deepEqual(holdCalls(on), [], 'the hold provider was never asked');
 });
+
+test('dry run, cp-like config (owner_approval chat, every path a P-path hit, P-path ignored for risk) with a recorded LOW risk: ends at the owner step, never the low-risk path', () => {
+  const yml = `${ymlFor()}hard_stops:\n  paths: ['src/**']\nowner_approval: chat\nrisk:\n  ignore_hard_stop_rules: [P-path]\n`;
+  const s = scenario({ yml, gh: { mergeStateStatus: 'CLEAN' } });
+  s.fake.setScript(script(s));
+  const g = s.gate();
+  assertExit(g, 0, `${g.stderr}${g.stdout}`);
+  assert.ok(g.json.ownerMerge > 0, 'the P-path hit is still an owner-merge item');
+  const statePath = join(s.repo.dir, '.review', 'state.json');
+  if (existsSync(statePath)) writeFileSync(statePath, JSON.stringify({ ...JSON.parse(readFileSync(statePath, 'utf8')), risk: 'low' }));
+  const d = dry(s);
+  assertExit(d.r, 0, `${d.r.stderr}${d.r.stdout}`);
+  assert.equal(d.r.json.ownerStep?.kind, 'owner-runs');
+  assert.notEqual(d.r.json.ownerStep, null, 'a low recorded risk must not skip the owner step');
+});

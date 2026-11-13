@@ -148,3 +148,24 @@ test('the review skill says one closing keyword per issue (GitHub links only the
   assert.match(skill, /one keyword per issue, `Closes #1\. Closes #2\.`/);
   assert.match(skill, /one keyword per issue, `Closes #170\. Closes #171\.` \(GitHub closes only the first number of\s+`Closes #170, #171`\)/);
 });
+
+test('extra-round discipline: the ask shows rounds, cost and severity; "follow up" is the owner\'s literal words and starts a revert, CI wait and defer-fixes; one implementer builds a PR unless it is big', () => {
+  const review = reviewText();
+  const merge = read('skills/review/reference/owner-merge.md');
+  assert.match(merge, /pastes `summary`/);
+  assert.match(merge, /only the owner's literal "follow up" or "file follow-ups" starts it/);
+  assert.match(merge, /P ci-wait --pr N` on THAT head/);
+  assert.match(merge, /P triage defer-fixes --pr N --ids/);
+  assert.match(merge, /ONE PR per reply/);
+  assert.match(merge, /With `recommend: extra-round` never offer the follow-up path/);
+  assert.match(review, /ONE `implementer` dispatch builds the whole change/);
+  assert.match(review, /continue THE SAME agent/);
+  assert.match(review, /booked ONCE, after its last leg/);
+  assert.ok(!/Split the work into small tasks/.test(review));
+  const implementer = read('agents/implementer.md');
+  assert.match(implementer, /the whole change of a PR \(or one part of a big one\)/);
+  assert.match(implementer, /Work through the task list in order, commit per step/);
+  const cli = read('docs/cli.md');
+  assert.match(cli, /Follow up instead of a round/);
+  assert.match(cli, /pipeline triage defer-fixes --pr N --ids/);
+});

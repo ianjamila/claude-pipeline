@@ -3,7 +3,7 @@
 A global **build → verify → review → merge → production check** pipeline for Claude Code. Once a
 repo is onboarded, asking Claude to build or fix something runs the build and review unattended: a
 branch and worktree, the change plus tests, a quick local check, a draft pull request, a cross-model
-review loop (Codex finds, a Sonnet judge triages low-risk PRs, a Fable pass rules on and reviews every medium/high-risk or sensitive PR), then CI (the full proof) on the
+review loop (Codex finds, a Sonnet judge triages low-risk PRs (and medium ones that are medium only for their size; `review.size_only_medium_reviewer`), a Fable pass rules on and reviews every other medium/high-risk or sensitive PR. Set `risk.ignore_hard_stop_rules` and `review.size_only_medium_reviewer` only after the installed pipeline is updated AND `pipeline vendor` has re-copied `risk.mjs` and `config.mjs` into the project (older validators reject unknown keys)), then CI (the full proof) on the
 exact commit. You merge: the agent hands you the exact merge request and never merges itself. Nothing reaches `main` without proof, and anything sensitive stops for you.
 
 Design: [`docs/specs/2026-10-01-claude-pipeline-design.md`](docs/specs/2026-10-01-claude-pipeline-design.md) ·
@@ -172,7 +172,14 @@ working exactly as before.
     `docs/cli.md`) records that the session is working on it. `summary` (the stop ritual) or an
     ended run closes it. A lease stops counting when the session is gone, after `/clear` or a
     resume (same process, new session id), or after 6 hours with no pipeline command; a detached
-    `P job` still running in the worktree keeps it alive (whatever its age), and a lease closed while a job still runs ends with that job. A plain terminal takes no lease;
+    `P job` still running in the worktree keeps it alive (whatever its age), and a lease closed while a job still runs ends with that job. A pipeline command typed in a plain terminal takes a lease too, for exactly as long as it runs: a small
+    `proc-<pid>-…` file that is removed when the command ends, fails, is interrupted (Ctrl-C) or is terminated. Such a lease counts as dead only when the process is
+    proven gone (`ps` shows no such pid, or another process started under it, or the pid no longer exists); if that cannot be checked (no `ps`, a lease from
+    another machine) it counts as live, never as "old", so a stuck one needs you: the 24-hour message names the file to delete once you know no pipeline command is running
+    in a terminal, or points at the `leases` command (read only: lists what is live, unreadable and, with `--all`, dead). A command typed in a terminal while an update is
+    swapping waits up to 20 seconds, then stops with "retry in a minute"; one that started across the swap stops with `updated-while-starting`; a read-only home stops
+    leased commands with `review-lease-unwritable`. Rolling back to an older pipeline makes these files unreadable to it, which counts as live (it waits until the
+    command ends or you delete the file). Programs a command started (Codex, a verify step) are not tracked: they load nothing from the install;
   - a `P job` that is still running (or just starting) in a worktree of a repo this machine knows;
   - a held review, merge or queue lock, or a merge command that outlived its run;
   - a merge-queue record that is not finished;
@@ -381,7 +388,10 @@ violations no longer fail CI, the review skill stops before the merge, lists the
 "merge" in chat; the PR ends as `awaiting-owner-merge`), `ci.guard_checks` (default `true`: the `Test integrity` and `Hard-stop scan` statuses are always
 required on top of `ci.required_checks`; `false` only for a repo that does not run `pipeline-guards.yml`), `ci.review_check`
 (default `false`; `true` makes the guards also post `Cross-model review`, green only when the newest review-complete comment
-names the head's content hash, and every required-check list includes it; turn it on together with branch protection)
+names the head's content hash, and every required-check list includes it; turn it on together with branch protection), `ci.draft_while_iterating` (default `false`; `true` makes `pipeline redraft` turn a ready PR back to draft before a fix push, so
+the heavy CI runs once when it is marked ready again; set it only when every heavy required workflow skips drafts, lists
+`ready_for_review` and `converted_to_draft` in its `pull_request` types (a bare `pull_request:` gets neither) and puts one PR's
+runs in one concurrency group with `cancel-in-progress`)
 and `ci.approvers` (logins whose approval labels count; required for org-owned repos, otherwise approvals
 fail closed with `org-repo-needs-ci.approvers`). `pipeline config` prints `warnings` for config that is valid
 but suspicious. Documentation and test files are exempt from the content rules (sensitive terms, SQL, auth) but keep

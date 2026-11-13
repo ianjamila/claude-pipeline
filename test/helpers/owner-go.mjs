@@ -12,7 +12,7 @@ import { fileURLToPath } from 'node:url';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { randomUUID } from 'node:crypto';
-import { accountHome, areasBlock, ownerGoDir, recordApproval, recordRoundGrant, recordRuling } from '../../pipeline/hooks/lib/owner-go.mjs';
+import { accountHome, areasBlock, ownerGoDir, recordApproval, recordPastRoundGrant, recordRoundGrant, recordRuling } from '../../pipeline/hooks/lib/owner-go.mjs';
 
 const HOOK = fileURLToPath(new URL('../../pipeline/hooks/owner-go.mjs', import.meta.url));
 
@@ -68,6 +68,8 @@ export const ownerSays = (t, prompt, reply, entry, after) => said(t, prompt, rep
 export const ownerRules = (t, prompt, reply, entry, after) => said(t, prompt, reply, recordRuling, entry, after);
 // Owner-granted extra round: the same for the owner's `extra round` (the reply ends with roundRequest's line).
 export const ownerGrants = (t, prompt, reply, entry, after) => said(t, prompt, reply, recordRoundGrant, entry, after);
+// The same for the owner's approval of a PAST round (the reply ends with pastRoundRequest's line).
+export const ownerApprovesPast = (t, prompt, reply, entry, after) => said(t, prompt, reply, recordPastRoundGrant, entry, after);
 
 // Files this process wrote and has not removed yet. Removed at exit, so an uncaught error or a failed test before t.after still leaves
 // nothing behind. Only paths this process itself wrote are ever touched: production accepts `test-<uuid>` session names and reads
@@ -125,6 +127,9 @@ export const rulingRequest = (pr, ids, repo = 'acme/widgets', content = 'c0ffee0
 
 // A reply that asks for one more counted review round, as `P triage round-request` prints it (k = the counted ordinal; head >= 12 hex).
 export const roundRequest = (pr, k, head, repo = 'acme/widgets') => `Round ${k - 1} left items open.\n🔁 Extra review round needed #${pr}: round ${k} · head ${head.slice(0, 12)} · repo ${repo}`;
+
+// A reply that asks the owner to approve a round that already ran, as `P triage round-request --past` prints it.
+export const pastRoundRequest = (pr, k, head, repo = 'acme/widgets') => `Round ${k} ran before the cap existed.\n🔂 Approve past review round #${pr}: round ${k} · head ${head.slice(0, 12)} · repo ${repo}`;
 
 // The flags P merge takes for it.
 export const approvalFlags = (head, items) => ['--owner-approved-head', head, '--owner-approved-items', items];

@@ -26,13 +26,13 @@ verify:
   deferrable_steps: [tests]
   ci_proof:
     tests: { workflow: .github/workflows/ci.yml, job: "test (ubuntu)", event: pull_request }
-  ci_proof_wait_minutes: 25      # ubuntu job ~9 min + queue; past this the Mac runs the tests
+  ci_proof_wait_minutes: 45      # ubuntu job ~25-33 min (two Node passes) + queue, = the job timeout; past this the Mac runs the tests
 
 ci:
   required_checks: ["test (ubuntu)", "test (windows)"]
   guard_checks: false          # no pipeline-guards.yml here: every path is a hard-stop; the owner's chat "merge" is the approval
   e2e_label: null
-  draft_while_iterating: false
+  draft_while_iterating: true  # ci.yml skips drafts (both required checks read skipped) and lists ready_for_review + converted_to_draft
 
 merge:
   command: gh pr merge {pr} --squash --auto --delete-branch --match-head-commit {sha}
@@ -44,7 +44,25 @@ production: null
 smoke_checks: []
 
 risk:
-  high_risk_paths: ["pipeline/hooks/**", "pipeline/lib/hardstops.mjs", "pipeline/lib/finalgate.mjs", "install.mjs", "pipeline/lib/installer.mjs"]
+  # Plan 2026-11-12-cp-risk-rating R3-6: the files that decide what is safe (guards, hard stops, the final gate, the installer,
+  # the risk rating and config itself, the review/merge commands, triage, owner grants, review proof, model floor) plus
+  # anything that runs code on install or commit (package.json scripts, git hooks, the install wrappers), plus the glob/git/diff/
+  # doc-path helpers the rating and the final gate read (every file risk.mjs imports, a test checks the closure). A PR touching one stays high and gets Fable.
+  high_risk_paths: [
+    "pipeline/hooks/**", "pipeline/lib/hardstops.mjs", "pipeline/lib/finalgate.mjs", "install.mjs", "pipeline/lib/installer.mjs",
+    "pipeline/lib/risk.mjs", "pipeline/lib/config.mjs", "pipeline/commands/codex-review.mjs", "pipeline/commands/review-complete.mjs",
+    "pipeline/commands/arbiter.mjs", "pipeline/commands/merge.mjs", "pipeline/lib/triage.mjs", "pipeline/lib/owner-grants.mjs",
+    "pipeline/lib/review-marker.mjs", "pipeline/lib/floor-proof.mjs", "pipeline/lib/model-floor.mjs", "package.json",
+    "**/.githooks/**", "**/.husky/**",
+    "pipeline/lib/glob.mjs", "pipeline/lib/git.mjs", "pipeline/lib/diff.mjs", "pipeline/lib/doc-paths.mjs", "pipeline/lib/docs-exempt.mjs",
+    "pipeline/lib/yaml.mjs", "pipeline/vendor/**", "pipeline/lib/proc.mjs", "pipeline/lib/paths.mjs", "pipeline/lib/resolution.mjs",
+    "pipeline/lib/seams.mjs", "pipeline/lib/shell-words.mjs",
+    "install.sh", "install.ps1"]
+  # Every path here is a hard stop (hard_stops.paths ["**"]), so every PR would rate high. These two rules no longer raise the
+  # LEVEL (round-1 Codex effort, judge vs Fable); their hits still make the merge an owner item. Editing this file or other
+  # pipeline config is an R4-pipeline hit, which is not ignorable, so it stays high (R4-config hits stop raising the level only
+  # once this list is on the base branch).
+  ignore_hard_stop_rules: [P-path, R4-config]
 
 hard_stops:
   paths: ["**"]

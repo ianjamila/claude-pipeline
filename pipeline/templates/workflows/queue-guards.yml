@@ -27,11 +27,11 @@ jobs:
       # No PIPELINE_VERDICT_DIR here: the runner context is not available in a job-level env (GitHub rejects the whole file). The poster falls back to
       # $RUNNER_TEMP/queue-verdict, the same folder the upload step below names.
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with: { sparse-checkout: "scripts/pipeline\n.claude/pipeline.yml", persist-credentials: false }
       - id: eval
         run: node scripts/pipeline/queue-guards-run.mjs
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with: { name: "${{ steps.eval.outputs.artifact }}", path: "${{ runner.temp }}/queue-verdict", if-no-files-found: error }
       - run: node scripts/pipeline/queue-guards-run.mjs --publish
       - if: failure()

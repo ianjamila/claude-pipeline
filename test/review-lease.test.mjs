@@ -93,7 +93,7 @@ test('PIPELINE_REVIEW_LEASE_DIR is honoured by a repo checkout only; an installe
 
 // ---- holder identity ---------------------------------------------------------------------------------------------------------------------
 
-test('resolveHolder: a session via its record, TTL-only when the lookup fails, nothing for a plain terminal', (t) => {
+test('resolveHolder: a session via its record, TTL-only when the lookup fails, a process holder for a plain terminal', (t) => {
   const w = world(t);
   w.session(500, 'sess-one');
   assert.deepEqual(resolveHolder({ worktree: w.root, ...w.as(500) }), { kind: 'session', sessionId: 'sess-one', pid: 500, pidStart: START_A });
@@ -107,10 +107,11 @@ test('resolveHolder: a session via its record, TTL-only when the lookup fails, n
   }
   assert.equal(ttl({ sessionRecord: () => null }).sessionId, ttl({ starts: () => null }).sessionId, 'stable for one worktree');
   assert.notEqual(resolveHolder({ worktree: path.join(w.root, 'a'), ...w.as(null) }).sessionId, resolveHolder({ worktree: path.join(w.root, 'b'), ...w.as(null) }).sessionId);
-  // No Claude ancestor but CLAUDECODE=1 (a detached job): TTL-only. Neither: no lease.
+  // No Claude ancestor but CLAUDECODE=1 (a detached job): TTL-only. Neither: a process holder of its own (test/review-lease-process.test.mjs); kind 'none' only via the seam.
   assert.equal(resolveHolder({ worktree: w.root, ...w.as(null) }).kind, 'ttl');
-  assert.deepEqual(resolveHolder({ worktree: w.root, ...w.as(null, { env: {} }) }), { kind: 'none' });
-  assert.deepEqual(resolveHolder({ worktree: w.root, ...w.as(null, { env: { CLAUDECODE: '0' } }) }), { kind: 'none' });
+  assert.equal(resolveHolder({ worktree: w.root, ...w.as(null, { env: {} }) }).kind, 'process');
+  assert.equal(resolveHolder({ worktree: w.root, ...w.as(null, { env: { CLAUDECODE: '0' } }) }).kind, 'process');
+  assert.deepEqual(resolveHolder({ worktree: w.root, ...w.as(null, { env: {}, processHolder: false }) }), { kind: 'none' });
 });
 
 test('readSessionRecord reads <config>/sessions/<pid>.json from every ~/.claude* folder (both accounts)', (t) => {
@@ -423,10 +424,10 @@ test('sweep removes stale temp files and an empty holder file', async (t) => {
   assert.deepEqual(fs.readdirSync(w.dir), []);
 });
 
-test('a plain terminal (no Claude ancestor, no CLAUDECODE) writes no lease and creates no folder', async (t) => {
+test('kind none (the test seam; production never returns it) writes no lease and creates no folder', async (t) => {
   const w = world(t);
   const wt = w.wt('a');
-  const plain = w.as(null, { env: {} });
+  const plain = w.as(null, { env: {}, processHolder: false });
   assert.deepEqual(await openOrRenewLease({ worktree: wt, repoId: 'acme/app', pr: 7, ...plain }), { skipped: 'no-session' });
   assert.deepEqual(await closeLease({ worktree: wt, ...plain }), { skipped: 'no-session' });
   assert.equal(fs.existsSync(w.dir), false);
