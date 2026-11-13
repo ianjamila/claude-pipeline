@@ -56,13 +56,13 @@ function world(t, opts = {}) {
 // A substitute transcript for a prepared round, under a loose projects folder (found with --projects-dir).
 function install(w, prep, o = {}) {
   const {
-    models = [OPUS], agentType = prep.agent, effort = 'high', answer = ANSWER, tag = prep.tag, agentId = 'a1', projects = w.projects, skipRead = [], extraTools = [],
+    models = [OPUS], agentType = prep.agent, effort = 'high', answer = ANSWER, tag = prep.tag, agentId = 'a1', projects = w.projects, skipRead = [], extraTools = [], readInput = (p) => ({ file_path: p }),
     prompt = `${prep.promptHeader}\nRead ${prep.inputPath} and review the pull request.\n`,
   } = o;
   const dir = join(projects, '-tmp-work', 'session-1', 'subagents');
   mkdirSync(dir, { recursive: true });
   const reads = [prep.inputPath, ...prep.files.map((f) => join(dirname(prep.inputPath), 'substitute', f))].filter((p) => !skipRead.includes(p));
-  const calls = [...reads.map((p) => ({ name: 'Read', input: { file_path: p } })), ...extraTools];
+  const calls = [...reads.map((p) => ({ name: 'Read', input: readInput(p) })), ...extraTools];
   const turn = (model, id, stop, content) => ({ type: 'assistant', effort, perTurnEffort: effort, requestId: `req_${id}`, message: { model, id, role: 'assistant', stop_reason: stop, content }, uuid: id });
   const lines = [
     { type: 'user', message: { role: 'user', content: prompt }, uuid: 'u0' },
@@ -777,4 +777,59 @@ test('R8-B1: prepare enforces review.substitute.min_wait_minutes like codex-revi
   assertExit(noReset.run(), 3);
   noReset.editRoute((r) => { r.resetAt = null; });
   assertExit(noReset.prepare(), 0); // no reset time: nothing to wait until, never waited for
+});
+
+test('R8-B2: apply refuses a transcript whose Reads cover only part of an exported file (a one-line Read): recorded invalid, nothing recorded', (t) => {
+  const w = world(t);
+  const prep = w.ready();
+  const diff = join(dirname(prep.inputPath), 'substitute', 'diff.patch');
+  const lines = readFileSync(diff, 'utf8').split('\n').length - 1;
+  assert.ok(lines >= 2, 'the fixture diff has several lines');
+  const one = w.apply(install(w, prep, { readInput: (p) => (p === diff ? { file_path: p, offset: 1, limit: 1 } : { file_path: p }) }));
+  assertExit(one, 1, one.stdout + one.stderr);
+  assert.ok(one.json.errors.some((e) => e.includes(diff) && /read in full|lines/.test(e)), one.stdout);
+  assert.equal(w.attempts().attempts[0].status, 'invalid', 'recorded as an invalid attempt, and no round was recorded');
+
+});
+
+test('R8-B2: paged Reads that together cover the whole exported file are accepted', (t) => {
+  const w = world(t);
+  const prep = w.ready();
+  const diff = join(dirname(prep.inputPath), 'substitute', 'diff.patch');
+  const text = readFileSync(diff, 'utf8');
+  const lines = text.split('\n').length - (text.endsWith('\n') ? 1 : 0);
+  // one Read of everything except the last line, one of the last line: written as two Read calls by the fixture's extraTools
+  const r = w.apply(install(w, prep, { skipRead: [diff], extraTools: [
+    { name: 'Read', input: { file_path: diff, offset: 1, limit: lines - 1 } },
+    { name: 'Read', input: { file_path: diff, offset: lines, limit: 5 } },
+  ] }));
+  assertExit(r, 0, r.stdout + r.stderr);
+});
+
+test('R8-B2: a gap between the pages is refused', (t) => {
+  const w = world(t);
+  const prep = w.ready();
+  const diff = join(dirname(prep.inputPath), 'substitute', 'diff.patch');
+  const lines = readFileSync(diff, 'utf8').split('\n').length - 1;
+  const r = w.apply(install(w, prep, { skipRead: [diff], extraTools: [
+    { name: 'Read', input: { file_path: diff, offset: 1, limit: 1 } },
+    { name: 'Read', input: { file_path: diff, offset: 3, limit: lines } },
+  ] }));
+  assertExit(r, 1, r.stdout + r.stderr);
+  assert.ok(r.json.errors.some((e) => e.includes(diff)));
+});
+
+test('R8-B2: prepare refuses packet-unreadable when a file of the packet is longer than one Read page (2000 lines), before any attempt is spent', (t) => {
+  const w = world(t);
+  w.repo.write('src/long.txt', `${Array.from({ length: 2500 }, (_, i) => `line ${i}`).join('\n')}\n`);
+  w.head = w.repo.commit('long');
+  w.prHead(w.head);
+  assertExit(w.run(), 3);
+  const p = w.prepare();
+  assertExit(p, 1, p.stdout.slice(0, 400));
+  assert.equal(p.json.error, 'packet-unreadable');
+  assert.equal(p.json.maxLines, 2000);
+  assert.ok(p.json.files.some((f) => f.rel === 'diff.patch' && f.lines > 2000), p.stdout.slice(0, 400));
+  assert.ok(!existsSync(join(w.dir(), 'substitute-input.md')));
+  assert.ok(!existsSync(w.attemptsFile), 'no attempt was opened');
 });
