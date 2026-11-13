@@ -99,5 +99,5 @@ test('#352 R8-F2: a subshell between an uncertain change and && does not give th
   allows('twin: cd d && (true) &&', 'cd /work/other2 && (true) && ' + SHIP);
   allows('twin: cd d && (true) && (true) &&', 'cd /work/other2 && (true) && (true) && ' + SHIP);
   allows('twin: cd d && echo $(true) &&', 'cd /work/other2 && echo $(true) && ' + SHIP);
-  allows('twin: a switch && (true) &&', RESET + ' && (true) && ' + SHIP);
+  denies('as before: a switch && (true) && (the subshell forgets a branch the line switched)', RESET + ' && (true) && ' + SHIP);
 });

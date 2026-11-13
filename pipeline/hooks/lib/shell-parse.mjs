@@ -2057,6 +2057,9 @@ function noteRedef(ctx, argv, env) {
 function emit(ctx, argv, env, raw, depth, redirects = [], sep = ';', afterClose = false) {
   noteRedef(ctx, argv, env);
   if (ctx.out.length >= MAX_COMMANDS) { ctx.truncated = true; ctx.stopped = true; return null; }
+  // (#352 R8-F1: a may-skip mark stays pending until a command that carries it is emitted: a segment that emitted nothing left it in ctx.owedClose, and the next command chained with && takes it)
+  if (sep === '&&' && ctx.owedClose) afterClose = true;
+  ctx.owedClose = false;
   const cmd = { argv, env, raw, depth, redirects };
   // grp: the subshells (`$( )`, `( )`, backticks, `<( )`) it runs inside, outermost first, as ids: a cd in one is lost when it ends. Not enumerable
   Object.defineProperty(cmd, 'grp', { value: ctx.grp, enumerable: false });
@@ -2299,7 +2302,9 @@ class Parser {
     this.subAcc = [];
     const base = this.ctlBase;
     this.ctlBase = this.ctlStack.length;
+    const outerOp = this.lexOp;
     try { this.lex(depth, stopAtParen, noRedir); } finally {
+      this.lexOp = outerOp;
       ctx.nest--; this.subAcc = saved;
       while (this.ctlStack.length > this.ctlBase) { const kind = this.ctlStack.pop(); this.ctlFrom.pop(); ctlDec(ctx, kind); } // (left open: ends with the level)
       this.ctlBase = base;
@@ -2336,6 +2341,8 @@ class Parser {
     let gGlob = false; // the word before the group holds a glob character
     let lastSep = ';';
     let lastAfterClose = false; // (the `&&` just read follows the closer of a construct that may have skipped its body: the next segment takes it, see emit)
+    // the operator before the command being read (a substitution in its words runs under it, see inGroup)
+    this.lexOp = () => (seg ? { sep: seg.sep, afterClose: seg.afterClose } : { sep: lastSep, afterClose: lastSep === '&&' && lastAfterClose });
     // `case` statements open at this level: st 'subj' (its word comes next), 'in', 'pat' (patterns up to `)` come next: no commands),
     // 'body' (an arm's commands, up to ;; ;& ;;& ;| or esac), 'end' (the esac word comes next). A stack: arms hold nested cases.
     const cs = [];
@@ -2641,6 +2648,7 @@ class Parser {
           // (a subshell after && / || runs only when that holds, and one that is a pipeline stage runs apart: its commands may not run, as for a { } group (cbrace).
           // `{ cat a; true || (cat x); cat c; } | bash` runs a+c, which the join a+x+c hid)
           const cond = !body && !(seg && seg.words.length) && ['&&', '||', '|'].includes(lastSep);
+          const opened = { sep: lastSep, afterClose: lastSep === '&&' && lastAfterClose }; // (the operator before the subshell, see inGroup)
           endSeg(this.i);
           lastSep = ';';
           this.i++;
@@ -2649,7 +2657,7 @@ class Parser {
           if (body) this.ctx.ctl.fn++;
           if (cond) this.ctx.ctl.cond++;
           try {
-            this.inGroup(() => this.nestParse(depth, { stopAtParen: true, noRedir: noRedir || (s[this.i] === '(' && closesAsArith(s, this.i - 1, 2)) })); // ((...)) is arithmetic when it closes as `))`; `((cmd) )` is nested subshells, redirects and all
+            this.inGroup(() => this.nestParse(depth, { stopAtParen: true, noRedir: noRedir || (s[this.i] === '(' && closesAsArith(s, this.i - 1, 2)) }), opened); // ((...)) is arithmetic when it closes as `))`; `((cmd) )` is nested subshells, redirects and all
           } finally { if (body) this.ctx.ctl.fn--; if (cond) this.ctx.ctl.cond--; }
           fnPending = false;
           if (head?.length) { for (const name of head) ctx.fns.add(name); fnPending = true; }
@@ -2775,7 +2783,9 @@ class Parser {
     this.ctx.ctl = { loop: +seg.ctl.loop, fn: +seg.ctl.fn, trap: +seg.ctl.trap, cond: +seg.ctl.cond };
     this.ctx.grp = seg.grp; // (what it runs, `bash -c` text included, is in the subshells it was written in, wherever the queue finishes it)
     try {
+      const out0 = this.ctx.out.length;
       this.finalizeSeg(seg);
+      if (seg.afterClose && this.ctx.out.length === out0) this.ctx.owedClose = true; // (it emitted nothing: the mark waits for the next command, see emit)
     } catch {
       // never lose the command to an unexpected failure: report its words as written and say we were cut short
       this.ctx.truncated = true;
@@ -2822,9 +2832,13 @@ class Parser {
   }
 
   // Runs fn with one more subshell open (see emit: grp).
-  inGroup(fn) {
+  // (#352 R8-F2: op = the operator that came before the subshell, { sep, afterClose }: a walk applies the may-not-run rule for it when it enters the subshell, so what it saves is settled.
+  // A substitution takes the operator of the command it is in (lexOp); anything else, none known: `;`, which trusts nothing.)
+  inGroup(fn, op = this.lexOp?.() ?? { sep: ';', afterClose: false }) {
     const saved = this.ctx.grp;
-    this.ctx.grp = [...saved, ++this.ctx.grpN];
+    const id = ++this.ctx.grpN;
+    this.ctx.grp = [...saved, id];
+    this.ctx.grpOps.set(id, op);
     try { return fn(); } finally { this.ctx.grp = saved; }
   }
 
@@ -2893,7 +2907,7 @@ class Parser {
       const a = assignOf(words[k]);
       if (a && words[k].subs.length && (i >= words.length || k > i)) noteVarFeeds(this.ctx, a[0], words[k].subs);
     }
-    if (i >= words.length) return Object.keys(env).length ? emit(this.ctx, [], env, seg.raw, seg.depth, [], seg.sep) : null;
+    if (i >= words.length) return Object.keys(env).length ? emit(this.ctx, [], env, seg.raw, seg.depth, [], seg.sep, seg.afterClose) : null;
     // brace expansion: {a,b} in an unquoted word becomes several words (assignment words before the command are exempt)
     const argv = [];
     for (const w of words.slice(i)) {
@@ -3281,7 +3295,7 @@ class Parser {
 }
 
 function newCtx(maxDepth, expired, bashState) {
-  return { out: [], expired, maxDepth, truncated: false, dynamic: false, dynamicHead: false, subshell: false, grp: [], grpN: 0, ctl: { loop: 0, fn: 0, trap: 0, cond: 0 }, loops: [], loopSeq: 0, ctlBroken: false, fns: new Set(), defs: { redef: false }, stopped: false, muted: 0, nest: 0, work: 0, braceWork: 0, varFeeds: new Map(), fdFeeds: new Map(), bashPlain: false, bashState, rootSrc: null, hdSpans: [], hdForeign: false };
+  return { out: [], expired, maxDepth, truncated: false, dynamic: false, dynamicHead: false, subshell: false, grp: [], grpN: 0, ctl: { loop: 0, fn: 0, trap: 0, cond: 0 }, loops: [], loopSeq: 0, ctlBroken: false, fns: new Set(), defs: { redef: false }, stopped: false, owedClose: false, grpOps: new Map(), muted: 0, nest: 0, work: 0, braceWork: 0, varFeeds: new Map(), fdFeeds: new Map(), bashPlain: false, bashState, rootSrc: null, hdSpans: [], hdForeign: false };
 }
 
 // The text with every comment the lexer skips blanked out (newlines kept), from a lexing pass that interprets nothing (muted); null when that pass did not
@@ -3326,6 +3340,8 @@ export function simpleCommands(str, opts) {
   // a stdin feed of that command, a process substitution, an unknown descriptor ... still count here)
   Object.defineProperty(ctx.out, 'dynamicOther', { value: ctx.dynamic, enumerable: false });
   Object.defineProperty(ctx.out, 'subshell', { value: ctx.subshell, enumerable: false });
+  // grpOps: for each subshell id (see emit: grp) the operator before it, { sep, afterClose } (see inGroup)
+  Object.defineProperty(ctx.out, 'grpOps', { value: ctx.grpOps, enumerable: false });
   // fns: every name the text defines as a function (`f()`, `function f`, zsh `f g ()`), wherever it is
   Object.defineProperty(ctx.out, 'fns', { value: ctx.fns, enumerable: false });
   // ctlBroken: the loop / branch / function marks (ctl) are not to be trusted (an unmatched closer, a construct finished out of order): callers read the line as before
