@@ -9,7 +9,7 @@ import { createFakeCodex } from './helpers/fakegh-env.mjs';
 import { assertExit } from './helpers/assert-exit.mjs';
 import { MARKERS } from '../pipeline/lib/render.mjs';
 import { decodeRecord } from '../pipeline/lib/run-record.mjs';
-import { parseEvent } from '../pipeline/lib/run-events.mjs';
+import { parseEvent, renderEvent } from '../pipeline/lib/run-events.mjs';
 import { writeSummaryComment } from '../pipeline/lib/summary-comment.mjs';
 import { run as mergeRun } from '../pipeline/commands/merge.mjs';
 import { approvalFlags, mergeRequest, ownerSays } from './helpers/owner-go.mjs';
@@ -461,6 +461,59 @@ test('checkpoint --resumed: stamps record.resumed {at, host, head}; a later chec
   assert.deepEqual(l.json.record.resumed, RESUMED, 'a resumed record stays resumed');
   const plain = scenario();
   assert.equal(checkpoint(plain, ['--step', 'review']).json.record.resumed, undefined, 'a normal run never carries it');
+});
+
+// R9-B1: "this run was resumed" is APPEND-ONLY evidence: its own never-edited event comment, posted before the (editable) record is written.
+test('checkpoint --resumed: posts a run-resumed event {at, host, head} BEFORE it writes the record', () => {
+  const s = scenario();
+  assertExit(checkpoint(s, ['--step', 'review', '--resumed']), 0);
+  const writes = commentWrites(s.fake);
+  const first = parseEvent(writes[0].body);
+  assert.deepEqual([writes[0].method, first?.kind, first?.data?.host, first?.data?.head], ['POST', 'run-resumed', hostname(), s.head]);
+  assert.ok(writes.slice(1).some((w) => w.body.startsWith(MARKERS.summary)), 'the record follows the event');
+  const plain = scenario();
+  assertExit(checkpoint(plain, ['--step', 'review']), 0);
+  assert.deepEqual(eventWrites(plain.fake), [], 'a checkpoint without --resumed posts no event');
+});
+
+test('checkpoint --resumed: a resumed stamp that cannot be made durable fails the command (exit 3) and writes no record', () => {
+  const s = scenario();
+  s.fake.setScript(ghEntries({ prHead: s.head, extra: [{ match: '-X POST repos/acme/widgets/issues/12/comments', code: 1, stderr: 'gh: Server Error (HTTP 502)' }] }));
+  const r = checkpoint(s, ['--step', 'review', '--resumed']);
+  assertExit(r, 3);
+  assert.match(r.stderr + r.stdout, /Server Error|unavailable/i);
+  const posts = s.fake.calls().filter((c) => isCommentWrite(c));
+  assert.equal(posts.length, 1, 'only the event was tried');
+  assert.equal(parseEvent(JSON.parse(posts[0].stdin).body)?.kind, 'run-resumed');
+});
+
+const RESUMED_EVENT = () => ({ id: 78, user: { login: 'me' }, body: renderEvent('run-resumed', `pr${PR}-aaaaaaaaaaaa`, 'This run was taken over from an earlier session.', RESUMED) });
+// the interleaving of R9-B1: the event is there, the record was then overwritten by a writer that had not seen the mark
+const withEventOnly = () => {
+  const s = mergeScenario();
+  s.fake.setScript(ghEntries({ prHead: s.head, comments: [existingSummary({ record: baseRecord({ step: 'gate' }) }), RESUMED_EVENT()], extra: [PATCH_77] }));
+  return s;
+};
+
+test('merge: a run-resumed EVENT with an unmarked record (overwritten after the event) still refuses without the owner\'s word (R9-B1)', (t) => {
+  const s = withEventOnly();
+  const g = s.gate();
+  assertExit(g, 0);
+  const r = mergeWith(s);
+  assertExit(r, 1);
+  assert.equal(r.json.error, 'pre-merge');
+  assert.match(r.json.reason, /^resumed run: the owner must say "merge" for this exact head/);
+  assert.deepEqual(s.mergeCalls(), []);
+  assertExit(mergeWith(s, approvalFlags(s.head, g.json.ownerItems)), 1); // the flags alone are the agent's word
+  ownerSays(t, 'merge', mergeRequest(12, s.head, g.json.ownerItems));
+  assertExit(mergeWith(s, approvalFlags(s.head, g.json.ownerItems)), 0);
+});
+
+test('merge: a forged run-resumed event (another author) does not make a run resumed', () => {
+  const s = mergeScenario();
+  s.fake.setScript(ghEntries({ prHead: s.head, comments: [existingSummary({ record: baseRecord({ step: 'gate' }) }), { ...RESUMED_EVENT(), user: { login: 'mallory' } }], extra: [PATCH_77] }));
+  assertExit(s.gate(), 0);
+  assertExit(mergeWith(s), 0);
 });
 
 test('merge: a RESUMED run record refuses to merge without --owner-approved-head (pre-merge, exit 1; nothing posted, nothing merged)', () => {

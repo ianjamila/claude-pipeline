@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createGitHub } from '../pipeline/lib/github.mjs';
-import { EVENT_KINDS, parseEvent, postEvent, renderEvent } from '../pipeline/lib/run-events.mjs';
+import { EVENT_KINDS, parseEvent, postEvent, readResumedEvidence, renderEvent } from '../pipeline/lib/run-events.mjs';
 import { createFakeGh, REPO_VIEW } from './helpers/fakegh-env.mjs';
 
 const REPO = { match: '^repo view', stdoutJson: REPO_VIEW };
@@ -59,4 +59,34 @@ test('postEvent always creates a NEW comment: two events, two POSTs, no PATCH', 
   assert.ok(!lines.some((l) => l.includes('--paginate')), 'it does not even read the comments first');
   const body = JSON.parse(fake.calls().find((c) => c.argv.includes('POST')).stdin).body;
   assert.equal(parseEvent(body).kind, 'prod-before');
+});
+
+// ---- R9-B1: the run-resumed event is the append-only evidence the merge gate reads beside the (editable) run record ----------------
+
+const resumedBody = (head = 'a'.repeat(40)) => renderEvent('run-resumed', `pr4-${head.slice(0, 12)}`, 'This run was taken over from an earlier session.', { at: '2026-11-12T08:00:00.000Z', host: 'pc-2', head });
+const ghWith = (comments, { me = 'me', fail = false } = {}) => ({
+  viewer: () => me,
+  listComments: () => { if (fail) throw new Error('boom 502'); return comments; },
+});
+
+test('readResumedEvidence: a viewer-authored run-resumed event, for any head, marks the run resumed', () => {
+  assert.ok(EVENT_KINDS.includes('run-resumed'));
+  const e = readResumedEvidence(ghWith([{ id: 1, user: { login: 'me' }, body: resumedBody('b'.repeat(40)) }]), 4);
+  assert.deepEqual([e.resumed, e.unreadable], [true, null]);
+  assert.equal(e.event.data.host, 'pc-2');
+});
+
+test('readResumedEvidence: another author, a quoted marker, or no event at all is NOT evidence', () => {
+  for (const comments of [
+    [{ id: 1, user: { login: 'mallory' }, body: resumedBody() }],
+    [{ id: 1, user: { login: 'me' }, body: `> ${resumedBody()}` }],
+    [{ id: 1, user: { login: 'me' }, body: renderEvent('prod-before', 'x', 's', {}) }],
+    [],
+  ]) assert.deepEqual(readResumedEvidence(ghWith(comments), 4), { resumed: false, unreadable: null, event: null });
+});
+
+test('readResumedEvidence: comments that cannot be read are reported as unreadable (the caller fails closed)', () => {
+  const e = readResumedEvidence(ghWith([], { fail: true }), 4);
+  assert.equal(e.resumed, false);
+  assert.match(e.unreadable, /the run-resumed events could not be read \(boom 502\)/);
 });

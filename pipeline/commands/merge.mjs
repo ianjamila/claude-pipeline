@@ -14,8 +14,7 @@ import { headSha } from '../lib/git.mjs';
 import { envWithGhDir, killTree, runShellAsync } from '../lib/proc.mjs';
 import { postEvent } from '../lib/run-events.mjs';
 import { proofLine } from '../lib/run-record.mjs';
-import { readSummaryComment } from '../lib/summary-comment.mjs';
-import { createRunRecorder, inFlightSince } from '../lib/run-progress.mjs';
+import { createRunRecorder, inFlightSince, resumedRunState } from '../lib/run-progress.mjs';
 import { bringUpToDate, updateTiming } from '../lib/updatebranch.mjs';
 import { loadState } from '../lib/state.mjs';
 import { approvalConfigDirHint, approvalGap, areasBlock, holdBlock, holdDigest, readyLine } from '../hooks/lib/owner-go.mjs';
@@ -181,10 +180,10 @@ export const run = guarded(async (argv, ctx) => {
       if (pre.watch) return watchOnly({ route, gh, pr, head: gate.head });
     }
 
-    // 1a. A resumed run never merges on its own: the run record (viewer-authored, so not forgeable by a commenter) says whether this
-    // run was taken over from an earlier session (an older record from `ship resume` carries the flag); if so the owner's approval of THIS exact head must come in as a flag. Read before
-    // anything irreversible. A record that cannot be checked (unreadable comments, an invalid or newer record) fails CLOSED: it
-    // may be a resumed one, so it needs the same approval. No record (absent) or a legacy comment is an ordinary run.
+    // 1a. A resumed run never merges on its own: the run record and the run-resumed events (both viewer-authored, so not forgeable by a commenter) say whether this
+    // run was taken over from an earlier session (an older record from `ship resume` carries the flag; the event is the append-only copy a record overwrite cannot erase); if so the owner's approval of THIS exact head must come in as a flag. Read before
+    // anything irreversible. A record or events that cannot be checked (unreadable comments, an invalid or newer record) fail CLOSED: it
+    // may be a resumed one, so it needs the same approval. No record (absent) or a legacy comment, and no event, is an ordinary run.
     // Why (#58): the flags were the agent's own word. They now only name what the owner approved: the owner-go recorder (a
     // UserPromptSubmit hook that only the owner's typed prompt reaches) must hold a "merge" for exactly this PR, this full head
     // and this owner-item set, as shown to the owner in the reply right before it (Head and 🔀 lines). See hooks/lib/owner-go.mjs.
@@ -201,25 +200,18 @@ export const run = guarded(async (argv, ctx) => {
     }
     const ownerApproved = values['owner-approved-head'] !== undefined && approvalProblem === null;
     const withProblem = (reason) => (approvalProblem ? `${reason} (${approvalProblem})` : reason);
-    let unchecked = null;
-    let existing = null;
-    try {
-      existing = readSummaryComment(gh, pr);
-      if (existing.status === 'invalid' || existing.status === 'unsupported') unchecked = `the run record is ${existing.status}`;
-    } catch (err) {
-      unchecked = `the run record could not be read (${String(err?.message ?? err).slice(0, 200)})`;
-    }
+    const { resumed, unchecked } = resumedRunState(gh, pr); // (the record's mark OR a viewer-authored run-resumed event; either unreadable => unchecked)
     // The record of this head already ended (pre.since): it re-queues only on a fresh decision newer than that end, and a new record starts with a new one-retry budget.
     // Where the owner's word is required (a resumed run, a run record that cannot be checked, items for the owner) that decision is the owner's "merge" newer than the end:
     // a final-gate run after the end never revives an older word (R1-F1). Otherwise a final-gate run that passed after the end is enough, or a fresh word.
-    const wordRequired = (existing?.status === 'ok' && Boolean(existing.record.resumed)) || unchecked !== null || Number(gate.ownerMerge) > 0;
+    const wordRequired = resumed || unchecked !== null || Number(gate.ownerMerge) > 0;
     const freshWord = () => approvalGapSince({ repo: gh.repo().slug, pr, head: gate.head, items: gate.ownerItems, areas: null, hold: null, rulings: null }, pre.since) === 'ok';
     approval.ownerRequired = wordRequired; // (stored on the queue record: the sweep re-queues it only while the word is still on record)
     const staleEnd = (liveItems) => pre?.since !== undefined && (wordRequired || liveItems ? !freshWord() : !freshWord() && !gateFreshSince(gate, pre.since));
-    const wordWhy = (existing?.status === 'ok' && Boolean(existing.record.resumed)) ? 'this is a resumed run' : unchecked !== null ? `${unchecked}, so the resumed-run guard cannot be checked` : 'the final gate left items for the owner';
+    const wordWhy = resumed ? 'this is a resumed run' : unchecked !== null ? `${unchecked}, so the resumed-run guard cannot be checked` : 'the final gate left items for the owner';
     if (staleEnd(false)) return pre.staleTerminal(wordRequired ? wordWhy : null);
     if (!ownerApproved) {
-      if (existing?.status === 'ok' && existing.record.resumed) {
+      if (resumed) {
         const reason = withProblem(`resumed run: the owner must say "merge" for this exact head (then pass ${APPROVAL_FLAGS})`);
         return refuse('pre-merge', [reason], { reason });
       }
@@ -690,14 +682,10 @@ async function dryRunMerge({ root, config, pr, gh, ctx, ownerGo }) {
     const refusals = gateRefusals({ gate, pr, head, prHead: gh.prView(pr, [...PR_FIELDS]).headRefOid, hash, repo: slug });
     if (refusals.length > 0) add('gate', refusals.join('; '));
 
-    // The resumed-run guard, as a real run reads it: a resumed or unchecked record needs the owner's flags.
-    try {
-      const existing = readSummaryComment(gh, pr);
-      if (existing.status === 'invalid' || existing.status === 'unsupported') flags = `the run record is ${existing.status}`;
-      else if (existing.status === 'ok' && existing.record.resumed) flags = 'resumed run';
-    } catch (err) {
-      flags = `the run record could not be read (${String(err?.message ?? err).slice(0, 200)})`;
-    }
+    // The resumed-run guard, as a real run reads it: a resumed record or event, or an unchecked one, needs the owner's flags.
+    const guard = resumedRunState(gh, pr);
+    if (guard.resumed) flags = 'resumed run';
+    else if (guard.unchecked !== null) flags = guard.unchecked;
 
     live = await evaluateGate({ root, config, pr, gh, env: ctx.env, readOnly: true, ...qm });
     for (const c of live.checks.filter((x) => !x.ok)) {

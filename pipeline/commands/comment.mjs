@@ -77,7 +77,7 @@ function summaryKind(gh, pr, sections, outcome) {
     repo: gh.repo().slug, pr, branch: view.headRefName, baseRef: view.baseRefName, head: view.headRefOid,
     outcome, host: hostname(), now: Date.now(),
   });
-  const r = writeRunRecord(gh, pr, { record, sections, repo: gh.repo().slug, branch: view.headRefName });
+  const r = writeRunRecord(gh, pr, { record, sections, onWarning: (w) => warnings.push(w) });
   return { exitCode: EXIT.OK, output: { ok: true, kind: 'summary', pr, action: r.action, url: r.url, id: r.id, step: r.record.step, warnings } };
 }
 

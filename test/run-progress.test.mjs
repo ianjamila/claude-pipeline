@@ -6,7 +6,8 @@ import assert from 'node:assert/strict';
 import { MARKERS } from '../pipeline/lib/render.mjs';
 import { applyCheckpoint, emptyRecord, encodeRecord } from '../pipeline/lib/run-record.mjs';
 import { readSummaryComment, writeSummaryComment } from '../pipeline/lib/summary-comment.mjs';
-import { baseRecordFor, createRunRecorder, writeRunRecord } from '../pipeline/lib/run-progress.mjs';
+import { baseRecordFor, createRunRecorder, resumedRunState, writeRunRecord } from '../pipeline/lib/run-progress.mjs';
+import { parseEvent, renderEvent } from '../pipeline/lib/run-events.mjs';
 
 const PR = 4;
 const HEAD = 'c'.repeat(40);
@@ -120,12 +121,78 @@ test('recorder: a newer-CLI record that appears between the read and the write i
 });
 
 // `P summary` / `P comment --kind summary` build their record from null when the comment is unreadable: the shared writer still marks it.
-test('writeRunRecord: an unreadable (invalid) comment gets a record marked resumed even when the caller built a plain one; another PR\'s resumed mark is not copied', () => {
+test('writeRunRecord: an unreadable (invalid) comment gets a record marked resumed even when the caller built a plain one', () => {
   const gh = memoryGh([{ id: 7, body: INVALID_BODY, user: { login: 'me' } }]);
   const posted = writeRunRecord(gh, PR, { record: plain(), repo: ID.repo, branch: ID.branch, host: 'pc-1', now: NOW });
   assert.deepEqual(posted.record.resumed, { at: new Date(NOW).toISOString(), host: 'pc-1', head: HEAD });
   assert.equal(readSummaryComment(gh, PR).record.resumed.host, 'pc-1');
-  const other = memoryGh();
-  seed(other, { ...resumedRecord(), pr: 99 });
-  assert.equal(writeRunRecord(other, PR, { record: plain(), repo: ID.repo, branch: ID.branch }).record.resumed, undefined);
+});
+
+// R9-F1: the comment is this PR's summary comment, the one the merge gate reads: a mark on a record bound to another repo / branch (a rename or
+// transfer) is carried, never dropped.
+test('writeRunRecord: a resumed mark on a record bound to another repo or branch (rename / transfer) is still carried over', () => {
+  for (const moved of [{ repo: 'acme/old-name' }, { branch: 'feat/old-branch' }, { pr: 99 }]) {
+    const gh = memoryGh();
+    seed(gh, { ...resumedRecord(), ...moved });
+    const posted = writeRunRecord(gh, PR, { record: plain() });
+    assert.deepEqual(posted.record.resumed, RESUMED, JSON.stringify(moved));
+    assert.deepEqual(readSummaryComment(gh, PR).record.resumed, RESUMED, JSON.stringify(moved));
+  }
+  const ordinary = memoryGh();
+  seed(ordinary, { ...plain(), repo: 'acme/old-name' });
+  assert.equal(writeRunRecord(ordinary, PR, { record: plain() }).record.resumed, undefined, 'a moved ordinary record stays ordinary');
+});
+
+// ---- R9-B1: the run-resumed event is the durable evidence; the record alone is not enough -------------------------------------------
+
+const EVENT = () => ({ id: 50, user: { login: 'me' }, body: renderEvent('run-resumed', 'pr4-aaaaaaaaaaaa', 'taken over', RESUMED) });
+
+test('resumedRunState: the record mark, OR a viewer-authored run-resumed event, makes the run resumed; neither leaves it ordinary', () => {
+  const none = memoryGh();
+  seed(none, plain());
+  assert.deepEqual(resumedRunState(none, PR).resumed, false);
+  const byRecord = memoryGh();
+  seed(byRecord, resumedRecord());
+  assert.deepEqual([resumedRunState(byRecord, PR).resumed, resumedRunState(byRecord, PR).unchecked], [true, null]);
+  // the R9-B1 interleaving: the event exists, the record was then overwritten by a writer that had not seen the mark
+  const byEvent = memoryGh([EVENT()]);
+  seed(byEvent, plain());
+  const state = resumedRunState(byEvent, PR);
+  assert.deepEqual([state.existing.status, state.existing.record.resumed, state.resumed, state.unchecked], ['ok', undefined, true, null]);
+  // another author's event does not count
+  const forged = memoryGh([{ ...EVENT(), user: { login: 'mallory' } }]);
+  seed(forged, plain());
+  assert.equal(resumedRunState(forged, PR).resumed, false);
+});
+
+test('resumedRunState: a record that cannot be read, or events that cannot be read, fail closed (unchecked)', () => {
+  const invalid = memoryGh([{ id: 7, body: INVALID_BODY, user: { login: 'me' } }]);
+  assert.match(resumedRunState(invalid, PR).unchecked, /^the run record is invalid$/);
+  // the record read succeeds, the events read (a second listing) fails
+  const gh = memoryGh();
+  seed(gh, plain());
+  const list = gh.listComments;
+  let calls = 0;
+  gh.listComments = (...a) => { calls += 1; if (calls > 1) throw new Error('boom 502'); return list(...a); };
+  const state = resumedRunState(gh, PR);
+  assert.equal(state.existing.status, 'ok');
+  assert.match(state.unchecked, /^the run-resumed events could not be read \(boom 502\)/);
+  assert.equal(state.resumed, false);
+});
+
+test('writeRunRecord: an invalid comment replaced by a resumed-marked record also leaves a run-resumed event (best effort, warned when it fails)', () => {
+  const gh = memoryGh([{ id: 7, body: INVALID_BODY, user: { login: 'me' } }]);
+  gh.createComment = (pr, body) => { gh.comments.push({ id: 60, body, user: { login: 'me' } }); return { id: 60, url: 'u' }; };
+  const warnings = [];
+  writeRunRecord(gh, PR, { record: plain(), repo: ID.repo, branch: ID.branch, host: 'pc-1', now: NOW, onWarning: (w) => warnings.push(w) });
+  const events = gh.comments.map((c) => parseEvent(c.body)).filter((e) => e?.kind === 'run-resumed');
+  assert.equal(events.length, 1);
+  assert.deepEqual([events[0].data.host, events[0].data.head], ['pc-1', HEAD]);
+  assert.deepEqual(warnings, []);
+  const broken = memoryGh([{ id: 7, body: INVALID_BODY, user: { login: 'me' } }]);
+  broken.createComment = () => { throw new Error('boom 502'); };
+  const w2 = [];
+  const posted = writeRunRecord(broken, PR, { record: plain(), repo: ID.repo, branch: ID.branch, host: 'pc-1', now: NOW, onWarning: (w) => w2.push(w) });
+  assert.ok(posted.record.resumed, 'the record is still written and marked');
+  assert.match(w2.join('\n'), /run-resumed event not posted: boom 502/);
 });
