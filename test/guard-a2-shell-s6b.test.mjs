@@ -165,15 +165,15 @@ test('S6b files: in a script run by plain bash, `${BASH:-bash}` names bash whate
   const bad = { ...ok, 'scripts/helper': BAD_WRITE };
   const BIND = 'grep -n "export type X\\|export interface Y" f.ts; ';
   for (const pre of ['', BIND, 'read -r n < f; ']) {
-    assert.equal(F(`${pre}bash scripts/tb plan.md`, ok), 'allow', pre);
-    assert.equal(F(`${pre}bash scripts/tb plan.md`, bad), 'deny', `${pre} (the helper is judged)`);
+    assert.equal(F(`${pre}bash ./scripts/tb plan.md`, ok), 'allow', pre);
+    assert.equal(F(`${pre}bash ./scripts/tb plan.md`, bad), 'deny', `${pre} (the helper is judged)`);
   }
   // (#56: a binder whose NAME is only known at run time may set any name, PATH or BASH_ENV included, which the bash inherits: every name is unknown)
-  assert.equal(F('read -r "$n" < f; bash scripts/tb plan.md', ok), 'deny');
-  assert.equal(F(`S=scripts; ${BIND}bash $S/tb plan.md`, ok), 'allow', '(the script picked through a variable)');
+  assert.equal(F('read -r "$n" < f; bash ./scripts/tb plan.md', ok), 'deny');
+  assert.equal(F(`S=./scripts; ${BIND}bash $S/tb plan.md`, ok), 'allow', '(the script picked through a variable)');
   // the bash reads a startup file first (it may bind BASH), or the line may change which program `bash` is: the old reading
-  assert.equal(F('BASH_ENV=rc bash scripts/tb plan.md', { ...ok, rc: 'read -r BASH' }), 'deny');
-  assert.equal(F(`${BIND}PATH=/tmp/x:$PATH bash scripts/tb plan.md`, ok), 'deny');
+  assert.equal(F('BASH_ENV=rc bash ./scripts/tb plan.md', { ...ok, rc: 'read -r BASH' }), 'deny');
+  assert.equal(F(`${BIND}PATH=/tmp/x:$PATH bash ./scripts/tb plan.md`, ok), 'deny');
 });
 
 // ---- git policy -------------------------------------------------------------------------------------------------------------------------------------------
