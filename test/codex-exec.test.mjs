@@ -122,12 +122,17 @@ test('execCodex: quota text only in an item output (turn.failed is a 401) is aut
   assert.equal('quota' in r, false);
 });
 
-test('execCodex: a stderr-only usage-limit message, or a run killed by a signal, is not quota', async (t) => {
+test('execCodex: a stderr-only usage-limit message is not quota', async (t) => {
   const dir = scratch(t);
   const plain = await run(dir, { FAKE_CODEX_EXIT: '1', FAKE_CODEX_STDERR: "ERROR: You've hit your usage limit. try again at 4:21 PM." });
   assert.equal(plain.reason, 'error');
   assert.match(plain.detail, /usage limit/, 'with no turn.failed the detail is the stderr tail');
   assert.equal('quota' in plain, false);
+});
+
+// On Windows process.kill ends the process with an exit code and signal null, so a "killed" run is indistinguishable from a real exit 1 with this stream.
+test('execCodex: a run killed by a signal is not quota', { skip: process.platform === 'win32' && 'no POSIX signals on Windows' }, async (t) => {
+  const dir = scratch(t);
   const killed = await run(dir, { FAKE_CODEX_STDOUT: QUOTA_STDOUT, FAKE_CODEX_SIGNAL: 'SIGKILL' });
   assert.equal(killed.ok, false);
   assert.equal(killed.reason, 'error');
