@@ -496,7 +496,8 @@ test('R2-B2: a fragment that switches the branch does not change the state the j
   // and what the fragments changed does not leak to the commands AFTER the feed: the real text `#git switch agent/x` switches nothing, so the later push is from main
   const leak = () => fakeFs(GIT_ROOT, { 'a.sh': '#', 'b.sh': 'git switch agent/x\n', 'p.sh': 'git push\n' }, ['sub', 'd']);
   for (const c of ['cat a.sh b.sh | bash; bash p.sh', 'bash <(cat a.sh b.sh); bash p.sh', 'eval "$(cat a.sh b.sh)"; bash p.sh']) assert.equal(gitOnMain(c, leak()).decision, 'deny', c);
-  assert.equal(gitOnMain('cat b.sh | bash; bash p.sh', leak()).decision, 'allow'); // b alone IS the switch (a single file carries)
+  assert.equal(gitOnMain('bash < b.sh; bash p.sh', leak()).decision, 'allow'); // b alone IS the switch (a single file carries)
+  assert.equal(gitOnMain('cat b.sh | bash; bash p.sh', leak()).decision, 'deny'); // (#352 R10: a change in a pipeline stage is unknown after it)
   // c alone pushes from main too (the baseline); the rewriting producer's files are scanned, never carried
   assert.equal(gitOnMain('cat c.sh | bash', fs()).decision, 'deny');
 });
@@ -508,14 +509,16 @@ test('R2-B2: the joined program is the real one: its own branch switch carries o
   const fs = () => fakeFs(GIT_ROOT, carried(), ['sub', 'd']);
   assert.equal(gitOnMain('bash p.sh', fs()).decision, 'deny'); // the baseline: p pushes from main
   // a + b = `git switch agent/x`: the rest of the line is on agent/x, where a push is allowed
-  for (const c of ['cat a.sh b.sh | bash; bash p.sh', 'bash <(cat a.sh b.sh); bash p.sh', 'eval "$(cat a.sh b.sh)"; bash p.sh']) assert.equal(gitOnMain(c, fs()).decision, 'allow', c);
+  for (const c of ['bash <(cat a.sh b.sh); bash p.sh', 'eval "$(cat a.sh b.sh)"; bash p.sh']) assert.equal(gitOnMain(c, fs()).decision, 'allow', c);
+  assert.equal(gitOnMain('cat a.sh b.sh | bash; bash p.sh', fs()).decision, 'deny'); // (#352 R10: a change in a pipeline stage is unknown after it)
   // without the switch (b alone is just a word, st is a status) the line stays on main
   for (const c of ['cat b.sh | bash; bash p.sh', 'cat st.sh st.sh | bash; bash p.sh']) assert.equal(gitOnMain(c, fs()).decision, 'deny', c);
 });
 
 test('R2-B2: a feed with ONE file keeps carrying that file\'s real state changes', () => {
   const fs = () => fakeFs(GIT_ROOT, carried(), ['sub', 'd']);
-  for (const c of ['cat sw.sh | bash; bash p.sh', 'bash < sw.sh; bash p.sh', 'eval "$(cat sw.sh)"; bash p.sh']) assert.equal(gitOnMain(c, fs()).decision, 'allow', c); // the switch is real
+  for (const c of ['bash < sw.sh; bash p.sh', 'eval "$(cat sw.sh)"; bash p.sh']) assert.equal(gitOnMain(c, fs()).decision, 'allow', c); // the switch is real
+  assert.equal(gitOnMain('cat sw.sh | bash; bash p.sh', fs()).decision, 'deny'); // (#352 R10: a change in a pipeline stage is unknown after it)
   assert.equal(gitOnMain('cat st.sh | bash; bash p.sh', fs()).decision, 'deny'); // nothing switched: still main
 });
 

@@ -158,7 +158,15 @@ test('#352 R7-F2: a state change inside an if / loop is not certain for a comman
   denies('a switch behind ||, then &&', 'true || git switch agent/x && ' + SHIP, {}, BAD, MAIN_DIR);
   denies('a cd behind ||, then &&', 'true || cd /work/other2 && ' + SHIP, {}, BAD, MAIN_DIR);
   denies('in a script', `bash ${GIT_ROOT}/run.sh`, { 'run.sh': '#!/bin/bash\nif false; then git switch agent/x; fi && ' + SHIP + '\n' }, BAD, MAIN_DIR);
-  allows('twin: a group chained with &&', '{ [ -f x ] && git switch agent/x; } && ' + SHIP, {}, MAIN_DIR);
+  allows('twin: a group chained with && (its status is its last list\'s: the push runs only when the switch did)', '{ [ -f x ] && git switch agent/x; } && ' + SHIP, {}, MAIN_DIR);
+  denies('R10: a conditional change in a group, then ; after the closer', '{ [ -f x ] && git switch agent/x; }; ' + SHIP, {}, undefined, MAIN_DIR);
+  denies('R10: a conditional change in a group, then more of the group', '{ [ -f x ] && git switch agent/x; true; } && ' + SHIP, {}, undefined, MAIN_DIR);
+  denies('R10: a change in a group, then || after the closer', '{ git switch agent/x; } || ' + SHIP, {}, undefined, MAIN_DIR);
+  denies('R10: a change in a piped group', '{ git switch agent/x; } | cat; ' + SHIP, {}, undefined, MAIN_DIR);
+  denies('R10: a change in a negated group', '! { git switch agent/x; }; ' + SHIP, {}, undefined, MAIN_DIR);
+  denies('R10: a change in a background group', '{ git switch agent/x; } & ' + SHIP, {}, undefined, MAIN_DIR);
+  allows('twin: a plain group, then ;', '{ git switch agent/x; }; ' + SHIP, {}, MAIN_DIR);
+  allows('twin: the change outside the group', '[ -f x ] && git switch agent/x && { :; } && ' + SHIP, {}, MAIN_DIR);
   allows('twin: a plain group', '{ git switch agent/x; } && ' + SHIP, {}, MAIN_DIR);
   allows('twin: && after && after a switch', 'true && git switch agent/x && ' + SHIP, {}, MAIN_DIR);
   denies('if, switch, fi ||', 'if false; then git switch agent/x; fi || ' + SHIP, {}, BAD, MAIN_DIR);

@@ -2521,6 +2521,8 @@ function unquotedText(s) {
 // text that is not shell code here: the argument of an external program (`docker exec db psql -c "select now()"`). Only a command that reads its words as code IN THIS SHELL can make such text
 // a definition (EVALUATES_HERE: eval, source, trap, alias, a shell ... and a name known only at run time); with one of those on the line the old answer stands.
 function definesFunction(str, cmds) {
+  // (#352 R10: a definition the parser found is code, also in a text it walks inline, where a quote stands before the name: `bash -c 'cd() { :; }; cd sub && psql -f q.sql'`)
+  if (cmds.fns instanceof Set && cmds.fns.size > 0) return true;
   if (!FUNCTION_DEF.test(str)) return false;
   // Defensive (mutation check): without the parser's real function definitions the unquotedText scan still refuses a text that defines a function.
   if (cmds.fns instanceof Set ? cmds.fns.size > 0 || !cmds.every(readsOnlyData) : !cmds.every(dataOnly)) return true;
@@ -3144,16 +3146,28 @@ function evalString(str, startDir, ctx, level, child = false) {
     const argv = c.argv;
     // Why: a cd inside a subshell ($( ), ( ), backticks, <( ), a text a new process runs: bash -c, a shell fed on stdin) moves that process only: when it ends, the line goes on in the directory it had when it started,
     // whatever the commands are named (superpowers' task-brief finds its helper with `$(cd "$(dirname "$0")" && pwd)` and then goes on where it was). A branch switched in it is the repository's, so it stays switched,
-    // or unknown when the switch may not have run. A change in this shell's own level (a { } group, eval, source) is unknown after it: the level itself may not have run.
+    // or unknown when the switch may not have run. A change in this shell's own level (eval, source, a { } group the line may not enter) is unknown after it: the level itself may not have run; a { } group the
+    // line surely enters hands its certain changes on.
     if (levels) {
       let k = 0;
       while (k < levels.length && k < c.up.length && levels[k].e === c.up[k]) k++;
       while (levels.length > k) {
         const l = levels.pop();
         const outer = levels[levels.length - 1];
-        if (l.e.kind === 'sub' || l.e.proc) { dir = l.dir; if (l.state) forgetBranches(); }
+        if (l.e.kind === 'sub' || l.e.proc) {
+          // (a directory a text left unknown stays unknown: it did something the walk cannot follow, `bash -c 'cd() { :; }'. A subshell's own snapshot is the directory the line goes on in, whatever a text inside it did: R10-F5)
+          if (l.e.kind === 'sub' || (dir !== null && !hazard)) dir = l.dir;
+          if (l.state) forgetBranches();
+        }
         else if (l.e.kind === 'blk') { for (const x of trackers) if (x.scoped && x.up.includes(l.e)) forget(x); } // (a change in a branch / loop / function body: unknown once the body is left)
-        else {
+        else if (l.e.kind === 'brace' && (l.e.sep === ';' || l.e.sep === '&')) {
+          // (#352 R10: a { } group the line surely enters (first, or after ; or &: one after && or || is a `blk`) is this shell going on. A change certain at its top stays certain after the closer, settled by
+          // the operator that follows it (`{ git switch x; } && push`; `{ [ -f x ] && git switch x; } && push`: the group's status is its last list's, so push runs only when the switch did). One in a negated,
+          // piped or backgrounded group was never certain: the parser marks its commands so.)
+          const at = levels.length;
+          trackers = trackers.map((x) => (x.up[at] === l.e ? { ...x, up: x.up.slice(0, at) } : x));
+          if (outer) { outer.lost ||= l.lost; outer.state ||= l.state; }
+        } else {
           if (l.lost) forgetState(); else if (l.state) forgetBranches();
           if (outer) { outer.lost ||= l.lost; outer.state ||= l.state; }
         }

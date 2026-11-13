@@ -84,6 +84,10 @@ test('S5a: quoted text that looks like a function definition does not make the d
   for (const c of ['function cd() { :; }; cd sub && psql -f q.sql', 'cd() { :; }; cd sub && psql -f q.sql', 'eval "true; function cd { :; }"; cd sub && psql -f q.sql', "bash -c 'cd() { :; }'; cd sub && psql -f q.sql", "cat <<EOF > /dev/null\ndon't\nEOF\nfunction cd() { :; }; echo 'x'; cd sub && psql -f q.sql"]) {
     assert.equal(git(c, fsFor('nowhere.sql', 'select 1;')).decision, 'deny', c);
   }
+  // (#352 R10: a definition inside a text the walk follows inline: its own cd is the function, so its psql runs q.sql where the text started, not in sub)
+  for (const c of ["bash -c 'cd() { :; }; cd sub && psql -f q.sql'", "bash -c 'function cd { :; }; cd sub && psql -f q.sql'"]) {
+    assert.equal(git(c, fsFor('q.sql', `\\! ${bad}`)).decision, 'deny', c);
+  }
 });
 
 // ---- 2: the consequence of an unknown cd is a write judgment, not a blanket refusal (files-policy) ----------------------------------------------------------------

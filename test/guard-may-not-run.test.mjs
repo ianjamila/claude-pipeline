@@ -83,7 +83,7 @@ test('#352 R8-F1: a NAME=value segment after the closer of a construct that may 
   denies('a switch: fi && A=1 &&', 'if false; then ' + RESET + '; fi && A=1 && ' + SHIP);
   denies('fi && A=1 && B=2 &&', 'if false; then cd /work/other2; fi && A=1 && B=2 && ' + SHIP);
   allows('twin: a plain chain with an assignment', 'cd /work/other2 && A=1 && ' + SHIP);
-  denies('twin (R10: a change in a { } group is unknown after it): a construct that cannot skip, then an assignment', '{ cd /work/other2; } && A=1 && ' + SHIP);
+  allows('twin: a construct that cannot skip, then an assignment (R10: a { } group the line surely enters hands its certain change on)', '{ cd /work/other2; } && A=1 && ' + SHIP);
   allows('twin: the cd outside the group', 'cd /work/other2 && { A=1; } && A=1 && ' + SHIP);
 });
 
@@ -149,7 +149,8 @@ test('#352 R9-F3: a negation covers the whole negated pipeline or group', () => 
   denies('! { a; switch; } &&', `! { git status; git switch agent/x; } && ${SHIP}`);
   denies('! (switch) &&', `! (git switch agent/x) && ${SHIP}`);
   denies('! cd | cat &&', `! cd /work/other2 | cat && ${SHIP}`);
-  denies('R10: { cd; } &&: a change in a group is unknown after it', `{ cd /work/other2; } && ${SHIP}`);
+  allows('twin: { cd; } && (R10: a { } group the line surely enters hands its certain change on)', `{ cd /work/other2; } && ${SHIP}`);
+  denies('R10: a { } group behind ||', `true || { cd /work/other2; } && ${SHIP}`);
 });
 
 test('#352 R9-F4: a pipeline that ends in & is a background job, whichever stage the change is in', () => {
