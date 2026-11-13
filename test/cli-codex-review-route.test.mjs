@@ -148,6 +148,23 @@ test('a Codex timeout is retried once: timeout then success is ok with retried; 
   assert.equal(stuck.record().lastOutage, null);
 });
 
+test('a model at capacity is retried once: capacity then success is ok with retried capacity; capacity twice is exit 3 error, never a substitute', (t) => {
+  const w = world(t);
+  const cap = { PIPELINE_CODEX_CAPACITY_RETRY_MS: '0', FAKE_CODEX_TURN_FAILED: 'Selected model is at capacity. Please try a different model.' };
+  const ok = w.run(1, { ...cap, FAKE_CODEX_FAIL_ONCE: join(w.scratch, 'failed-once'), ...w.ok() });
+  assertExit(ok, 0, ok.stdout + ok.stderr);
+  assert.deepEqual(ok.json.retried, { reason: 'capacity' });
+  assert.equal(w.state().rounds.length, 1, 'one counted round');
+
+  const stuck = world(t);
+  const r = stuck.run(1, { ...cap, FAKE_CODEX_EXIT: '1', ...stuck.ok() });
+  assertExit(r, 3, r.stdout);
+  assert.deepEqual([r.json.reason, r.json.timedOut, r.json.retried], ['error', false, { reason: 'capacity' }]);
+  assert.equal(r.json.substitute.eligible, false);
+  assert.equal(stuck.route().evidence, 'none');
+  assert.equal(stuck.record().lastOutage, null);
+});
+
 test('overlapping attempts: A starts, B replaces route.json and ends auth, A ends quota => A is superseded (exit 2), route.json stays B\'s, no round, no outage record', { skip: process.platform === 'win32' }, (t) => {
   const w = world(t);
   const b = `FAKE_CODEX_DURING= FAKE_CODEX_TURN_FAILED='Not logged in. Run codex login.' node "${join(process.cwd(), 'pipeline', 'bin', 'pipeline.mjs')}" codex-review --pr 7 --round 1 --base ${w.base} --head ${w.head} --effort high`;
