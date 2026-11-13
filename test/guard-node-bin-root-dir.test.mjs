@@ -171,3 +171,75 @@ test('#352 follow-up: the clean runner chain (npx next start, npm exec next) beh
     }
   }
 });
+
+// Why (#352 R1-B2): binSite dropped the bin's OWN package root when that is `/` (a bin /node_modules/.bin/tool run from /sub), so a shebang `#!/vendor/node` was not "inside the project" and the program was not opened.
+// Only a guessed run directory that is `/` is dropped; the package root of the bin is always kept.
+test('#352 R1-B2: binSite keeps the bin\'s own package root when it is /, run from a subdirectory', () => {
+  const s = binSite('/node_modules/.bin/tool', '/sub', () => false, path.posix);
+  assert.equal(s.inside('/vendor/node'), true, 'a path under the bin\'s package root (/) is inside the project');
+  const t = binSite('/home/u/proj/node_modules/.bin/tool', '/', () => false, path.posix);
+  assert.equal(t.inside('/vendor/node'), false, 'a guessed run directory of / is still dropped');
+});
+
+test('#352 R1-B2: a root-level bin run from a subdirectory whose shebang names a program in the project is opened by both guards', () => {
+  for (const g of GUARDS) {
+    const root = '/sub';
+    const files = { '/sub/package.json': '{}', '/node_modules/.bin/tool': '#!/vendor/node\necho ok\n', '/vendor/node': `#!/bin/sh\n${BAD[g]}\n` };
+    const fs = fakeFs(root, files);
+    const cwd = resolve(root);
+    const o = { home: '/home/u', realpath: (p) => p, cwd, ...fs };
+    const r = g === 'git'
+      ? evaluateGitCommand('npx tool', { currentBranch: () => 'agent/x', pushDestination: () => null, issueLabels: () => [], ...o })
+      : evaluateBashForFiles('npx tool', { env: {}, platform: PLATFORM, existsSync: fs.pathExists, ...o });
+    assert.equal(r.decision, 'deny', `${g}: ${r.reason}`);
+  }
+});
+
+// Why (#352 R1-B1): the per-ancestor package-script probes shared branch state, so a `git switch` in a script that may never run was kept as the certain branch and a later bare push was judged against it.
+const PUSH_BARE = 'git ' + PUSH;
+test('#352 R1-B1: a branch switched in a package script that may not run (lost cd) does not make a later push look safe', () => {
+  const files = {
+    'package.json': JSON.stringify({ name: 'x', scripts: { start: 'git switch agent/safe' } }),
+    'scripts/start.sh': '#!/bin/bash\ncd "$SOME_DIR" || exit 1\nnpm start\n',
+    'release.sh': `#!/bin/bash\n${PUSH_BARE}\n`,
+  };
+  const r = run('git', `bash ${GIT_ROOT}/scripts/start.sh; bash ${GIT_ROOT}/release.sh`, files, { currentBranch: () => MAIN });
+  assert.equal(r.decision, 'deny', r.reason);
+  // an alias defined by the speculative script is just as uncertain
+  const al = { ...files, 'package.json': JSON.stringify({ name: 'x', scripts: { start: 'git config alias.ship "' + PUSH + ' origin agent/x"' } }), 'release.sh': `#!/bin/bash\ngit ship\n` };
+  const r2 = run('git', `bash ${GIT_ROOT}/scripts/start.sh; bash ${GIT_ROOT}/release.sh`, al, { currentBranch: () => MAIN });
+  assert.equal(r2.decision, 'deny', 'alias: ' + r2.reason);
+});
+
+test('#352 R1-B1 control: the same switch run in a directory that is known (no lost cd) is still the certain branch', () => {
+  const files = {
+    'package.json': JSON.stringify({ name: 'x', scripts: { start: 'git switch agent/safe' } }),
+    'scripts/start.sh': '#!/bin/bash\nnpm start\n',
+    'release.sh': `#!/bin/bash\n${PUSH_BARE}\n`,
+  };
+  const r = run('git', `bash ${GIT_ROOT}/scripts/start.sh; bash ${GIT_ROOT}/release.sh`, files, { currentBranch: () => MAIN });
+  assert.equal(r.decision, 'allow', r.reason);
+});
+
+// Why (#352 R1-F1): selfDirs walked the script path as named; a link to the script (`cd "${0:A:h:h}"` resolves it) was not covered.
+test('#352 R1-F1: a script run through a link in another directory is refused like the real path', () => {
+  const bad = (g) => `#!/bin/sh\n${BAD[g]}\n`;
+  const files = { ...project('git', { start: 'evil' }, bad), 'node_modules/.bin/evil': bad('git'), 'scripts/serve.sh': '#!/bin/zsh\ncd "${0:A:h:h}" || exit 1\nexec npm start\n', '/home/u/bin/serve': '#!/bin/zsh\ncd "${0:A:h:h}" || exit 1\nexec npm start\n' };
+  const linkReal = (p) => (p === '/home/u/bin/serve' ? `${GIT_ROOT}/scripts/serve.sh` : p);
+  assert.equal(run('git', `${GIT_ROOT}/scripts/serve.sh`, files).decision, 'deny', 'real path');
+  const r = run('git', '/home/u/bin/serve', files, { realpath: linkReal });
+  assert.equal(r.decision, 'deny', r.reason);
+});
+
+// Why (#352 R1-F2): the same package.json reached from several ancestors was judged once per ancestor, spending the script allowance.
+test('#352 R1-F2: a package.json reached from many ancestor directories is judged once', () => {
+  const dirs = Array.from({ length: 12 }, (_, i) => `d${i}`).join('/');
+  const names = Array.from({ length: 12 }, (_, i) => `b${i}`);
+  const scripts = { start: names.map((n) => `cd "$SOME_DIR" && npm run ${n}`).join('; '), ...Object.fromEntries(names.map((n) => [n, 'echo built'])) };
+  const files = {
+    'package.json': JSON.stringify({ name: 'x', scripts }),
+    [`${dirs}/serve.sh`]: '#!/bin/bash\ncd "$SOME_DIR" || exit 1\nnpm start\n',
+  };
+  const r = run('git', `${GIT_ROOT}/${dirs}/serve.sh`, files);
+  assert.equal(r.decision, 'allow', r.reason);
+});
