@@ -677,9 +677,10 @@ since the review": fetch, re-run the review, and post again.
 assess the risk level of a branch diff.
 
 ```
-pipeline risk --base REF --head REF [--pr-base BRANCH] [--repo DIR]   -> {ok, level, reasons, lightLane, changedLines, fileCount, hardStops, sizeOnly, drivers, reviewer, laneReasons, sensitivePaths, note?, base, head, mergeBase}
+pipeline risk --base REF --head REF [--pr-base BRANCH] [--repo DIR]   -> {ok, level, reasons, lightLane, changedLines, fileCount, hardStops, sizeOnly, drivers, reviewer, laneReasons, sensitivePaths, note?, baseConfigError?, defaultBranch, anchor, base, head, mergeBase}
   the rating uses the working-tree config AND the one committed at the default branch's fork point (stricter wins; an unreadable one means reviewer fable)
-  the default branch is the anchor origin/HEAD names (a clone without it, or whose target is gone, uses config.default_branch); when the two differ a lane reason says so (fix a stale origin/HEAD: `git remote set-head origin -a`)
+  the default branch is the one the remote names, never the working-tree config's: refs/remotes/origin/HEAD (anchor origin-head), else `git ls-remote --symref origin HEAD`, asked once, read-only (anchor ls-remote); only a clone with no origin remote uses config.default_branch (anchor config);
+  a clone WITH an origin remote that neither source answers for (offline, no origin/HEAD) has an untrusted anchor: reviewer fable, baseConfigError and a lane reason say so (fix: `git remote set-head origin -a`); when the remote's branch differs from config.default_branch a lane reason says so too
   --pr-base: the branch the PR targets, when it is not the default branch (a stack): rated over both ranges like codex-review does, and never the size-only judge
   sizeOnly: medium for size alone (no hit, no high-risk path); drivers {hardStop, advisory, path, size}; reviewer: who follows Codex (judge|fable); note says why a medium PR has the judge
 ```
@@ -693,7 +694,9 @@ the judge (Sonnet), and so does a `medium` PR that is medium **only for its size
 report-only or ignored, and no sensitive path; base branch = the default branch) unless `review.size_only_medium_reviewer` is `fable`; other `medium` / `high`,
 or any file on `risk.high_risk_paths` or `review.arbiter_always_paths` → one Fable pass per round that rules on every Codex item and reviews the diff itself
 (`arbiter needed` mode `review`). `risk.ignore_hard_stop_rules` (only `P-path`, `R4-config`; default none) leaves those hits out of the level only. The rating is
-worked out under the working-tree config AND the one committed at the default branch's fork point (stricter wins; an unreadable one means Fable). `P risk`
+worked out under the working-tree config AND the one committed at the default branch's fork point (stricter wins; an unreadable one means Fable). The default branch that
+anchors that fork point comes from the remote (`origin/HEAD`, else one read-only `git ls-remote --symref origin HEAD`), never from the PR-editable `default_branch`; an `origin`
+remote that cannot name it leaves the working-tree value as an untrusted anchor (Fable). `P risk`
 adds `sizeOnly`, `drivers`, `reviewer`, `laneReasons` and the lane `note`. A PR that goes from judge to Fable reviews the whole PR in that round. Set the two new keys only after the installed pipeline is updated AND `pipeline vendor` has re-copied `risk.mjs` and `config.mjs` into the project (older validators reject unknown keys).
 
 ## smoke
