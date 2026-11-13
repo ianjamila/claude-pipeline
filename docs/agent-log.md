@@ -165,3 +165,4 @@ full record.
 - 2026-11-13 · #405 · Redraft safety: reconcile lost replies, --before-push, approval warning, hold-release retries · risk high · rounds 1 · arbiter 0 · blocked
 - 2026-11-13 · #406 · Workflow audit: warn when draft_while_iterating prerequisites are missing · risk high · rounds 1 · arbiter 0 · blocked
 - 2026-11-13 · #375 · fix(risk): gate and review-proof inputs join high_risk_paths as a named set (#356) · risk high · rounds 13 · arbiter 12 · awaiting-owner-merge
+- 2026-11-13 · #413 · CI usage report: cost per run class, pushes while ready, base churn; summary warns on a push to a ready PR · risk high · rounds 1 · arbiter 0 · blocked
