@@ -73,35 +73,54 @@ test('R6: only the proven draft-skip spellings are recognised', () => {
     "github.event_name != 'pull_request' || !github.event.pull_request.draft",
     '${{ github.event_name != "pull_request" || !github.event.pull_request.draft }}',
     "(github.event_name != 'pull_request' || !github.event.pull_request.draft) && github.ref != 'x'",
+    'always() && !github.event.pull_request.draft',
+    "always() && (github.event_name != 'pull_request' || !github.event.pull_request.draft)",
+    "failure() && (github.event.pull_request.draft == false)",
   ];
   for (const p of proven) assert.equal(draftSkipKind(p), 'proven', p);
   const unverified = [
-    'always() && !github.event.pull_request.draft',
+    'always()',
+    'success() || !github.event.pull_request.draft',
+    'always() && github.event.pull_request.draft == true',
     "contains(github.event.pull_request.labels.*.name,'x') || !github.event.pull_request.draft",
     'github.event.pull_request.draft',
     'github.event.pull_request.draft == true',
     '!github.event.pull_request.draft || github.actor == x',
+    'github.actor == x || !github.event.pull_request.draft',
   ];
   for (const u of unverified) assert.equal(draftSkipKind(u), 'unverified', u);
   assert.equal(draftSkipKind(null), 'none');
   assert.equal(draftSkipKind('github.event_name == push'), 'none');
   // Through the audit: unverified is its own code, never a pass and never plain draft-skip.
-  assert.deepEqual(audit(wf({ ifLine: 'if: always() && !github.event.pull_request.draft' })).missing, ['draft-skip-unverified']);
+  assert.deepEqual(audit(wf({ ifLine: 'if: always() && !github.event.pull_request.draft' })).missing, [], 'always() beside a proven conjunct is proven');
+  assert.deepEqual(audit(wf({ ifLine: 'if: github.actor == x || !github.event.pull_request.draft' })).missing, ['draft-skip-unverified']);
   assert.deepEqual(audit(wf({ ifLine: "if: contains(github.event.pull_request.labels.*.name,'x') || !github.event.pull_request.draft" })).missing, ['draft-skip-unverified']);
   assert.deepEqual(audit(wf({ ifLine: "if: github.event_name != 'pull_request' || !github.event.pull_request.draft" })).missing, []);
 });
 
-test('an always() aggregate behind a proven ancestor is fine (this repo\'s ci.yml shape)', () => {
-  const jobs = `  shard:
-    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+test('a job whose if calls a status function needs its own proven skip; an ancestor does not rescue it', () => {
+  const PROVEN = "github.event_name != 'pull_request' || !github.event.pull_request.draft";
+  const jobs = (own) => `  shard:
+    if: ${PROVEN}
     runs-on: x
   ci:
     needs: shard
-    if: always() && (github.event_name != 'pull_request' || !github.event.pull_request.draft)
-    runs-on: x
+${own === null ? '' : `    if: ${own}\n`}    runs-on: x
 `;
-  assert.deepEqual(audit(wf({ jobs })).missing, []);
-  assert.deepEqual(audit(wf({ jobs: jobs.replace('    if: github.event_name != \'pull_request\' || !github.event.pull_request.draft\n    runs-on: x\n  ci', '    runs-on: x\n  ci') })).missing, ['draft-skip-unverified']);
+  // this repo's ci.yml aggregate: proven by its own \`if\`
+  assert.deepEqual(audit(wf({ jobs: jobs(`always() && (${PROVEN})`) })).missing, []);
+  assert.deepEqual(audit(wf({ jobs: jobs('always() && !github.event.pull_request.draft') })).missing, []);
+  // no draft mention: not rescued by the proven ancestor
+  assert.deepEqual(audit(wf({ jobs: jobs('always()') })).missing, ['draft-skip']);
+  assert.deepEqual(audit(wf({ jobs: jobs("failure() && github.actor == 'x'") })).missing, ['draft-skip']);
+  assert.deepEqual(audit(wf({ jobs: jobs('cancelled()') })).missing, ['draft-skip']);
+  // mentions the draft in an unproven way: unverified, still not rescued
+  assert.deepEqual(audit(wf({ jobs: jobs('always() && github.event.pull_request.draft == true') })).missing, ['draft-skip-unverified']);
+  // no if at all, or a plain one: the ancestor's skip still carries over
+  assert.deepEqual(audit(wf({ jobs: jobs(null) })).missing, []);
+  assert.deepEqual(audit(wf({ jobs: jobs("github.actor != 'bot'") })).missing, []);
+  // ancestor without a proven skip: nothing to rescue with
+  assert.deepEqual(audit(wf({ jobs: jobs(null).replace(PROVEN, 'true') })).missing, ['draft-skip']);
 });
 
 test('the concurrency group needs a per-PR key and cancel-in-progress must be literally true', () => {

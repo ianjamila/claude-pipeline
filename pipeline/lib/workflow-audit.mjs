@@ -135,19 +135,25 @@ function unwrap(s) {
 }
 const unquote = (s) => s.replace(/"/g, "'");
 
-// 'proven' | 'unverified' | 'none' for one job `if`.
+const STATUS_FN = /\b(always|failure|cancelled|success)\s*\(/i;
+// A job whose `if` calls a status function runs even when its `needs` ancestors were skipped, so an ancestor's draft skip cannot
+// stand in for the job's own.
+export const callsStatusFunction = (ifText) => ifText != null && STATUS_FN.test(norm(ifText));
+export const mentionsDraft = (ifText) => ifText != null && /draft/i.test(ifText);
+
+// 'proven' | 'unverified' | 'none' for one job `if`. A top-level `&&` conjunction is false on a draft when one proven conjunct is, so a
+// proven conjunct proves the whole (even beside `always()`); under a top-level `||` only the push-or-not-draft spelling as a whole counts.
+// Anything else that mentions the draft or calls a status function is unverified.
 export function draftSkipKind(ifText) {
   if (ifText == null) return 'none';
   const e = unquote(norm(ifText));
-  if (!/draft/i.test(e)) return 'none';
-  if (/\balways\s*\(/i.test(e)) return 'unverified';
   const whole = unwrap(e);
   if (PROVEN.includes(whole)) return 'proven';
   if (splitTop(whole, '||')?.length === 1) {
     const terms = splitTop(whole, '&&');
-    if (terms && terms.length > 1 && terms.some((t) => PROVEN.includes(unwrap(t)))) return 'proven';
+    if (terms && terms.some((t) => PROVEN.includes(unwrap(t)))) return 'proven';
   }
-  return 'unverified';
+  return /draft/i.test(e) || STATUS_FN.test(e) ? 'unverified' : 'none';
 }
 
 // ---- concurrency -------------------------------------------------------------------------------------------------------------
@@ -185,12 +191,15 @@ export function auditWorkflowText(text, required) {
   if (producing.length === 0 || pr === null) return null;
   const missing = new Set();
 
-  // draft-skip: per producing job, its own `if` or any `needs` ancestor's (an ancestor's skip makes this job skip too).
+  // draft-skip: per producing job, its own `if` or any `needs` ancestor's (an ancestor's skip makes this job skip too, unless its own `if` calls a status function).
   let unverified = false; let absent = false;
   for (const { job } of producing) {
-    const chain = [job, ...ancestorsOf(job, byId)].map((j) => draftSkipKind(j.ifText));
-    if (chain.includes('proven')) continue;
-    if (chain.includes('unverified')) unverified = true; else absent = true;
+    if (draftSkipKind(job.ifText) === 'proven') continue;
+    // A status function in the job's own `if` makes it run despite a skipped ancestor: no rescue, only its own `if` counts.
+    const own = callsStatusFunction(job.ifText);
+    const chain = own ? [job] : [job, ...ancestorsOf(job, byId)];
+    if (!own && chain.some((j) => draftSkipKind(j.ifText) === 'proven')) continue;
+    if (chain.some((j) => mentionsDraft(j.ifText))) unverified = true; else absent = true;
   }
   if (absent) missing.add('draft-skip');
   if (unverified) missing.add('draft-skip-unverified');
@@ -236,7 +245,7 @@ export function auditDraftWorkflows(root, config) {
 
 const REMEDY = {
   'draft-skip': 'no job that produces a required check skips drafts (add `if: ${{ !github.event.pull_request.draft }}`)',
-  'draft-skip-unverified': 'the draft skip is not one of the recognised spellings, so it is unverified (use `!github.event.pull_request.draft`, `github.event.pull_request.draft == false`, or `github.event_name != \'pull_request\' || !github.event.pull_request.draft`, alone or `&&`-joined; `always()` hides it)',
+  'draft-skip-unverified': 'the draft skip is not one of the recognised spellings, so it is unverified (use `!github.event.pull_request.draft`, `github.event.pull_request.draft == false`, or `github.event_name != \'pull_request\' || !github.event.pull_request.draft`, alone or as one `&&`-joined conjunct; a draft test under a top-level `||` is unverified)',
   'no-ready_for_review': 'pull_request `types` lacks ready_for_review (a bare `pull_request:` gets only opened/synchronize/reopened)',
   'no-converted_to_draft': 'pull_request `types` lacks converted_to_draft',
   'no-pr-concurrency-group': 'the concurrency group has no per-PR key (pull_request.number, head_ref or github.ref)',
