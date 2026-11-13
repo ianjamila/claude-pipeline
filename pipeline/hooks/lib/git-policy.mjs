@@ -1571,20 +1571,59 @@ function pkgFileWritten(ctx, abs) {
   return w.unknown || w.pieces || w.authored || w.programs.length || w.scans.length || w.texts.length || sources.length ? 'maybe' : null;
 }
 
-// The directories a script file may have moved to with a cd the guard cannot follow: its own directory and every one above it.
-// (Why every one above it: the safe side. A package.json or bin in an ancestor the script would not really run from can only cause a false refusal, never a missed one.)
+// The directories a script file may have moved to with a cd the guard cannot follow: its own directory and every one above it, for the path as named and for where it really is (`${0:A:h:h}` resolves links).
+// Each is only a guess at where the script really runs from, so what the guesses do is judged as ALTERNATIVES: see judgeAlternatives.
 function selfDirs(ctx) {
   const out = [];
   if (typeof ctx.selfScript !== 'string') return out;
-  for (let d = path.dirname(ctx.selfScript); out.length < 16; d = path.dirname(d)) {
-    out.push(d);
-    if (path.dirname(d) === d) break;
+  const real = realLocation(ctx.realpath, ctx.selfScript);
+  for (const start of new Set([ctx.selfScript, typeof real === 'string' ? real : ctx.selfScript])) {
+    for (let d = path.dirname(start), n = 0; n < 16; n++, d = path.dirname(d)) {
+      if (!out.includes(d)) out.push(d);
+      if (path.dirname(d) === d) break;
+    }
   }
-  return out;
+  return out.slice(0, 32);
+}
+
+// Candidate readings of where a command runs (the directories of selfDirs): each is judged from the SAME starting state, and whatever any of them changed (a branch, a git / gh alias) is unknown afterwards,
+// never the guess's value nor the old one -- a `git switch` in a package script that may never run is not the branch the later commands act on. (Same rule as judgeScopedIn's candidates and judgeReadings.)
+// judge(item) returns a verdict (a refusal ends the walk) or null.
+function judgeAlternatives(ctx, items, judge) {
+  const base = { branches: new Map([...ctx.branches].map(([d, e]) => [d, { ...e }])), git: { ...ctx.gitAliases }, gh: { ...ctx.ghAliases }, unsure: new Set(ctx.aliasUnsure) };
+  const moved = new Set();
+  const redefined = new Set();
+  const settle = () => {
+    for (const d of new Set([...base.branches.keys(), ...ctx.branches.keys()])) {
+      const a = base.branches.get(d);
+      const b = ctx.branches.get(d);
+      if (a?.name !== b?.name || a?.trackMain !== b?.trackMain) moved.add(d);
+    }
+    for (const [kind, was, now] of [['git', base.git, ctx.gitAliases], ['gh', base.gh, ctx.ghAliases]]) {
+      for (const n of new Set([...Object.keys(was), ...Object.keys(now)])) if (was[n] !== now[n]) redefined.add(`${kind}:${n}`);
+    }
+    ctx.branches.clear();
+    for (const [d, e] of base.branches) ctx.branches.set(d, { ...e });
+    for (const [k, was] of [['gitAliases', base.git], ['ghAliases', base.gh]]) { for (const n of Object.keys(ctx[k])) delete ctx[k][n]; Object.assign(ctx[k], was); }
+    ctx.aliasUnsure.clear();
+    for (const n of base.unsure) ctx.aliasUnsure.add(n);
+  };
+  let v = null;
+  for (const item of items) {
+    try {
+      v = judge(item);
+    } finally {
+      settle();
+    }
+    if (v) break;
+  }
+  for (const d of moved) ctx.branches.set(d, { name: null, trackMain: false });
+  for (const a of redefined) ctx.aliasUnsure.add(a);
+  return v;
 }
 
 const MARKERS_MSG =(said, kind) => `package script: an earlier command on the line (mkdir, touch, rm, mv, cp, ln ...) ${kind === 'known' ? 'creates, removes or renames' : 'may create, remove or rename (a path only known at run time), while the line mentions a guarded operation,'} a package.json, node_modules, server.js, binding.gyp or configuration file that \`${said}\` depends on (in the package's directory or above it), so which script it runs cannot be verified. Run it in a command of its own.`;
-function packageScriptVerdict(argv, dir, ctx, level) {
+function packageScriptVerdict(argv, dir, ctx, level, seen = null) {
   const call = pmCall(argv.map((a) => expandVars(a, ctx)));
   if (!call) return null;
   const said = argv.slice(0, 4).join(' ');
@@ -1601,10 +1640,10 @@ function packageScriptVerdict(argv, dir, ctx, level) {
   }
   if (dir === null) {
     // (#352) inside a script file, a directory lost to a cd the guard cannot follow is most likely near the script (`cd "$(dirname "$0")/.."`): the package.json is read from the script's directory and each one above it
-    for (const d of selfDirs(ctx)) {
-      const v = packageScriptVerdict(argv, d, ctx, level);
-      if (v) return v;
-    }
+    // (the same package.json is reached from several of them: each distinct script is judged once)
+    const judged = new Set();
+    const v = judgeAlternatives(ctx, selfDirs(ctx), (d) => packageScriptVerdict(argv, d, ctx, level, judged));
+    if (v) return v;
     // a directory the guard lost track of (after a sourced file or a cd it cannot follow): judged like a script named at run time (`bash $F`) -- refused when the line mentions a guarded operation (t11)
     return lineMentionsGuarded(ctx) ? deny('package script: the directory this runs in is unknown (after a cd or a sourced file the guard cannot follow) and the line mentions a guarded operation, so which package.json `' + said + '` reads cannot be verified. Chain the cd with &&, or use an absolute --prefix.') : null;
   }
@@ -1613,6 +1652,11 @@ function packageScriptVerdict(argv, dir, ctx, level) {
   const marked = pkgMarkersFor(ctx.budget, pmStartDirs(call, [dir], ctx.home, path), { pathExists: ctx.pathExists, real: (q) => realLocation(ctx.realpath, q), p: path });
   if (marked === 'known' || (marked === 'maybe' && lineMentionsGuarded(ctx))) return deny(MARKERS_MSG(said, marked));
   for (const run of plan.runs ?? []) {
+    if (seen) { // (a script already judged for another candidate directory)
+      const key = [run.file, run.dir, run.binDir ?? '', run.name ?? run.label, run.text].join('\u0000'); // (not the label: it names the file relative to the directory the manager was started in, which differs)
+      if (seen.has(key)) continue;
+      seen.add(key);
+    }
     // (the manager puts every node_modules/.bin from the package's directory upward on the PATH of the script's commands: a bare command name in it may be one of those bins)
     const outerBinDir = ctx.scriptBinDir;
     ctx.scriptBinDir = run.binDir ?? run.dir;
@@ -1691,10 +1735,8 @@ function runnerBinVerdict(argv, dir, ctx, level, quiet = false, lookup = dir) {
   if (name.includes('/')) return null;
   // (#352) a runner (npx, npm exec, pnpm dlx / exec, yarn exec, bunx) run after a cd the guard cannot follow, in a script file: its bin is looked up from the script's own directory and each one above it
   if (dir === null && lookup === null) {
-    for (const d of selfDirs(ctx)) {
-      const v = binVerdict(name, d, ctx, level, quiet, d);
-      if (v) return v;
-    }
+    const v = judgeAlternatives(ctx, selfDirs(ctx), (d) => binVerdict(name, d, ctx, level, quiet, d));
+    if (v) return v;
   }
   return binVerdict(name, dir, ctx, level, quiet, lookup);
 }
