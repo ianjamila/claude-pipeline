@@ -2885,6 +2885,7 @@ class Parser {
       else if (w.text === 'function' && i + 1 < words.length) i += 2;
       else break;
     }
+    seg.negated = words.slice(0, i).some((w) => w.text === '!' && w.qa < 0); // (`! cmd`: its status is inverted, so a command chained with && after it runs when cmd FAILED)
     const env = {};
     // PowerShell: `$env:NAME = "v"` / `$env:NAME="v"` sets an environment variable
     const ps = i < words.length ? PS_ENV_RE.exec(words[i].text) : null;
@@ -2982,6 +2983,7 @@ class Parser {
     const cmd = emit(this.ctx, a, env, seg.raw, seg.depth, [], seg.sep, seg.afterClose);
     if (cmd && chdir !== undefined) Object.defineProperty(cmd, 'chdir', { value: chdir, enumerable: false });
     if (cmd && viaRunner) Object.defineProperty(cmd, 'viaRunner', { value: true, enumerable: false });
+    if (cmd && seg.negated) Object.defineProperty(cmd, 'negated', { value: true, enumerable: false }); // (#352 R8: see git-policy's may-not-run rule)
     if (cmd && runnerDirs.length) Object.defineProperty(cmd, 'runnerDirs', { value: runnerDirs, enumerable: false });
     if (bashAlso) for (const sh of ['bash', 'sh']) emit(this.ctx, [sh, ...bashAlso], env, seg.raw, seg.depth, [], seg.sep, seg.afterClose);
     // the words that are exactly one command substitution (`for f in $(cmd)`): see wspans (#81)

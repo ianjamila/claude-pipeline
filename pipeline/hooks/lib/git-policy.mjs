@@ -3165,7 +3165,7 @@ function evalString(str, startDir, ctx, level, child = false) {
     // judged from, a git command that changes the checkout in a way the walk does not model.)
     // `cd d || exit`: when the cd fails nothing after it runs, so the commands that do run see the change
     const orExits = cmds[i + 1]?.sep === '||' && ['exit', 'return'].includes(cmds[i + 1].argv[0]) && cmds[i + 2]?.sep !== '|' && cmds[i + 2]?.sep !== '&';
-    const mayNotRun = inFlow(from, i) || c.depth > 0 || c.sep === '&&' || c.sep === '||' || ranInSubshell(cmds, i) || (cmds[i + 1]?.sep === '||' && !orExits);
+    const mayNotRun = inFlow(from, i) || c.negated === true || c.depth > 0 || c.sep === '&&' || c.sep === '||' || ranInSubshell(cmds, i) || (cmds[i + 1]?.sep === '||' && !orExits);
     const before = mayNotRun && argv.length ? stateMark(ctx) : null;
     const changesStateWords = argv.length > 0 && (DIR_CHANGERS.includes(baseName(argv[0])) || (baseName(argv[0]) === 'git' && argv.some((w) => STATE_GIT.has(w)) && !argv.some((w) => w === '--show-current' || w === '--list' || w === '-l')));
     // (Phase 3b, Fable attacker pass: `env -C D gh pr merge …` / `sudo -D D …` run the command in D, which the merge check never saw from a
@@ -3272,7 +3272,7 @@ function evalString(str, startDir, ctx, level, child = false) {
       if (startupList.some((st) => !st.implicit)) withStartupScope(c, ctx, judgeRest); else judgeRest();
     }
     if (verdict && verdict.decision === 'deny') return verdict;
-    if (mayNotRun && (changesStateWords || stateChanged(ctx, before))) { flags.uncertain = true; if (c.sep === '||') flags.orChanged = true; }
+    if (mayNotRun && (changesStateWords || stateChanged(ctx, before))) { flags.uncertain = true; if (c.sep === '||' || c.negated === true) flags.orChanged = true; } // (a negated command: its && successor runs when it failed)
     markPackageState(ctx.budget, [argv], { dirs: dir === null ? null : [dir], expand: (w) => expandVars(w, ctx), home: ctx.home, p: path }); // (what this command may change, for the package scripts after it)
     if (SOURCING.includes(name)) {
       // what the sourced file did is not modelled: every later command sees an unknown directory, branch and variables
