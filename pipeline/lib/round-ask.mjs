@@ -47,7 +47,7 @@ export function openItems(state, outcome, { config, files, baseConfig, baseProbl
   const ids = new Set([...outcome.newAccepted, ...outcome.unimplemented, ...outcome.openBlocking, ...outcome.pending, ...outcome.needsHuman]);
   const found = (state?.rounds ?? []).flatMap((r) => (r.items ?? []).map((item) => ({ item, round: item.round ?? r.n }))).filter(({ item }) => ids.has(item.id));
   let broken = false;
-  if (baseProblem) {
+  if (baseProblem && found.length > 0) { // (nothing open: nothing to judge, no warning about items that do not exist)
     broken = true;
     warnings.push(`severity could not be judged: the trusted base config is unreadable (${asciiLine(baseProblem, 120)}): every open item is shown as high`);
   }

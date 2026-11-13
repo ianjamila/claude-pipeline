@@ -76,3 +76,23 @@ test('round-request and the park comment: a fork-point config that names another
   assert.ok(a.warnings.some((x) => /^severity could not be judged: the trusted base config is unreadable \(the config at the fork point names default_branch "trunk"/.test(x)), JSON.stringify(a.warnings));
   assert.match(park(w), /^- Open: not available \(severity could not be judged\)\.$/m);
 });
+
+test('the park comment: an unreadable trusted base config with no open item says "no item is open", with no severity warning (the PR that first adds pipeline.yml)', (t) => {
+  const w = roundWorld(t);
+  w.atCap();
+  // no item is open any more (the rounds ran, every item is gone), and the fork point has no config at all
+  w.edit((s) => { for (const r of s.rounds) r.items = []; });
+  w.repo.git(['checkout', '-q', 'main']);
+  w.repo.git(['rm', '-q', '.claude/pipeline.yml']);
+  w.repo.commit('main drops the config');
+  w.repo.git(['checkout', '-q', 'feat/x']);
+  w.repo.git(['merge', '--no-edit', '--no-commit', 'main']);
+  w.repo.git(['checkout', 'HEAD', '--', '.claude/pipeline.yml']);
+  w.repo.commit('merge main, keep the config');
+  const body = park(w);
+  assert.match(body, /^- Open: no item is open\.$/m);
+  assert.doesNotMatch(body, /severity could not be judged/);
+  // round-request still refuses the follow-up path on the unreadable config (the triage.mjs startsWith refusal), as the tests above pin with items open
+  const a = ask(w);
+  assert.ok(a.warnings.some((x) => x.startsWith('severity could not be judged: the trusted base config is unreadable')), JSON.stringify(a.warnings));
+});
