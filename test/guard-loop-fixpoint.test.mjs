@@ -89,6 +89,12 @@ test('#352 R6-F2 extras: break, a loop that exits early, until, a function in th
   denies('until', `git switch agent/x; until [ -f stop ]; do ${SHIP}; npm run setup; [ -f flag ] && continue; npm run reset; done`, SCRIPTS);
   denies('function called in the loop', `f() { ${SHIP}; npm run setup; [ -f flag ] && return; npm run reset; }; git switch agent/x; for i in 1 2; do f; done`, SCRIPTS);
   denies('break in an inner loop, the outer carries on', `for i in 1 2; do ${SHIP}; for j in 1 2; do npm run setup; [ -f flag ] && break; npm run reset; done; done`, SCRIPTS);
+  denies('the reset after || true', 'for s in ship setup; do npm run $s || true; done', SCRIPTS);
+  denies('a loop word in a subshell', 'for s in ship setup; do (npm run $s); done', SCRIPTS);
+  denies('a loop word in the background', 'for s in ship setup; do npm run $s & done', SCRIPTS);
+  denies('break in an if, a push after the loop', 'while true; do if [ -f a ]; then npm run setup; break; fi; npm run ship; done', SCRIPTS);
+  denies('three deep', 'for i in 1 2; do for j in 1 2; do for k in 1 2; do npm run ship; npm run setup; npm run reset; done; done; done', SCRIPTS);
+  denies('the readings of a loop inside a loop', 'for a in x y; do for s in ship setup; do npm run $s; done; done; ' + SHIP, SCRIPTS);
   denies('continue 2', `git switch agent/x; for i in 1 2; do ${SHIP}; for j in 1 2; do npm run setup; [ -f flag ] && continue 2; npm run reset; done; done`, SCRIPTS);
 });
 
