@@ -25,7 +25,7 @@ export const meta = {
     '  --kind blocked renders the verify report\'s failure; with --reason TEXT it renders a "the review stopped: TEXT" comment instead (no report needed), e.g. the advice of a stop that waits for a terminal restart.',
     '  --kind needs-human adds, when a review state with at least one round exists for this PR, a short status block under the paragraph: rounds, booked cost (with the last round\'s share),',
     '  open items with their severity and why the review is not clean (the extra-round ask\'s text without its recommendation). Display only: a part that cannot be read becomes a "not available" line; the comment is always written.',
-    '  --kind triage also adds {redraftAdvice:true, warnings:[...]}: run `pipeline redraft --pr N` before the first fix push, when the repo has ci.draft_while_iterating, the state holds',
+    '  --kind triage also adds {redraftAdvice:true, warnings:[...]}: run `pipeline redraft --pr N --before-push` after committing the first fix and before pushing it, when the repo has ci.draft_while_iterating, the state holds',
     '  an ACCEPT item not yet implemented (a fix is coming) and the PR is READY. Advice only, never a failure: no such item, a draft PR or a PR that cannot be read gets none.',
   ].join('\n'),
 };
@@ -98,7 +98,7 @@ function redraftAdvice({ config, state, gh, pr }) {
   if (!fixComing || !prIsReady(gh, pr)) return {};
   return {
     redraftAdvice: true,
-    warnings: [`PR #${pr} is ready and this repo iterates in draft (ci.draft_while_iterating): run \`pipeline redraft --pr ${pr}\` BEFORE you push any fix from this round, so CI waits for the re-ready instead of running on every fix push`],
+    warnings: [`PR #${pr} is ready and this repo iterates in draft (ci.draft_while_iterating): commit the fix, then run \`pipeline redraft --pr ${pr} --before-push\` BEFORE you push any fix from this round, so CI waits for the re-ready instead of running on every fix push`],
   };
 }
 
