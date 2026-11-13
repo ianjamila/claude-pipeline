@@ -135,3 +135,19 @@ describe('R20: a CDPATH set by a sourced file is seen by what runs after it', ()
       withFs({ [`${HOME}/proj/env-plain.sh`]: 'export FOO=1\n', [`${HOME}/proj/clean.sh`]: 'cd build && rm -rf out\n', [`${HOME}/proj/build`]: '' })],
   ]);
 });
+
+// ---- R21: the real home's startup file is judged with the CDPATH a sourced file set ----
+describe('R21: ~/.zshenv sees a CDPATH learned from a sourced file', () => {
+  const SKILLS = `${HOME}/.claude/skills`;
+  const withFs = (files) => ({ ...fsx(files), existsSync: (p) => Object.hasOwn(files, p) || p === SKILLS });
+  denies('R21-F1', [
+    ['source env.sh then zsh -c : with ~/.zshenv doing a plain cd',
+      'source ./env.sh; zsh -c :',
+      withFs({ [`${HOME}/proj/env.sh`]: 'export CDPATH=/home/u/lib\n', [`${HOME}/.zshenv`]: 'cd skills && find . -delete\n' })],
+  ]);
+  allows('R21 (no CDPATH anywhere)', [
+    ['source env-plain.sh then zsh -c : with ~/.zshenv doing a plain cd into a project folder',
+      'source ./env-plain.sh; zsh -c :',
+      withFs({ [`${HOME}/proj/env-plain.sh`]: 'export FOO=1\n', [`${HOME}/.zshenv`]: 'cd build && rm -rf out\n', [`${HOME}/proj/build`]: '' })],
+  ]);
+});
