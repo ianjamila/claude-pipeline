@@ -275,6 +275,12 @@ test('rateBranch: an unstaged default_branch edit cannot move the trusted fork p
   const r = await w.rate();
   assert.equal(r.reviewer, 'fable', r.laneReasons.join('; '));
   assert.equal(r.trustedFork, w.repo.git(['rev-parse', 'main']).trim(), 'the trusted fork point is main\'s, not the branch the edited config names');
+  // the committed config stays in force even though it names another default_branch than the edited working config: the PR cannot drop its sensitive list
+  assert.equal(r.level, 'high', r.reasons.join('; '));
+  assert.deepEqual(r.sensitivePaths, ['src/vault/store.js']);
+  assert.equal(r.sizeOnly, false);
+  assert.equal(r.baseConfig.ok, false);
+  assert.match(r.baseConfig.reason, /default_branch/);
 });
 
 test('rateBranch: without a remote default branch, a default_branch the committed config does not share is an untrusted base config (Fable)', async (t) => {
@@ -283,4 +289,27 @@ test('rateBranch: without a remote default branch, a default_branch the committe
   assert.equal(r.baseConfig.ok, false);
   assert.match(r.baseConfig.reason, /default_branch/);
   assert.ok(r.laneReasons.some((x) => /trusted base config unreadable/.test(x)));
+});
+
+// A branch with an origin/HEAD whose target does not resolve (default branch renamed, fetched with prune, origin/HEAD never re-set) rates from the config's default_branch.
+test('rateBranch: a dangling origin/HEAD falls back to the config default_branch instead of throwing', async (t) => {
+  const w = world(t, { feature: (r) => r.write('src/a.js', lines(3)) });
+  w.repo.git(['symbolic-ref', 'refs/remotes/origin/HEAD', 'refs/remotes/origin/gone']);
+  const r = await w.rate();
+  assert.equal(r.trustedFork, w.repo.git(['rev-parse', 'main']).trim());
+  assert.equal(r.reviewer, 'judge', r.laneReasons.join('; '));
+  assert.equal(r.stacked, false);
+});
+
+test('rateBranch: a remote default branch that differs from config.default_branch is named in the lane reasons, with the remedy', async (t) => {
+  const w = world(t, { feature: (r) => r.write('src/a.js', lines(3)) });
+  w.repo.git(['branch', 'develop', 'main']);
+  w.repo.git(['update-ref', 'refs/remotes/origin/develop', 'develop']);
+  w.repo.git(['symbolic-ref', 'refs/remotes/origin/HEAD', 'refs/remotes/origin/develop']);
+  const r = await w.rate();
+  const reason = r.laneReasons.find((x) => /origin\/HEAD/.test(x));
+  assert.ok(reason, r.laneReasons.join('; '));
+  assert.match(reason, /"develop"/);
+  assert.match(reason, /"main"/);
+  assert.match(reason, /git remote set-head origin -a/);
 });

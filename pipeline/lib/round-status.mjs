@@ -14,8 +14,10 @@ import { asciiLine, roundOutcome } from './triage.mjs';
 // -> { config, problem }: unreadable gives config null (its lists count as empty, nothing is loosened) and says why.
 export function trustedBaseConfig(root, config) {
   try {
-    const { trusted } = trustedBase({ root, head: 'HEAD', config });
-    return trusted.ok ? { config: trusted.config, problem: null } : { config: null, problem: trusted.reason };
+    const { trusted, mismatch } = trustedBase({ root, head: 'HEAD', config });
+    if (!trusted.ok) return { config: null, problem: trusted.reason };
+    // a readable committed config that names another default_branch still counts for the union (its lists are kept); the mismatch is the problem
+    return { config: trusted.config, problem: mismatch };
   } catch (err) {
     return { config: null, problem: String(err?.message ?? err).split('\n')[0].slice(0, 160) };
   }
