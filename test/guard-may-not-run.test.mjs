@@ -357,3 +357,29 @@ test('#352 R12-F1b: a $( ) in a heredoc body or in $[ ] takes the operator befor
   allows('twin: switch; cat <<EOF, $( push ) in the body', `${RESET}; cat <<EOF\n$(${SHIP})\nEOF`);
   allows('twin: switch && echo $[ $( push ) ]', `${RESET} && echo $[ $(${SHIP}) ]`);
 });
+
+// (#352 R13: the tail after a subshell's `)` is decided from what the lexer read since it, not from the raw text; a reserved word after `)` is no redirect list; the `paren` mark covers only the group's own commands)
+test('#352 R13-B1: a line continuation between ) and its redirect keeps the redirect part of the subshell command', () => {
+  denies('cd d && ( ) \\<nl> 2>&1 & push', `cd /work/other2 && (true) \\\n 2>&1 & ${SHIP}`);
+  denies('cd d && ( ) \\<nl>\\<nl> > log & push', `cd /work/other2 && (true) \\\n\\\n > /tmp/log & ${SHIP}`);
+  denies('switch || ( ) \\<nl> 2>&1 | cat; push', `${RESET} || (true) \\\n 2>&1 | cat; ${SHIP}`);
+  allows('twin: cd d && ( ) \\<nl> 2>&1 && push', `cd /work/other2 && (true) \\\n 2>&1 && ${SHIP}`);
+  allows('twin: cd d && ( ) \\<nl> 2>&1; push', `cd /work/other2 && (true) \\\n 2>&1; ${SHIP}`);
+});
+
+test('#352 R13-F1: a reserved word right after ) is not the subshell\'s redirect: it does not inherit the operator before the (', () => {
+  denies('then cd d && ( ) else push', `if false; then cd /work/other2 && (true) else ${SHIP}; fi`);
+  denies('then cd d && ( ) elif push', `if false; then cd /work/other2 && (true) elif ${SHIP}; then true; fi`);
+  denies('then switch && ( ) else push', `if false; then ${RESET} && (true) else ${SHIP}; fi`);
+  denies('then cd d && ( ) \\<nl> else push', `if false; then cd /work/other2 && (true) \\\n else ${SHIP}; fi`);
+  allows('twin: then cd d && ( ) 2>&1 && push', `if false; then cd /work/other2 && (true) 2>&1 && ${SHIP}; fi`);
+  allows('twin: then cd d && ( ) 2>&1; push', `if false; then cd /work/other2 && (true) 2>&1; ${SHIP}; fi`);
+});
+
+test('#352 R13-F2: the command in front of a ( ) glued after its words is still a stage of the pipeline that follows', () => {
+  denies('cd d (N) | cat; push', `cd /work/other2 (N) | cat; ${SHIP}`);
+  denies('cd d (true) | cat && push', `cd /work/other2 (true) | cat && ${SHIP}`);
+  denies('switch (N) | cat; push', `${RESET} (N) | cat; ${SHIP}`);
+  allows('twin: (cd d && push) | cat', `(cd /work/other2 && ${SHIP}) | cat`);
+  allows('twin: cd d && npm test 2>&1 | tail, push in its own line', `cd /work/other2 && echo hi 2>&1 | tail && ${SHIP}`);
+});
