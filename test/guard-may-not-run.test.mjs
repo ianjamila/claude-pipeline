@@ -101,3 +101,18 @@ test('#352 R8-F2: a subshell between an uncertain change and && does not give th
   allows('twin: cd d && echo $(true) &&', 'cd /work/other2 && echo $(true) && ' + SHIP);
   denies('as before: a switch && (true) && (the subshell forgets a branch the line switched)', RESET + ' && (true) && ' + SHIP);
 });
+
+test('#352 R8 adjacent shapes: negation, a text run by bash -c under ||, a pipeline stage, a subshell around a script keep or gain the right verdict', () => {
+  denies('! cd && (the push runs when the cd failed)', '! cd /work/other2 && ' + SHIP);
+  denies('! npm run && ', '! npm run reset && ' + SHIP, HERE);
+  denies('fi && ! A=1 &&', 'if false; then cd /work/other2; fi && ! A=1 && ' + SHIP);
+  denies('true || bash -c switch &&', "true || bash -c 'git switch agent/x' && " + SHIP);
+  denies('true || bash -c npm run &&', "true || bash -c 'npm run reset' && " + SHIP, HERE);
+  denies('case, esac && (true) &&', 'case $x in a) cd /work/other2;; esac && (true) && ' + SHIP);
+  denies('case, esac && A=1 &&', 'case $x in a) cd /work/other2;; esac && A=1 && ' + SHIP);
+  denies('a script in a subshell, ;', '(npm run reset); ' + SHIP, HERE);
+  allows('twin: bash -c switch &&', "bash -c 'git switch agent/x' && " + SHIP);
+  allows('twin: a script in a pipeline stage still switched the branch', 'npm run reset | cat; ' + SHIP, HERE);
+  allows('twin: a nested subshell with a cd behind ||, then a switch', '( (true || cd /safe) ); ' + RESET + ' && ' + SHIP);
+  allows('twin: cd d && A=$(true) &&', 'cd /work/other2 && A=$(true) && ' + SHIP);
+});

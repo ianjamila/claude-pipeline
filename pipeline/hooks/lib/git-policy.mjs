@@ -3043,19 +3043,23 @@ function evalString(str, startDir, ctx, level, child = false) {
   const from = flowStart(cmds);
   // (#352 R8: ONE state for the may-not-run rule. uncertain: an earlier cd / branch change may not have taken effect for the commands that follow; orChanged: that change is behind `||`, so a command
   // chained with && after it may run without it. They are saved and restored together with the directory (snap / restore) by every subshell and loop frame.)
-  const flags = { uncertain: false, orChanged: false };
-  const forgetState = () => { dir = null; for (const e of ctx.branches.values()) e.name = null; };
-  const snap = () => ({ dir, uncertain: flags.uncertain, orChanged: flags.orChanged });
-  const restore = (x) => { dir = x.dir; flags.uncertain = x.uncertain; flags.orChanged = x.orChanged; };
+  // lostDir: the change may have moved the directory (a cd, or a direct git command: as before); a change only found in the git state (a script that switched the branch) leaves the directory known, so the
+  // package scripts after it are still followed.)
+  const flags = { uncertain: false, orChanged: false, lostDir: false };
+  const forgetBranches = () => { for (const e of ctx.branches.values()) e.name = null; };
+  const forgetState = () => { dir = null; forgetBranches(); };
+  const snap = () => ({ dir, uncertain: flags.uncertain, orChanged: flags.orChanged, lostDir: flags.lostDir });
+  const restore = (x) => { dir = x.dir; flags.uncertain = x.uncertain; flags.orChanged = x.orChanged; flags.lostDir = x.lostDir; };
   // The rule, for a command (or a subshell) that comes after an uncertain change, with the operator before it: only commands chained with && after the change are certain to see it (`cd d && git push`);
   // anything else may run without it (`false && cd d; git push`, `cd d &`, `(cd d)`, `cd d || git push`), so the state is unknown.
   // (#352 R7-F2: not the `&&` after the closer of a construct that may have skipped its body: `if false; then cd d; fi && git push`, `done &&`, `esac &&` chain to the construct, not to the body's last command.
   // Nor the `&&` after a change that was itself behind `||`: `true || cd d && git push` runs the push without the cd.)
   const settle = (op) => {
     if (!flags.uncertain || (op.sep === '&&' && !op.afterClose && !flags.orChanged)) return;
-    forgetState();
+    if (flags.lostDir) forgetState(); else forgetBranches();
     flags.uncertain = false;
     flags.orChanged = false;
+    flags.lostDir = false;
   };
   // sticky: a later `cd /abs` does not make it known again (`alias cd=true; cd /safe`, a DEBUG trap that cds back)
   const hazard = definesFunction(str, cmds) || cmds.some(isStateHazard);
@@ -3120,7 +3124,7 @@ function evalString(str, startDir, ctx, level, child = false) {
       fr.judged.set(nextDir, carrySize(fr.carry));
       fr.passDir = nextDir;
       loopReseed(ctx, fr.entry, fr.carry);
-      restore(nextDir === fr.at.dir ? fr.at : { dir: nextDir, uncertain: false, orChanged: false });
+      restore(nextDir === fr.at.dir ? fr.at : { dir: nextDir, uncertain: false, orChanged: false, lostDir: false });
       chdirBase = undefined;
       if (subs) subs.splice(0, subs.length, ...fr.subs.map((x) => ({ ...x })));
       i = fr.start;
@@ -3165,7 +3169,12 @@ function evalString(str, startDir, ctx, level, child = false) {
     // judged from, a git command that changes the checkout in a way the walk does not model.)
     // `cd d || exit`: when the cd fails nothing after it runs, so the commands that do run see the change
     const orExits = cmds[i + 1]?.sep === '||' && ['exit', 'return'].includes(cmds[i + 1].argv[0]) && cmds[i + 2]?.sep !== '|' && cmds[i + 2]?.sep !== '&';
-    const mayNotRun = inFlow(from, i) || c.negated === true || c.depth > 0 || c.sep === '&&' || c.sep === '||' || ranInSubshell(cmds, i) || (cmds[i + 1]?.sep === '||' && !orExits);
+    // (c.depth > 0: a command of a `bash -c` / eval text runs only when that command does. A cd is also lost in a pipeline stage, but a script that ran in one still switched the repository's branch: that is for the words only.)
+    // (a command of a `bash -c` / eval text runs when the command that holds the text does, under ITS operator: `true || bash -c 'cd d' && x`)
+    let op = c;
+    if (c.depth > 0) for (let j = i - 1; j >= 0; j--) if (cmds[j].depth < c.depth) { op = cmds[j]; break; }
+    const mayNotRun = inFlow(from, i) || op.negated === true || c.depth > 0 || op.sep === '&&' || op.sep === '||' || cmds[i + 1]?.sep === '&' || (cmds[i + 1]?.sep === '||' && !orExits);
+    const wordMayNotRun = mayNotRun || ranInSubshell(cmds, i);
     const before = mayNotRun && argv.length ? stateMark(ctx) : null;
     const changesStateWords = argv.length > 0 && (DIR_CHANGERS.includes(baseName(argv[0])) || (baseName(argv[0]) === 'git' && argv.some((w) => STATE_GIT.has(w)) && !argv.some((w) => w === '--show-current' || w === '--list' || w === '-l')));
     // (Phase 3b, Fable attacker pass: `env -C D gh pr merge …` / `sudo -D D …` run the command in D, which the merge check never saw from a
@@ -3272,7 +3281,12 @@ function evalString(str, startDir, ctx, level, child = false) {
       if (startupList.some((st) => !st.implicit)) withStartupScope(c, ctx, judgeRest); else judgeRest();
     }
     if (verdict && verdict.decision === 'deny') return verdict;
-    if (mayNotRun && (changesStateWords || stateChanged(ctx, before))) { flags.uncertain = true; if (c.sep === '||' || c.negated === true) flags.orChanged = true; } // (a negated command: its && successor runs when it failed)
+    const wordChange = changesStateWords && wordMayNotRun;
+    if (wordChange || (mayNotRun && stateChanged(ctx, before))) {
+      flags.uncertain = true;
+      if (wordChange) flags.lostDir = true;
+      if (op.sep === '||' || op.negated === true) flags.orChanged = true; // (a negated command: its && successor runs when it failed)
+    }
     markPackageState(ctx.budget, [argv], { dirs: dir === null ? null : [dir], expand: (w) => expandVars(w, ctx), home: ctx.home, p: path }); // (what this command may change, for the package scripts after it)
     if (SOURCING.includes(name)) {
       // what the sourced file did is not modelled: every later command sees an unknown directory, branch and variables
