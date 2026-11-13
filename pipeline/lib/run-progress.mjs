@@ -114,6 +114,7 @@ export function createRunRecorder({ gh, pr, host = hostname(), now = () => Date.
         base.warnings.forEach(warn);
         const record = applyCheckpoint(base.record, patch, { host, now: now() });
         const posted = writeRunRecord(gh, pr, { record, host, now: now() });
+        posted.warnings.forEach(warn);
         return posted.record;
       } catch (err) {
         warn(`run record not updated: ${String(err?.message ?? err).slice(0, 200)}`);

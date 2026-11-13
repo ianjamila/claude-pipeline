@@ -151,6 +151,8 @@ export const run = guarded(async (argv, ctx) => {
     }
     // (the guarded writer re-reads first, which only narrows the window for a concurrent writer's `resumed` mark: the run-resumed event is the durable evidence)
     const posted = writeRunRecord(gh, pr, { record, skipResumedEvent: Boolean(values.resumed) });
+    // The writer's own re-read can find the record unreadable and stamp it resumed (#407); baseRecordFor may have said the same already.
+    for (const w of posted.warnings) if (!warnings.includes(w)) warnings.push(w);
     return { exitCode: EXIT.OK, output: { ok: true, url: posted.url, action: posted.action, record: posted.record, warnings } };
   });
 });
