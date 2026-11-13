@@ -718,6 +718,14 @@ export function reviewBaseRef(branch, o) {
   }
 }
 
+// The branch the remote itself calls its default (what refs/remotes/origin/HEAD points at), or null when the clone has none or it is not a plain
+// origin/<branch>. A source a PR cannot edit: unlike .claude/pipeline.yml it is not part of the tree under review.
+export function remoteDefaultBranch(o) {
+  const out = gitOrNull(['symbolic-ref', '-q', 'refs/remotes/origin/HEAD'], 1, o);
+  const m = /^refs\/remotes\/origin\/(.+)\n?$/.exec(out ?? '');
+  return m ? m[1] : null;
+}
+
 // THE content hash of "the code that was reviewed": what HEAD changes relative to where it forked from the PR base,
 // minus the agent log the pipeline itself appends to. The review loop (round coverage, review-complete) and the final
 // gate / merge both call this, so they cannot disagree about whether a review is current.

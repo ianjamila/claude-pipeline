@@ -197,3 +197,49 @@ test('rateBranch: hits keep the collector identity (rule, file, line) and the st
   assert.equal(p2.length, 2);
   assert.ok(p2.every((h) => h.advisory !== true), JSON.stringify(p2));
 });
+
+// EW#1955: the trusted fork point must not come from the working-tree config. main's config (C1) is strict; the branch `old` sits on C0, whose committed
+// config was loose. An unstaged edit points default_branch at `old` and loosens the same keys: both evaluations would read loose configs.
+function attackWorld(t, { remote }) {
+  const repo = createTmpRepo();
+  t.after(() => repo.cleanup());
+  const loose = yml('risk:\n  high_risk_paths: []\n');
+  const strict = yml('review:\n  size_only_medium_reviewer: fable\nrisk:\n  high_risk_paths: ["src/vault/**"]\n');
+  repo.write('.claude/pipeline.yml', loose);
+  repo.write('README.md', 'base\n');
+  repo.commit('c0');
+  repo.git(['branch', 'old']);
+  repo.write('.claude/pipeline.yml', strict);
+  repo.commit('c1');
+  if (remote) {
+    repo.git(['update-ref', 'refs/remotes/origin/main', 'main']);
+    repo.git(['symbolic-ref', 'refs/remotes/origin/HEAD', 'refs/remotes/origin/main']);
+  }
+  repo.branch('feat/x');
+  repo.write('src/vault/store.js', lines(5));
+  repo.commit('feature');
+  const rate = async () => {
+    repo.write('.claude/pipeline.yml', `${loose}default_branch: old\n`);
+    const loaded = await loadConfig(repo.dir);
+    assert.equal(loaded.ok, true, (loaded.errors ?? []).join('; '));
+    // the callers' diff base is the PR's own base (GitHub's baseRefName, here main), so the diff does not contain the config change itself
+    const base = repo.git(['rev-parse', 'main']).trim();
+    return rateBranch({ root: repo.dir, head: 'HEAD', config: loaded.config, prBase: 'main', base });
+  };
+  return { repo, rate };
+}
+
+test('rateBranch: an unstaged default_branch edit cannot move the trusted fork point (the remote default branch anchors it)', async (t) => {
+  const w = attackWorld(t, { remote: true });
+  const r = await w.rate();
+  assert.equal(r.reviewer, 'fable', r.laneReasons.join('; '));
+  assert.equal(r.trustedFork, w.repo.git(['rev-parse', 'main']).trim(), 'the trusted fork point is main\'s, not the branch the edited config names');
+});
+
+test('rateBranch: without a remote default branch, a default_branch the committed config does not share is an untrusted base config (Fable)', async (t) => {
+  const r = await attackWorld(t, { remote: false }).rate();
+  assert.equal(r.reviewer, 'fable');
+  assert.equal(r.baseConfig.ok, false);
+  assert.match(r.baseConfig.reason, /default_branch/);
+  assert.ok(r.laneReasons.some((x) => /trusted base config unreadable/.test(x)));
+});

@@ -11,7 +11,7 @@ import { diffStats } from './diff.mjs';
 import { matchAny } from './glob.mjs';
 import { DEFAULTS, RISK_IGNORABLE_RULES, baseConfigAt } from './config.mjs';
 import { collectHardStops } from './hardstops.mjs';
-import { diffFiles, mergeBase, reviewBaseRef } from './git.mjs';
+import { diffFiles, mergeBase, remoteDefaultBranch, reviewBaseRef } from './git.mjs';
 
 const LEVELS = ['low', 'medium', 'high'];
 export const SIZE_ONLY_NOTE = 'medium for size only: Sonnet judge (review.size_only_medium_reviewer)';
@@ -168,22 +168,30 @@ export function reviewLane({ level, files, config, sizeOnly = false }) {
 // ---- the whole decision, under the working-tree config AND the trusted base config ------------------------------------------------
 //
 // One shared function for codex-review, review-complete and `pipeline risk`: the hard-stop scan, the level and the lane are worked out twice, once with
-// the working-tree config and once with the config COMMITTED at mergeBase(origin/<default_branch>, head) (never the PR's own base branch), and the
+// the working-tree config and once with the config COMMITTED at mergeBase(origin/<default branch>, head) (never the PR's own base branch), and the
 // stricter result wins on every axis. A PR (committed, staged or unstaged edits of .claude/pipeline.yml) therefore cannot loosen the thresholds, the
 // sensitive paths, the hard-stop paths, the ignore list or the size-only reviewer that rate it. The same config twice is evaluated once. A base config
 // that is missing, unreadable or invalid means the rating cannot be trusted: the reviewer is Fable, whatever the level.
+// The default branch that anchors the trusted fork point is never taken from the working-tree config (a PR can edit it): it is what the remote calls its
+// default (refs/remotes/origin/HEAD); only a clone without that ref falls back to the config's default_branch. Whichever is used, a config committed at
+// that fork point that names a different default_branch than the working-tree config is no trusted base config either (Fable).
 // A PR whose base branch is not the default branch (a stack) never gets the size-only judge: it is rated from the default branch's fork point by
 // review-complete, and from its own base by codex-review, and the two must agree.
 // `base` (optional) is the ref the diff starts from; it defaults to the trusted fork point (codex-review passes its own, stack-aware, fork point).
 // Throws what the scan throws (the callers decide how to fail closed). -> {
 //   level, reasons, changedLines, fileCount, drivers, sizeOnly, reviewer, laneReasons, sensitivePaths, sizeOnlyJudge, note, hits, files, lightLane,
 //   trustedFork, baseConfig: { ok, reason? }, stacked }
-export async function rateBranch({ root, head, config, defaultBranch = config.default_branch, prBase = defaultBranch, base }) {
+export async function rateBranch({ root, head, config, prBase, base }) {
   const o = { cwd: root };
+  const defaultBranch = remoteDefaultBranch(o) ?? config.default_branch;
+  prBase ??= defaultBranch;
   const trustedFork = mergeBase(reviewBaseRef(defaultBranch, o), head, o);
   const from = base ?? trustedFork;
   const stacked = prBase !== defaultBranch;
-  const trusted = baseConfigAt(trustedFork, root);
+  const committed = baseConfigAt(trustedFork, root);
+  const trusted = committed.ok && committed.config.default_branch !== config.default_branch
+    ? { ok: false, reason: `the config at the fork point names default_branch ${JSON.stringify(committed.config.default_branch)}, the working-tree config ${JSON.stringify(config.default_branch)}` }
+    : committed;
   const sameConfig = trusted.ok && JSON.stringify(trusted.config) === JSON.stringify(config);
   const configs = [['', config], ...(trusted.ok && !sameConfig ? [['base config: ', trusted.config]] : [])];
   const files = diffFiles(from, head, o);
