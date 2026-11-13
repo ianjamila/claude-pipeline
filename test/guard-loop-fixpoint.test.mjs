@@ -18,7 +18,7 @@ const RESET = 'git switch agent/x';
 function fakeFs(root, files) {
   const abs = (p) => resolve(root, p);
   const F = Object.fromEntries(Object.entries(files).map(([k, v]) => [abs(k), v]));
-  const D = new Set([root, '/home/u', '/work/other2'].map((p) => resolve(p)));
+  const D = new Set([root, '/home/u', '/work/other2', '/work/main'].map((p) => resolve(p)));
   for (const p of Object.keys(F)) for (let d = dirname(p); d !== dirname(d); d = dirname(d)) D.add(d);
   const names = (d) => {
     const out = new Set();
@@ -32,21 +32,21 @@ function fakeFs(root, files) {
     readDir: (p) => (D.has(resolve(p)) ? names(resolve(p)) : null),
   };
 }
-// (the repository at GIT_ROOT is on agent/x, so is /work/other2; any other directory is a repository on main)
-const run = (cmd, files = {}) => evaluateGitCommand(cmd, {
-  cwd: GIT_ROOT, home: '/home/u', currentBranch: (d) => (String(d).startsWith(GIT_ROOT) || String(d).startsWith('/work/other2') ? 'agent/x' : MAIN), pushDestination: () => null, issueLabels: () => [], realpath: (p) => p, ...fakeFs(GIT_ROOT, files),
+// (the repository at GIT_ROOT is on agent/x, so is /work/other2; any other directory is a repository on main, /work/main for one)
+const run = (cmd, files = {}, cwd = GIT_ROOT) => evaluateGitCommand(cmd, {
+  cwd, home: '/home/u', currentBranch: (d) => (String(d).startsWith(GIT_ROOT) || String(d).startsWith('/work/other2') ? 'agent/x' : MAIN), pushDestination: () => null, issueLabels: () => [], realpath: (p) => p, ...fakeFs(GIT_ROOT, files),
 });
 const pkgOf = (scripts) => ({ 'package.json': JSON.stringify({ name: 'x', scripts }) });
 const SCRIPTS = pkgOf({ setup: SWITCH_MAIN, reset: RESET, ship: SHIP, other: 'echo hi' });
 const NEXT = /cannot determine the current branch|pushing to main is blocked/; // (the push of the next iteration meets a branch that is unknown, or main)
 
-function denies(what, cmd, files, reason = NEXT) {
-  const r = run(cmd, files);
+function denies(what, cmd, files, reason = NEXT, cwd = GIT_ROOT) {
+  const r = run(cmd, files, cwd);
   assert.equal(r.decision, 'deny', `${what}: allowed`);
   assert.match(r.reason, reason, `${what}: ${r.reason}`);
 }
-function allows(what, cmd, files) {
-  const r = run(cmd, files);
+function allows(what, cmd, files, cwd = GIT_ROOT) {
+  const r = run(cmd, files, cwd);
   assert.equal(r.decision, 'allow', `${what}: ${r.reason}`);
 }
 
@@ -117,4 +117,50 @@ test('#352 R6 allow twins: loops that leave nothing for their next iteration are
   allows('a switch before the loop, a push in it', `git switch agent/x; for i in 1 2; do ${SHIP}; npm run other; done`, SCRIPTS);
   allows('a switch after the loop', `for i in 1 2; do ${SHIP}; done; npm run setup`, SCRIPTS);
   allows('a switch before the loop', `npm run setup; for i in 1 2; do git add f; done`, SCRIPTS);
+});
+
+const MAIN_DIR = '/work/main';
+const pk = (scripts) => JSON.stringify({ name: 'x', scripts });
+const PUSH_MAIN = PB + ' origin ' + MAIN;
+
+test('#352 R7-B1: the directories a loop starts an iteration in are shared by the readings of its loop word (iteration a moves, iteration b runs there)', () => {
+  const at = (bScript) => ({ 'package.json': pk({ a: 'echo a', b: 'echo b' }), '/work/a/package.json': pk({ a: 'echo a', b: bScript }), '/work/b/package.json': pk({ a: 'echo a', b: 'echo b' }) });
+  denies('b pushes in /work/a', 'for s in a b; do npm run $s; cd /work/$s; done', at(PUSH_MAIN), /pushing to main is blocked/);
+  denies('pushd', 'for s in a b; do npm run $s; pushd /work/$s; done', at(PUSH_MAIN), /pushing to main is blocked/);
+  denies('in a script', `bash ${GIT_ROOT}/run.sh`, { ...at(PUSH_MAIN), 'run.sh': '#!/bin/bash\nfor s in a b; do npm run $s; cd /work/$s; done\n' }, /pushing to main is blocked/);
+  allows('twin: b is harmless in /work/a', 'for s in a b; do npm run $s; cd /work/$s; done', at('echo b'));
+  allows('twin: nothing moves', 'for s in a b; do npm run $s; done', at(PUSH_MAIN));
+});
+
+test('#352 R7-F1: a loop frame holds the state the loop\'s first command really starts with, after the subshell of the same command is settled', () => {
+  const sub = (a) => ({ 'package.json': pk({ a: 'echo a' }), 'sub/package.json': pk({ a }) });
+  denies('a subshell before the loop', '(true); for i in 1 2; do npm run a; cd sub; done', sub(PUSH_MAIN), /pushing to main is blocked/);
+  denies('a cd in a subshell before the loop', '(cd /tmp); for i in 1 2; do npm run a; cd sub; done', sub(PUSH_MAIN), /pushing to main is blocked/);
+  allows('twin: harmless in sub', '(true); for i in 1 2; do npm run a; cd sub; done', sub('echo a'));
+  allows('twin: cd in a subshell, harmless in sub', '(cd /tmp); for i in 1 2; do npm run a; cd sub; done', sub('echo a'));
+  denies('a loop inside a subshell, the push after it', '( for i in 1 2; do git status; cd /work/other2; done ); ' + SHIP, {}, /pushing to main is blocked/, MAIN_DIR);
+  allows('twin: the same from a directory on a feature branch', '( for i in 1 2; do git status; cd /work/other2; done ); ' + SHIP, {});
+  allows('twin: a loop inside a subshell, the push before it', SHIP + '; ( for i in 1 2; do git status; cd /work/other2; done )', {});
+});
+
+test('#352 R7-F2: a state change inside an if / loop is not certain for a command chained with && after its closer', () => {
+  denies('if false, switch, fi &&', 'if false; then git switch agent/x; fi && ' + SHIP, {}, /pushing to main is blocked|cannot determine the current branch/, MAIN_DIR);
+  denies('while false, cd, done &&', 'while false; do cd /work/other2; done && ' + SHIP, {}, /pushing to main is blocked|cannot determine the current branch/, MAIN_DIR);
+  denies('for, cd, done &&', 'for i in; do cd /work/other2; done && ' + SHIP, {}, /pushing to main is blocked|cannot determine the current branch/, MAIN_DIR);
+  denies('until, cd, done &&', 'until true; do cd /work/other2; done && ' + SHIP, {}, /pushing to main is blocked|cannot determine the current branch/, MAIN_DIR);
+  denies('case, switch, esac &&', 'case $x in a) git switch agent/x;; esac && ' + SHIP, {}, /pushing to main is blocked|cannot determine the current branch/, MAIN_DIR);
+  denies('group, switch, } &&', '{ [ -f x ] && git switch agent/x; } && ' + SHIP, {}, /pushing to main is blocked|cannot determine the current branch/, MAIN_DIR);
+  denies('if, switch, fi ||', 'if false; then git switch agent/x; fi || ' + SHIP, {}, /pushing to main is blocked|cannot determine the current branch/, MAIN_DIR);
+  allows('twin: a feature branch, fi &&', 'if [ -f x ]; then git status; fi && ' + SHIP, {});
+  allows('twin: a plain chain stays certain', 'git switch agent/x && ' + SHIP, {}, MAIN_DIR);
+  allows('twin: a plain cd chain stays certain', 'cd /work/other2 && ' + SHIP, {}, MAIN_DIR);
+  allows('twin: a loop that does not move, done &&', 'for i in 1 2; do git status; done && ' + SHIP, {});
+});
+
+test('#352 R7-F3: a loop whose carry keeps growing at every new place it moves to is refused after MAX_LOOP_PASSES, with the reason that names it', () => {
+  // (a different git alias in the package of each directory the body moves to: every new start grows the carry, so the starts are judged again and again)
+  const alias = (n) => pk({ a: `git config alias.s${n} x` });
+  const deep = { 'package.json': alias(1), 'sub/package.json': alias(2), 'sub/sub/package.json': alias(3), 'sub/sub/sub/package.json': alias(4) };
+  denies('four aliases in four places', 'for i in 1 2; do npm run a; cd sub; done', deep, /keeps leaving git state for its next iteration, or moves to ever new places/);
+  allows('twin: the same body, one alias in every place', 'for i in 1 2; do npm run a; cd sub; done', { 'package.json': alias(1), 'sub/package.json': alias(1), 'sub/sub/package.json': alias(1), 'sub/sub/sub/package.json': alias(1) });
 });
