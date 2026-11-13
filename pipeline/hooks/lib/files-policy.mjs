@@ -3923,7 +3923,7 @@ function evaluateBashForFilesFrame(command, opts) {
     // line's text nor its directories, only on the variables the line has set (seeded below; one whose value is unknown refuses a script it picks)
     if (st.implicit) {
       const unknown = Object.keys(ctx.vars).filter((k) => /[$`]/.test(ctx.vars[k])).sort();
-      const key = `${st.file}\u0000${JSON.stringify([ctx.vars, ctx.keptVars ?? {}, unknown, dirs, writeSignature(ctx.frames)])}`;
+      const key = `${st.file}\u0000${JSON.stringify([ctx.vars, ctx.keptVars ?? {}, unknown, dirs, writeSignature(ctx.frames), ctx.cdpath === true])}`;
       const memo = (ctx.budget.implicitStartup ??= new Map());
       // a verdict that leaned on "a missing script may have been created by a command we do not model" is reused only while that is as true as it was
       const flag = unmodelledBefore(ctx.frames);
@@ -3931,7 +3931,7 @@ function evaluateBashForFilesFrame(command, opts) {
       if (known && (!known.sens || known.flag === flag)) return known.v;
       const seen0 = ctx.budget.unmodelledSeen ?? 0;
       memo.set(key, { v: null, sens: false, flag });
-      const seed = { ...opts, _ignoreUnmodelled: true, _depth: 0, _assigned: ctx.assigned, _vars: { ...ctx.vars }, _keptVars: { ...(ctx.keptVars ?? {}) }, _unknown: new Set(unknown) };
+      const seed = { ...opts, _ignoreUnmodelled: true, _depth: 0, _assigned: ctx.assigned, _vars: { ...ctx.vars }, _keptVars: { ...(ctx.keptVars ?? {}) }, _unknown: new Set(unknown), _cdpath: opts._cdpath === true || ctx.cdpath === true }; // (R21: a CDPATH a sourced file set reaches the home startup file)
       let v = null;
       const abs = expandRefs(st.file, ctx);
       const text = isAbs(abs) ? ctx.readText(abs) : null;
@@ -3952,7 +3952,7 @@ function evaluateBashForFilesFrame(command, opts) {
     // reused only for the same file, directories and nesting depth, never for a run-time name (its verdict depends on the line's text)
     // (the shell sees the variables the line gave it, its own prefix included: `F=f.sh BASH_ENV=rc bash -c :` where rc sources "$F")
     if (st.ambiguous) return judgeScriptFile(st, dirs, ctx, withLineVars(opts), scanRaw);
-    const key = `${dirs.join('\u0000')}\u0000${opts._depth ?? 0}\u0000${st.file}\u0000${JSON.stringify([ctx.vars, ctx.keptVars ?? {}])}\u0000${unmodelledBefore(ctx.frames)}\u0000${writeSignature(ctx.frames)}`;
+    const key = `${dirs.join('\u0000')}\u0000${opts._depth ?? 0}\u0000${st.file}\u0000${JSON.stringify([ctx.vars, ctx.keptVars ?? {}])}\u0000${unmodelledBefore(ctx.frames)}\u0000${writeSignature(ctx.frames)}\u0000${ctx.cdpath === true}`;
     if (ctx.budget.startupOk.has(key)) return null;
     ctx.budget.startupOk.add(key);
     return judgeScriptFile(st, dirs, ctx, withLineVars(opts), scanRaw);
