@@ -74,7 +74,8 @@ const uploadSteps = (f) => {
   const wf = parseYaml(readFileSync(new URL(f, DIR), 'utf8'));
   return Object.values(wf.jobs ?? {}).flatMap((j) => (j.steps ?? []).filter((s) => /^actions\/upload-artifact@/.test(s.uses ?? '')));
 };
-const hasHiddenSegment = (p) => !p.includes('${{') && p.split(/[\n/\\]+/).some((seg) => seg.startsWith('.'));
+// `.` and `..` are path navigation, not hidden names: flagging them would push authors to upload `.git/config` (the checkout token).
+const hasHiddenSegment = (p) => !p.includes('${{') && p.split(/[\n/\\]+/).some((seg) => seg.startsWith('.') && seg !== '.' && seg !== '..');
 
 for (const f of files) {
   test(`workflow template ${f} sets include-hidden-files: true on upload-artifact steps that upload a dot path`, () => {
@@ -92,4 +93,10 @@ test('the hidden-path upload check sees verify.yml\'s .verify/ upload (it is not
   assert.equal(hasHiddenSegment('a/.b/c'), true);
   assert.equal(hasHiddenSegment('${{ runner.temp }}/.x'), false);
   assert.equal(hasHiddenSegment('out/report.json'), false);
+  assert.equal(hasHiddenSegment('out/.cache/x'), true);
+  assert.equal(hasHiddenSegment('./.verify'), true);
+  // `.` and `..` segments are not hidden names
+  assert.equal(hasHiddenSegment('.'), false);
+  assert.equal(hasHiddenSegment('./out/report.json'), false);
+  assert.equal(hasHiddenSegment('../x/y'), false);
 });
