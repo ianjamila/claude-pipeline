@@ -80,6 +80,7 @@ risk:
     "pipeline/commands/risk.mjs", "pipeline/commands/hardstops.mjs", "pipeline/commands/integrity.mjs", "pipeline/commands/preflight.mjs",
     "pipeline/lib/claude-ancestry.mjs", "pipeline/lib/protection.mjs", "pipeline/commands/comment.mjs", "pipeline/commands/update.mjs",
     "pipeline/lib/update-schedule.mjs",
+    "pipeline/lib/render.mjs", "pipeline/lib/upstream.mjs", "pipeline/lib/private-tmp.mjs", "pipeline/lib/auto-update.mjs",
     "install.sh", "install.ps1"]
   # Every path here is a hard stop (hard_stops.paths ["**"]), so every PR would rate high. These two rules no longer raise the
   # LEVEL (round-1 Codex effort, judge vs Fable); their hits still make the merge an owner item. Editing this file or other

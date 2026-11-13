@@ -213,6 +213,8 @@ test('repo config: the gate and review-proof named set is in risk.high_risk_path
     // the comment publisher, the update commands (owner-only guards), and the libs the gate-side commands use
     'pipeline/lib/claude-ancestry.mjs', 'pipeline/lib/protection.mjs', 'pipeline/commands/comment.mjs', 'pipeline/commands/update.mjs',
     'pipeline/lib/update-schedule.mjs',
+    // the review-comment renderer and marker-forgery defence, and the upstream, private-tmp and auto-update libs the update path runs on
+    'pipeline/lib/render.mjs', 'pipeline/lib/upstream.mjs', 'pipeline/lib/private-tmp.mjs', 'pipeline/lib/auto-update.mjs',
   ];
   const list = raw.risk.high_risk_paths;
   const { config } = validateConfig(raw);
