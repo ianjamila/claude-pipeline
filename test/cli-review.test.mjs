@@ -4005,6 +4005,9 @@ test('resolution round end to end: publish, replay in a fresh clone, arbiter reb
   const clone = join(w.scratch, 'clone');
   const gitIn = (...args) => spawnSync('git', args, { cwd: clone, encoding: 'utf8' });
   assert.equal(spawnSync('git', ['clone', '-q', '--no-local', w.repo.dir, clone], { encoding: 'utf8' }).status, 0);
+  // The fixture's "remote" is a working repo with the PR branch checked out, so the clone's origin/HEAD names feat/x; a real remote's HEAD is its default branch
+  // (the hash is measured from the trusted default branch = origin/HEAD, #448), so point it at main as GitHub's would be.
+  assert.equal(gitIn('remote', 'set-head', 'origin', 'main').status, 0);
   const hasTree = () => gitIn('cat-file', '-e', markerTree).status === 0;
   assert.equal(hasTree(), false, 'precondition: the marker tree exists only where the round was made');
   // The clone's own git would write a different marker style: the forced config must make the rebuilt tree identical.
