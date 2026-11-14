@@ -95,7 +95,7 @@ risk:
     "pipeline/lib/run-record.mjs", "pipeline/lib/claude-code-version.mjs", "pipeline/lib/queue-route.mjs", "pipeline/lib/updatebranch.mjs",
     "pipeline/lib/live-work-scan.mjs", "pipeline/lib/stacks/paths.mjs", "pipeline/lib/stacks/uninstall.mjs", "pipeline/lib/queue-sweep-schedule.mjs",
     "pipeline/lib/summary-comment.mjs", "pipeline/lib/run-progress.mjs", "pipeline/commands/checkpoint.mjs",
-    "pipeline/lib/jobs.mjs", "pipeline/lib/job-output.mjs", "pipeline/lib/run-cost.mjs",
+    "pipeline/lib/jobs.mjs", "pipeline/lib/job-output.mjs", "pipeline/lib/job-runner.mjs", "pipeline/lib/run-cost.mjs",
     "pipeline/lib/schedule.mjs", "pipeline/lib/cmd-io.mjs", "pipeline/lib/merge-cleanup.mjs",
     "pipeline/lib/stacks/config.mjs", "pipeline/lib/stacks/result.mjs", "pipeline/lib/worktree-prune/live-sessions.mjs",
     "pipeline/commands/summary.mjs", "pipeline/commands/queue-sweep.mjs", "pipeline/commands/merge-hold.mjs", "pipeline/commands/job.mjs", "pipeline/commands/round.mjs", "pipeline/commands/update-branch.mjs", "pipeline/commands/redraft.mjs", "pipeline/commands/protect.mjs", "pipeline/commands/repo-move.mjs", "pipeline/commands/smoke.mjs", "pipeline/commands/followups.mjs", "pipeline/commands/artifacts.mjs", "pipeline/commands/vendor.mjs", "pipeline/commands/agent-log.mjs",
