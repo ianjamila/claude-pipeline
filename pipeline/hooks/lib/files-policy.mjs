@@ -23,7 +23,7 @@ import { pmCall, pmMoverName, packageScripts, defaultLexists, localBin, nameAtRu
 import os from 'node:os';
 import path from 'node:path';
 import { toPosix, expandHome, isInside, samePath, drivePosix, transcriptRes, configDirOf, HOME_CONFIG_DIR_RE } from '../../lib/paths.mjs';
-import { UNDECIDABLE_HEREDOC, simpleCommands, commandName, scriptFileOf, scriptFeedsOf, startupFilesOf, startupVarsOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, sqlShellEscapes, sourcePathSearch, splicesOptions, spliceText, implicitBindsOf, MATCH_NAMES, ZSH_NAME_BINDERS, indirectExpansionOnLine, arithAssignedNames, refusalAdvice } from './shell-parse.mjs';
+import { UNDECIDABLE_HEREDOC, plainExit, simpleCommands, commandName, scriptFileOf, scriptFeedsOf, startupFilesOf, startupVarsOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, sqlShellEscapes, sourcePathSearch, splicesOptions, spliceText, implicitBindsOf, MATCH_NAMES, ZSH_NAME_BINDERS, indirectExpansionOnLine, arithAssignedNames, refusalAdvice } from './shell-parse.mjs';
 import { flattenProgram, newWriteFrame, exportRecords, writtenTo, writtenCandidates, joinedReadings, writtenNamesIn, writeSignature, unmodelledBefore, sedArgsUnsafe, sedWriteTargets, sedInPlaceArg, awkArgsPure, sortArgsPure, flowStart, inFlow } from './line-writes.mjs';
 import { ZSH_MODIFIED, zshModifiedNames, scriptCandidates, execLineOf, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, countScript, countReading, substitute, GuardLimit, execLinesOf, paramReadings, readingsOf, UNKNOWN_WORD, assigningDefaults, spliceLines } from './script-candidates.mjs';
 import { SETS_BY_NAME } from './git-policy.mjs';
@@ -2702,7 +2702,11 @@ const PROGRAM_TOOLS = new Set(['sed', 'gsed', 'awk', 'gawk', 'mawk', 'nawk']);
 const RUNTIME_PART = /[$`]/;
 // A run-time part: a backtick, or a `$` followed by ANYTHING but the end of the word or a `/` (R3-F1 #288: `$(`, `${`, `$NAME`, `$@`, a positional parameter and zsh's `$=D`, `$~D`, `$^D`, `$+D`, and any
 // spelling a later shell adds). A lone `$` at the end (the regex `foo$`) or before a slash (`$/`) is the text itself.
-const RUN_TIME = /`|\$(?!\/|$)/;
+// #301: but not a `$` before `|`, `)`, `\`, a blank or a `"` (`rg 'foo$|bar'`, `test("^a$")`, `--grep='x$)'`): none of them starts an expansion in bash or zsh, and what they follow is a regex or text.
+// A `$"` still counts in a word that starts with `-` or `$` (`$"-delete"` is the option -delete: bash's locale string), see runTime.
+const RUN_TIME_PART = /`|\$(?![/|)\\\s"]|$)/;
+const runTime = (e) => RUN_TIME_PART.test(e) || (e.includes('$"') && /^[-$]/.test(e));
+const RUN_TIME = { test: runTime };
 // Can the shell split a value on something other than blanks? IFS written anywhere on the line (assignment, export / declare / typeset / local / read / printf -v, a name built at run time: git-policy's
 // SETS_BY_NAME), tracked as a variable, or possibly changed by a sourced file or an unreadable part of the line. (Mirrors git-policy's ifsMayBeSet.)
 // R3-F3 (#288): what the LINE says is the same for every word, so it is scanned once per (ctx, line) and cached on ctx (like envLineMemo); the answer used to be recomputed for every expanded word.
@@ -2827,7 +2831,9 @@ function globWordMeets(a, pats) {
   return GLOB_CHARS.test(a) && pats.some((p) => globMeets(a, p));
 }
 // `orig`: the words as written. R6-B1: a word that expansion changed (`D="--[d]elete"; find DIR $D`) is matched against the files after the expansion, so each blank-split piece of it is tested, whatever the raw text says.
-function globOptionRisky(name, args, raw, orig = args) {
+// #312: `lit` is the parser's own list of the words with no unquoted glob character and no expansion in them (cmd.litWords, read from the lexer's per-word quoting): `rg '^(a|b)' DIR/*.md` has an unquoted
+// glob, but the quoted program is no glob. Absent (a command the parser did not build): the line-wide reading, as before. A word that is both quoted and unquoted on the command is not listed (the text is the key).
+function globOptionRisky(name, args, raw, orig = args, lit = undefined) {
   const pats = GLOB_PATTERNS[name];
   if (!pats || !args.some((a) => GLOB_CHARS.test(a))) return false;
   const globs = unquotedGlob(raw);
@@ -2835,7 +2841,7 @@ function globOptionRisky(name, args, raw, orig = args) {
     const a = args[i];
     if (a === '--' && DASHDASH_ENDS.has(name)) break;
     if (!GLOB_CHARS.test(a)) continue;
-    if (globs && globWordMeets(a, pats)) return true;
+    if (globs && !(lit !== undefined && orig[i] === a && lit.has(a)) && globWordMeets(a, pats)) return true;
     if (orig[i] !== a && a.split(/\s+/).some((piece) => globWordMeets(piece, pats))) return true;
   }
   return false;
@@ -2846,7 +2852,10 @@ function globOptionRisky(name, args, raw, orig = args) {
 function judgedWords(name, args, ctx) {
   if (!args.some((a) => RUNTIME_PART.test(a))) return { args, unknown: false };
   const touched = (n) => Object.hasOwn(ctx.vars ?? {}, n) || ctx.unknownVars?.has(n) || ctx.pickUnknown?.has(n) || ctx.srcChanged?.has(n) || ctx.srcTouched?.has(n) || ctx.unknownAll === true;
-  const tool = OPTION_TOOLS.has(name) || PROGRAM_TOOLS.has(name);
+  // #298: `python -m json.tool IN [OUT]` writes its second operand, so how many operands the words make is what judges it: it is read like an option tool (no run-time word, the split reading of an expanded word)
+  // (R1-B1: the module word is read as expanded: `M=json.tool; python3 -m "$M" $(…)` is the same call as the literal one; #463: so is the flag: `F=-m; python3 $F json.tool $(…)`)
+  const optionLike = OPTION_TOOLS.has(name) || (/^python3?$/.test(name) && args.length > 1 && (RUNTIME_PART.test(args[0]) ? expandRefs(args[0], ctx) : args[0]) === '-m' && (RUNTIME_PART.test(args[1]) ? expandRefs(args[1], ctx) : args[1]) === 'json.tool');
+  const tool = optionLike || PROGRAM_TOOLS.has(name);
   let unknown = false;
   const words = [];
   for (const a of args) {
@@ -2855,7 +2864,7 @@ function judgedWords(name, args, ctx) {
     const e = expandRefs(a, ctx);
     if (RUNTIME_PART.test(e)) {
       if (PROGRAM_TOOLS.has(name)) { if (/`|\$[({@*]/.test(e) || [...e.matchAll(/\$(\w+)/g)].some((m) => touched(m[1]))) unknown = true; }
-      else if (OPTION_TOOLS.has(name) && RUN_TIME.test(e)) unknown = true;
+      else if (optionLike && RUN_TIME.test(e)) unknown = true;
     }
     if (e !== a && tool && !singleToken(e, ctx)) unknown = true;
     words.push(e);
@@ -3105,7 +3114,7 @@ function isReadOnly(cmd, ctx) {
 }
 function readOnlyWith(name, args, cmd, ctx, argv) {
   if (CD_CMDS.has(name)) return true; // its effect (later relative paths) is tracked through the directory list
-  if (globOptionRisky(name, args, cmd.raw, argv.slice(1))) return false; // (R4-F3 / R5-B2: a glob-spelled option)
+  if (globOptionRisky(name, args, cmd.raw, argv.slice(1), cmd.litWords)) return false; // (R4-F3 / R5-B2: a glob-spelled option; #312: a quoted word is no glob)
   if (READ_ONLY.has(name)) {
     if (name === 'rg' && args.some((a) => a === '--pre' || a.startsWith('--pre='))) return false;
     return !(['less', 'more', 'bat', 'rg'].includes(name) && toolEnvTouched(cmd, ctx, GIT_TOOL_ENV));
@@ -3158,6 +3167,64 @@ function splitOperands(argv, name) {
     if (b && b !== '.' && b !== '..' && !/[*?[]/.test(b)) written.push(`${trimSlashes(d)}/${b}`);
   }
   return { written, dests, sources };
+}
+
+// R1-B3 / R1-B2 (#300): rsync's own reading of its words (splitOperands is cp's: it takes `--exclude VALUE` / `--timeout 30` for operands and `-t` for a target directory). The options that take a
+// value, as `--opt=v`, as `--opt v`, and as a short letter (`-e ssh`, `-esh`, `-ae ssh`: the rest of a cluster after the letter is its value, a letter that ends it takes the next word); options may stand
+// among the operands or after them (rsync permutes), and `--` ends them. Same-line names are replaced by their value first. { pos: the operands as written, expanded: the same, as expanded, dry: a real
+// -n / --dry-run option word (a value is no option: `--exclude -n`, `-en`), filesFrom: a --files-from option (R6-B1) }
+const RSYNC_VALUE_LONG = new Set(['rsh', 'rsync-path', 'max-delete', 'max-size', 'min-size', 'partial-dir', 'block-size', 'compare-dest', 'copy-dest', 'link-dest', 'exclude', 'exclude-from', 'include', 'include-from',
+  'filter', 'files-from', 'out-format', 'log-file', 'log-file-format', 'bwlimit', 'timeout', 'contimeout', 'port', 'address', 'sockopts', 'password-file', 'temp-dir', 'backup-dir', 'suffix', 'chmod', 'chown',
+  'usermap', 'groupmap', 'iconv', 'skip-compress', 'compress-level', 'compress-choice', 'zc', 'zl', 'checksum-choice', 'cc', 'checksum-seed', 'modify-window', 'write-batch', 'only-write-batch', 'read-batch',
+  'protocol', 'info', 'debug', 'outbuf', 'stop-after', 'time-limit', 'stop-at', 'remote-option', 'copy-as', 'early-input', 'max-alloc']);
+const RSYNC_VALUE_SHORT = new Set(['e', 'f', 'B', 'T', 'M', '@']);
+const SUBST_TEXT = /[`]|\$\(/;
+// R2-B1 / #459: bash splits an UNQUOTED word that a same-line name changed on blanks (an empty value is no word), and each piece is an argument of its own: `FLAGS='-a --include n'; rsync $FLAGS SRC/ ~/`
+// is not a cluster with an n in it, `A='-a /tmp/x/'` holds an operand, `X=; … $X` leaves no last word. A quoted word (cmd.quotedWords) stays one.
+// R3-F1: zsh (the shell of the Bash tool here) does not split an unquoted name, so the caller reads the words BOTH ways (split = true / false) and calls the line a dry run only when both readings agree. The text of a
+// backtick or $( ) substitution is never cut up (what it prints is only known at run time: no dry run). R3-B1: the shell splits on space, tab and newline only (no \s: U+00A0 is no blank to it).
+function rsyncOperands(words, ctx, quoted, split = true) {
+  const items = []; // [as written (or the piece), as expanded]
+  for (const w of words.slice(1)) {
+    if (ctx.budget) checkDeadline(ctx.budget);
+    if (!RUNTIME_PART.test(w)) { items.push([w, w]); continue; }
+    const e = expandRefs(w, ctx);
+    if (e === w || quoted?.has(w)) items.push([w, e]);
+    else if (!split) { if (e !== '') items.push([w, e]); } // (zsh keeps the value whole, and drops an empty unquoted one)
+    else if (SUBST_TEXT.test(e)) items.push([w, e]);
+    else for (const piece of e.split(/[ \t\n]+/)) if (piece !== '') items.push([piece, piece]);
+  }
+  const pos = [];
+  const expanded = [];
+  let dry = false;
+  let filesFrom = false;
+  let rest = false;
+  for (let i = 0; i < items.length; i++) {
+    const [w, e] = items[i];
+    if (!rest && e === '--') { rest = true; continue; }
+    if (!rest && e.length > 1 && e[0] === '-') {
+      const sub = SUBST_TEXT.test(e); // (an option word that holds a substitution is only known at run time: it is no dry run)
+      if (e[1] === '-') {
+        const eq = e.indexOf('=');
+        const o = eq < 0 ? e.slice(2) : e.slice(2, eq);
+        // R6-B1: rsync takes any unambiguous abbreviation of a long option (`--file` is only files-from; `--fil` is filter too); the same prefix reading as `--del` in rsyncFlags
+        if (o.length >= 4 && 'files-from'.startsWith(o)) { filesFrom = true; if (eq < 0) i++; } // (its value is the next word)
+        else if (o === 'dry-run' && eq < 0 && !sub) dry = true;
+        else if (eq < 0 && RSYNC_VALUE_LONG.has(o)) i++; // (the next word is its value, an option-looking one included)
+      } else {
+        for (let j = 1; j < e.length; j++) { // (linear: a cluster is read once, up to its first value letter)
+          const ch = e[j];
+          if (RSYNC_VALUE_SHORT.has(ch)) { if (j === e.length - 1) i++; break; }
+          if (!/[A-Za-z0-9@ \t\n-]/.test(ch)) break; // (a word held whole by zsh may hold the shell's blanks, `-a -n`; any other character, a U+00A0 included, is no option letter: no dry run in it)
+          if (ch === 'n' && !sub) dry = true;
+        }
+      }
+      continue;
+    }
+    pos.push(w);
+    expanded.push(e);
+  }
+  return { pos, expanded, dry, filesFrom };
 }
 
 // R4-B1 / item 6 (#288): rsync's options as the shell passes them. A same-line name is replaced by its value (`D=--delete; rsync -a "$D" SRC ~/`) and a value that holds blanks is several words; a word that
@@ -5174,8 +5241,7 @@ function evaluateBashForFilesFrame(command, opts) {
       // R1-B2: a redirection on the exit, or on the group's closer (`} < f`, read as a command of no words that holds it), may fail before the exit runs, and then the shell goes on: no narrowing.
       // (a redirection on a command before the exit, `{ echo no >&2; exit 1; }`, only fails that command)
       // R1-F1: `exit` alone or with ONE literal number; `exit 1 2` is refused ("too many arguments") and the shell goes on, and a run-time word (`exit $X`) may split into two
-      if (!staticName(e) || e.argv[0] !== 'exit' || (e.redirects ?? []).length > 0) return -1;
-      if (e.argv.length > 2 || (e.argv.length === 2 && !/^\d+$/.test(e.argv[1]))) return -1;
+      if (!plainExit(e)) return -1; // (shell-parse's plainExit: the one rule, the git guard's orExits reads it too)
       if (last !== k + 1 && top[last + 1] !== undefined && top[last + 1].argv.length === 0 && (top[last + 1].redirects ?? []).length > 0) return -1;
       const y = top[last + 1];
       return y === undefined || y.sep === ';' || y.sep === '&&' ? last + 1 : -1;
@@ -5374,12 +5440,40 @@ function evaluateBashForFilesFrame(command, opts) {
   // qualifier, `out(/)`, as a command named `/`). Read-only commands on home stay allowed (`ls ~`, `du -sh ~`, `find ~ -name x`), and a file directly in home is no ancestor. cp / install into home write
   // DIR/basename(SRC), which the scan below judges; rsync --delete into home or a parent of it also removes whatever the source lacks, the protected tree included.
   if (opts._writesOnly !== true) {
+    // #300: a CONTENTS merge into home or a parent of it (`rsync -a /tmp/x/ ~/`, `cp -a /tmp/x/. ~/`, `cp /tmp/x/.* ~/`) writes what the source holds (a `.claude/settings.json` staged there included) straight into the protected tree, and
+    // destsOf cannot see it: it writes DIR/basename(SRC) and skips a basename of `.` or a glob. The sources that are a contents form: an rsync source with a trailing slash, a source whose basename is `.` or a glob that starts with a dot
+    // (`.*`: a visible-file glob never matches a dot folder), and a cp / install source with a trailing slash on macOS (BSD cp copies its contents). A dry run (rsync -n / --dry-run) writes nothing.
+    const mergesContents = (c, name, hit) => {
+      const words = wordsOf(c);
+      // R1-B3 / R1-B2: rsync reads its own options (rsyncOperands: a value is no operand and no dry-run flag, `-t` is no target directory)
+      const contents = (dests, sources) => dests.some(hit) && sources.some((src) => {
+        const s = toPosix(src);
+        if (s.endsWith('/') && (name === 'rsync' || ctx.platform === 'darwin')) return true;
+        // R1-B4: a source only known at run time may be a folder with a trailing slash (an rsync call only: `cp "$f" ~/` is an everyday copy of one file)
+        if (name === 'rsync' && RUN_TIME.test(s) && (/[`]|\$\(/.test(s) || RUN_TIME.test(s.slice(s.lastIndexOf('/') + 1)))) return true;
+        const b = posix.basename(trimSlashes(s));
+        return b === '.' || /^\.[^/]*[*?[]/.test(b);
+      });
+      if (name !== 'rsync') {
+        const r = splitOperands(words, name);
+        return contents(r.dests, r.sources.map((s) => (RUNTIME_PART.test(s) ? expandRefs(s, ctx) : s))); // (R1-B4: the source as the shell will pass it)
+      }
+      // R3-F1: bash and zsh read a changed unquoted word differently; each reading that is no dry run is judged, and either one finding a contents merge counts
+      return [true, false].some((split) => {
+        const r = rsyncOperands(words, ctx, c.quotedWords, split);
+        if (r.dry || r.pos.length < 2) return false;
+        // R6-B1: --files-from copies each listed name, relative to the source directory, directly beneath the destination (a slash on the source or not, -r or not: it implies --relative): a contents merge of the source
+        if (r.filesFrom && hit(r.pos[r.pos.length - 1])) return true;
+        return contents([r.pos[r.pos.length - 1]], r.expanded.slice(0, -1));
+      });
+    };
     const homeWriter = cmds.find((c) => {
       const name = c.argv.length ? baseOf(c.argv[0]) : '';
       if (!name || NOT_WRITERS.has(name) || isReadOnly(c, ctx)) return false;
       const wd = dirsOf(c);
       const hit = (w) => homeWord(w, wd.ds, name, wd.unknown);
       if (DEST_ONLY.has(name)) {
+        if (mergesContents(c, name, hit)) return true;
         if (name !== 'rsync') return false;
         const f = rsyncFlags(c.argv, ctx, c.raw);
         if (!f.del && !f.rm && !f.unknown) return false;
@@ -5464,6 +5558,13 @@ function evaluateBashForFilesFrame(command, opts) {
   const bad = pool.find((c) => !isReadOnly(c, ctx) && !harmless(c));
   if (bad) {
     const name = bad.argv.length ? baseOf(bad.argv[0]) : '(assignment)';
+    // #295: a command that is read-only in itself, refused only because the line's heredoc text holds an expansion that can evaluate (ctx.heredocPlants, R5-F3): say so, not "is not a read-only command"
+    if (ctx.heredocPlants === true && bad.argv.length) {
+      ctx.heredocPlants = false;
+      let alone;
+      try { alone = isReadOnly(bad, ctx); } finally { ctx.heredocPlants = true; }
+      if (alone) return deny(`${name} refers to a protected pipeline file, and the line holds a heredoc whose text contains an expansion that can evaluate text (\${name[…]}, $name[, $(( )), a \${(…)} flag group or a \${name=…} assignment), so no command on the line counts as read-only; put the heredoc on a line of its own, apart from the command that reads the protected file (${PROTECTED_MSG})`);
+    }
     const literal = bad.argv.length ? '' : '; if the variable only holds a path, pass the path literally, or use it only with cat / head / tail / wc / ls / stat / grep / cut / echo / printf / test on a line without export, eval, source or another program';
     // (#190 case 3, wording only: when the ONLY protected references are transcript paths, say how to get on: a copy is no protected file)
     const isTranscriptWord = (w) => { const v = expandRefs(String(w), ctx); return new RegExp(TRANSCRIPT_TEXT_SRC, ctx.ci ? 'i' : '').test(v) || (isAbs(v) && ctx.hitTranscriptFile(v)); };
