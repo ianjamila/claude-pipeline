@@ -154,3 +154,50 @@ describe('#460: a single-dash word that reaches a blank before a value letter is
     ['-a -n with a substitution is only known at run time', "OPTS=\"-a -n $(echo x)\"; rsync $OPTS /tmp/x/ ~/"],
   ]);
 });
+
+// ---- PR #478 round 1 ----
+// R1-B1: the commands INSIDE the failure group of `cd X || { …; exit 1; }` run only when the cd (or a `git checkout` / `switch`) FAILED, so they run in the old directory / on the old branch, not the new one.
+describe('#478 R1-B1: a command inside the failure group is not judged in the directory or on the branch the cd / checkout would have moved to', () => {
+  const DENY = (name, line) => test(`deny: ${name}`, () => {
+    const v = gitRun(line);
+    assert.equal(v.decision, 'deny', line);
+  });
+  const ALLOW = (name, line) => test(`allow: ${name}`, () => assert.equal(gitRun(line).decision, 'allow', line));
+  DENY('a push in the group after a cd whose input file is missing', 'cd /other < /missing || { git push; exit 1; }; true');
+  DENY('a push in the group after an ordinary cd', 'cd /other || { git push; exit 1; }; true');
+  DENY('a push in the group, then the push after it', 'cd /other || { git push; exit 1; }; git push');
+  DENY('a push in the group after a git checkout that may fail', 'git checkout agent/y || { git push; exit 1; }; true');
+  DENY('a git switch with a push in the group', 'git switch agent/y || { git push; exit 1; }; git status');
+  DENY('a push after echo, inside the group', 'cd /other || { echo no >&2; git push; exit 1; }; true');
+  // the state after the group is still the moved one
+  ALLOW('the push after the group is judged in /other', 'cd /other || { echo no; exit 1; }; git push');
+  ALLOW('a git checkout group, then a push on the new branch', 'git checkout agent/y || { echo no; exit 1; }; git push');
+  ALLOW('a command substitution in the group keeps the later push in /other', 'cd /other || { echo $(date); exit 1; }; git push');
+});
+
+// R1-B2 / R1-F2: no dry-run exemption for --delete when rsyncFlags cannot tell the words (a custom IFS, a run-time word in front of the -n).
+// R1-F1: nor when the dry-run flag comes from an assignment that may not run.
+describe('#478 R1-B2 / R1-F1 / R1-F2: the --delete dry-run exemption trusts only a dry-run flag that is surely there', () => {
+  decide('deny', [
+    ['a custom IFS makes $OPTS split on the n (R1-B2)', "bash -c 'IFS=n; OPTS=-an; rsync --delete $OPTS /tmp/x/ ~/'"],
+    ['a run-time word before the -n (R1-F2)', 'rsync $X -n --delete /tmp/x/ ~/'],
+    ['a run-time word before --dry-run (R1-F2)', 'rsync $X --dry-run --delete /tmp/x/ ~/'],
+    ['the flag is set in an if (R1-F1)', 'if [ "$DRY" = 1 ]; then N=-n; fi; rsync -a --delete $N /tmp/x/ ~/'],
+    ['the flag is set after a && (R1-F1)', '[ -n "$DRY" ] && N=-n; rsync -a --delete $N /tmp/x/ ~/'],
+    ['the flag is set after a || (R1-F1)', 'true || N=-n; rsync -a --delete $N /tmp/x/ ~/'],
+    ['the flag is set in a && group (R1-F1)', '[ -n "$DRY" ] && { A=1; N=-n; }; rsync -a --delete $N /tmp/x/ ~/'],
+    ['the flag is set in a subshell (R1-F1)', '(N=-n); rsync -a --delete $N /tmp/x/ ~/'],
+    ['the flag is set in a pipe stage (R1-F1)', 'N=-n | cat; rsync -a --delete $N /tmp/x/ ~/'],
+    ['the flag is set in a background job (R1-F1)', 'N=-n &\nrsync -a --delete $N /tmp/x/ ~/'],
+    ['the flag is set in a loop (R1-F1)', 'for i in 1 2; do N=-n; done; rsync -a --delete $N /tmp/x/ ~/'],
+    ['the flag is assigned twice (R1-F1)', 'N=-n; N=; rsync -a --delete $N /tmp/x/ ~/'],
+    ['the flag is given only as the rsync command\'s own prefix (the shell expands $N before the prefix applies)', 'N=-n rsync -a --delete $N /tmp/x/ ~/'],
+  ]);
+  decide('allow', [
+    ['a literal -n', 'rsync -a --delete -n /tmp/x/ ~/'],
+    ['a plain assignment, once, before the line', "OPTS='-a --delete -n'; rsync $OPTS /tmp/x/ ~/"],
+    ['a plain assignment on its own line', "N=-n\nrsync -a --delete $N /tmp/x/ ~/"],
+    ['an exported assignment', 'export N=-n; rsync -a --delete $N /tmp/x/ ~/'],
+    ['a plain assignment after a && chain that ended', 'true && true; N=-n; rsync -a --delete $N /tmp/x/ ~/'],
+  ]);
+});
