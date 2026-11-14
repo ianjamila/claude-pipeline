@@ -194,7 +194,7 @@ export function buildReviewPrompt({ pr, title, body, base, head, risk, round, li
     lines.push(
       '',
       '## Threat model',
-      "The repository owner's threat model for the paths below. For a file matching a model's paths, attack only within that model: a construction outside it is at most a SUGGESTION, never BLOCKING. Every other file is reviewed as above (bugs and broken behaviour stay BLOCKING). A file matching several models: judge it against the union.",
+      "The repository owner's threat model for the paths below. For a file matching a model's paths, attack only within that model: a security construction outside it is at most a SUGGESTION, never BLOCKING. Bugs, data loss, auth and permissions stay BLOCKING whatever the model says, and every other file is reviewed as above. A file matching several models: judge it against the union.",
     );
     for (const m of models) lines.push('', `Model ${oneLine(m.name)} (paths: ${m.paths.map(oneLine).join(', ')}):`, String(m.text).trim());
   }

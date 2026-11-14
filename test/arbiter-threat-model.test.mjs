@@ -177,7 +177,7 @@ test('Codex prompt: the Threat model block is present only when models are given
   assert.doesNotMatch(buildReviewPrompt(args), /## Threat model/);
   assert.doesNotMatch(buildReviewPrompt({ ...args, threatModels: [] }), /## Threat model/);
   const p = buildReviewPrompt({ ...args, sensitivePaths: ['src/a.js'], threatModels: [{ name: 'guards', paths: ['src/a.js'], text: MODEL_TEXT }] });
-  assert.match(p, /## Threat model\n.*attack only within that model.*never BLOCKING/s);
+  assert.match(p, /## Threat model\n.*attack only within that model.*a security construction outside it is at most a SUGGESTION, never BLOCKING.*Bugs, data loss, auth and permissions stay BLOCKING/s);
   assert.match(p, /Model guards \(paths: src\/a\.js\):\nAttackers are other repo users/);
   assert.ok(p.indexOf("## Attacker's brief") < p.indexOf('## Threat model'));
 });
