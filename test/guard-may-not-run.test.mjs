@@ -1,40 +1,3 @@
-// (#352 R17: the R16 rule was keyed on the segment, but `[[ a && b ]]` is split by the && into two; a `{ }` group closed in argument position (zsh) ends a condition too; a word after `]]` / `repeat N` hides
-// the body in the argv of `[[` / `repeat`; `case W { pat) cmd }` ends the case at the `{`. None of these is followed: the line is refused)
-test('#352 R17-F1: a && inside [[ ]] does not hide the ]] that ends the condition of a zsh condition-then-body form', () => {
-  denies('R17-F1: until C && [[ a && b ]] { push; break }', `until cd /work/other2 && [[ -n a && -n b ]] { ${SHIP}; break }`);
-  denies('R17-F1: if C && [[ a && b ]] { : } else { push }', `if false && cd /work/other2 && [[ -n a && -n b ]] { : } else { ${SHIP} }`);
-  denies('R17-F1: while C && [[ a || b ]] { push; break }', `while cd /work/other2 && [[ -n a || -n b ]] { ${SHIP}; break }`);
-  denies('R17-F1: until C && [[ a && b && c ]] { push; break }', `until cd /work/other2 && [[ -n a && -n b && -n c ]] { ${SHIP}; break }`);
-  allows('twin: cd d && if [[ a && b ]]; then :; fi && push', `cd /work/other2 && if [[ -n a && -n b ]]; then :; fi && ${SHIP}`);
-  allows('twin: cd d && [[ a && b ]] && push', `cd /work/other2 && [[ -n a && -n b ]] && ${SHIP}`);
-});
-
-test('#352 R17-F2/F4: an unquoted { or } word in argument position (a zsh group ending a condition, a case body) is not followed', () => {
-  denies('R17-F2: until C && { true } { push; break }', `until cd /work/other2 && { true } { ${SHIP}; break }`);
-  denies('R17-F2: until { false && cd } { push; break }', `until { false && cd /work/other2 } { ${SHIP}; break }`);
-  denies('R17-F2: if { false && cd } { : } else { push }', `if { false && cd /work/other2 } { : } else { ${SHIP} }`);
-  denies('R17-F2: while C && { true } short body', `while cd /work/other2 && { true } ${SHIP}`);
-  denies('R17-F4: case x { y) switch }; push', `case x { y) ${RESET} }; ${SHIP}`);
-  denies('R17-F4: case x { y) cd d }; push (from the other worktree)', `case x { y) cd /work/main }; ${SHIP}`, {}, '/work/other2');
-  denies('R17-F4: case x { y) : ;; } ; push after a switch', `${RESET}; case x { y) : }; ${SHIP}`, {}, MAIN_DIR);
-  // everyday lines that carry a { or } as an argument keep their verdict
-  allows('twin: find . -exec rm {} + ; push', `find . -exec rm {} + && ${SHIP}`, {}, '/work/other2');
-  allows('twin: find . -exec echo {} \; push', `find . -exec echo {} \; && ${SHIP}`, {}, '/work/other2');
-  allows('twin: git log --format={} ; push', `git log --format={} && ${SHIP}`, {}, '/work/other2');
-  allows('twin: echo ${HOME} {a,b} x{1..3} ; push', `echo ${HOME} {a,b} x{1..3} && ${SHIP}`, {}, '/work/other2');
-  allows('twin: echo "{" "}" ; push', `echo "{" "}" && ${SHIP}`, {}, '/work/other2');
-});
-
-test('#352 R17-F3: a word after the ]] that ends a condition, or after repeat N, hides the body in an argv: the line is refused', () => {
-  denies('R17-F3: if [[ ]] push (main)', `if [[ -n x ]] ${SHIP}`);
-  denies('R17-F3: until C && [[ ]] push', `until cd /work/other2 && [[ -n x ]] ${SHIP}`);
-  denies('R17-F3: if [[ ]] cd main; push (from the other worktree)', `if [[ -n x ]] cd /work/main; ${SHIP}`, {}, '/work/other2');
-  denies('R17-F3: repeat 1 push', `repeat 1 ${SHIP}`);
-  denies('R17-F3: repeat 1 cd main; push (from the other worktree)', `repeat 1 cd /work/main; ${SHIP}`, {}, '/work/other2');
-  denies('R17-F3: cd d && repeat 1 push', `cd /work/other2 && repeat 1 ${SHIP}`);
-  allows('twin: if [[ ]]; then :; fi; push', `if [[ -n x ]]; then :; fi; ${SHIP}`, {}, '/work/other2');
-});
-
 // Why (#352 R8): "may this command not run, and did it change state?" is ONE rule. A command that may not run (in an if / loop body, after && or ||, after the closer of a construct that may have skipped
 // its body, in a subshell, behind ||) and that changed git state (a branch, an alias, config, a directory: judged by comparing the state before and after, so a package script or a script file that switches
 // the branch counts as well as `git switch`) leaves that state UNKNOWN for every later command, whatever the separator, except for the trusted chain `cd d && x`. The flags of that rule (uncertain, orChanged)
@@ -73,6 +36,8 @@ const run = (cmd, files = {}, cwd = MAIN_DIR) => evaluateGitCommand(cmd, {
   cwd, home: '/home/u', currentBranch: (d) => (String(d).startsWith(GIT_ROOT) || String(d).startsWith('/work/other2') ? 'agent/x' : MAIN), pushDestination: () => null, issueLabels: () => [], realpath: (p) => p, ...fakeFs(files),
 });
 const denies = (what, cmd, files = {}, cwd = MAIN_DIR) => { const r = run(cmd, files, cwd); assert.equal(r.decision, 'deny', `${what}: allowed`); assert.match(r.reason, BAD, `${what}: ${r.reason}`); };
+// (a line the parser gives up on, truncated: denied whatever the reason)
+const refuses = (what, cmd, files = {}, cwd = MAIN_DIR) => { const r = run(cmd, files, cwd); assert.equal(r.decision, 'deny', `${what}: allowed`); };
 const allows = (what, cmd, files = {}, cwd = MAIN_DIR) => { const r = run(cmd, files, cwd); assert.equal(r.decision, 'allow', `${what}: ${r.reason}`); };
 
 // (the repository the line runs in is on main; its package script `reset` and its file reset.sh switch it to agent/x)
@@ -507,4 +472,68 @@ test('#352 R16-#432: a [[ ]] ending a zsh condition followed by a brace body is 
   allows('twin: cd d && if [[ -n x ]]; then echo hi; fi && push', `cd /work/other2 && if [[ -n x ]]; then echo hi; fi && ${SHIP}`);
   allows('twin: cd d && () { push; } (anonymous function)', `cd /work/other2 && () { ${SHIP}; }`);
   allows('twin: cd d && if ((1)); then :; fi && push', `cd /work/other2 && if ((1)); then :; fi && ${SHIP}`);
+});
+
+// (#352 R17: the R16 rule was keyed on the segment, but `[[ a && b ]]` is split by the && into two; a `{ }` group closed in argument position (zsh) ends a condition too; a word after `]]` / `repeat N` hides
+// the body in the argv of `[[` / `repeat`; `case W { pat) cmd }` ends the case at the `{`. None of these is followed: the line is refused)
+test('#352 R17-F1: a && inside [[ ]] does not hide the ]] that ends the condition of a zsh condition-then-body form', () => {
+  denies('R17-F1: until C && [[ a && b ]] { push; break }', `until cd /work/other2 && [[ -n a && -n b ]] { ${SHIP}; break }`);
+  denies('R17-F1: if C && [[ a && b ]] { : } else { push }', `if false && cd /work/other2 && [[ -n a && -n b ]] { : } else { ${SHIP} }`);
+  denies('R17-F1: while C && [[ a || b ]] { push; break }', `while cd /work/other2 && [[ -n a || -n b ]] { ${SHIP}; break }`);
+  denies('R17-F1: until C && [[ a && b && c ]] { push; break }', `until cd /work/other2 && [[ -n a && -n b && -n c ]] { ${SHIP}; break }`);
+  allows('twin: cd d && if [[ a && b ]]; then :; fi && push', `cd /work/other2 && if [[ -n a && -n b ]]; then :; fi && ${SHIP}`);
+  allows('twin: cd d && [[ a && b ]] && push', `cd /work/other2 && [[ -n a && -n b ]] && ${SHIP}`);
+});
+
+test('#352 R17-F2/F4: an unquoted { or } word in argument position (a zsh group ending a condition, a case body) is not followed', () => {
+  denies('R17-F2: until C && { true } { push; break }', `until cd /work/other2 && { true } { ${SHIP}; break }`);
+  denies('R17-F2: until { false && cd } { push; break }', `until { false && cd /work/other2 } { ${SHIP}; break }`);
+  denies('R17-F2: if { false && cd } { : } else { push }', `if { false && cd /work/other2 } { : } else { ${SHIP} }`);
+  denies('R17-F2: while C && { true } short body', `while cd /work/other2 && { true } ${SHIP}`);
+  denies('R17-F4: case x { y) switch }; push', `case x { y) ${RESET} }; ${SHIP}`);
+  denies('R17-F4: case x { y) cd d }; push (from the other worktree)', `case x { y) cd /work/main }; ${SHIP}`, {}, '/work/other2');
+  denies('R17-F4: case x { y) : ;; } ; push after a switch', `${RESET}; case x { y) : }; ${SHIP}`, {}, MAIN_DIR);
+  // everyday lines that carry a { or } as an argument keep their verdict
+  allows('twin: find . -exec rm {} + ; push', `find . -exec rm {} + && ${SHIP}`, {}, '/work/other2');
+  allows('twin: find . -exec echo {} \; ; push', `find . -exec echo {} \\; && ${SHIP}`, {}, '/work/other2');
+  allows('twin: git log --format={} ; push', `git log --format={} && ${SHIP}`, {}, '/work/other2');
+  allows('twin: echo $\{HOME} {a,b} x{1..3} ; push', `echo \${HOME} {a,b} x{1..3} && ${SHIP}`, {}, '/work/other2');
+  allows('twin: echo "{" "}" ; push', `echo "{" "}" && ${SHIP}`, {}, '/work/other2');
+});
+
+test('#352 R17-F3: a word after the ]] that ends a condition, or after repeat N, hides the body in an argv: the line is refused', () => {
+  refuses('R17-F3: if [[ ]] push (main)', `if [[ -n x ]] ${SHIP}`);
+  refuses('R17-F3: until C && [[ ]] push', `until cd /work/other2 && [[ -n x ]] ${SHIP}`);
+  refuses('R17-F3: if [[ ]] cd main; push (from the other worktree)', `if [[ -n x ]] cd /work/main; ${SHIP}`, {}, '/work/other2');
+  refuses('R17-F3: repeat 1 push', `repeat 1 ${SHIP}`);
+  refuses('R17-F3: repeat 1 cd main; push (from the other worktree)', `repeat 1 cd /work/main; ${SHIP}`, {}, '/work/other2');
+  refuses('R17-F3: cd d && repeat 1 push', `cd /work/other2 && repeat 1 ${SHIP}`);
+  allows('twin: if [[ ]]; then :; fi; push', `if [[ -n x ]]; then :; fi; ${SHIP}`, {}, '/work/other2');
+});
+
+// (#352 R17-F5: the zsh condition-then-body forms are not followed, so EVERY line of this cross product that holds a push is refused. No shell model is needed: the generator of the differential test has no
+// "unknown" verdict to compare with, so the forms are enumerated here instead. The condition enders and the bodies are those the rounds 15..17 found by hand, one spelling at a time)
+test('#352 R17-F5: every zsh condition-then-body line (if / until / while + condition ender + redirect + body, case W { }, repeat N) that holds a push is refused', () => {
+  const ENDERS = ['(true)', '((1))', '[[ -n x ]]', '[[ -n a && -n b ]]', '{ true }'];
+  const REDIRS = ['', ' >/dev/null', ' 2>&1'];
+  const BODIES = [`{ ${SHIP}; break }`, `{ ${SHIP} }`, `{ ${SHIP}; }`, SHIP, `{ : } else { ${SHIP} }`, `{ : } else { ${SHIP}; }`, `{ : }; ${SHIP}`];
+  const PREFIXES = ['cd /work/other2 && ', 'cd /work/other2; ', 'false && cd /work/other2 && '];
+  const seen = { enders: new Set(), bodies: new Set(), kinds: new Set(), n: 0 };
+  const check = (kind, ender, body, line) => { refuses(`${kind} ${ender} / ${body}: ${line}`, line); seen.n++; seen.kinds.add(kind); if (ender) seen.enders.add(ender); seen.bodies.add(body); };
+  for (const pre of PREFIXES) {
+    for (const head of ['if', 'until', 'while']) {
+      for (const ender of ENDERS) for (const redir of REDIRS) for (const body of BODIES) {
+        // (an if / elif keeps its else only for the if: the loops take the other bodies)
+        if (head !== 'if' && body.includes('else')) continue;
+        check(head, ender + redir, body, `${pre}${head} ${pre.startsWith('false') ? 'true && ' : ''}${ender}${redir} ${body}`);
+      }
+    }
+    for (const arm of [`y) ${SHIP} }`, `y) ${SHIP}; }`, `y) ${SHIP} ;; }`, `y) ${RESET} }; ${SHIP}`]) check('case', '', arm, `${pre}case x { ${arm}`);
+    for (const body of [SHIP, `{ ${SHIP} }`, `{ ${SHIP}; }`, `${RESET}; ${SHIP}`]) check('repeat', '', body, `${pre}repeat 1 ${body}`);
+  }
+  // (coverage: the node was drawn: every kind, every ender and every body of the table appears in at least one checked line)
+  assert.deepEqual([...seen.kinds].sort(), ['case', 'if', 'repeat', 'until', 'while']);
+  assert.equal(seen.enders.size, ENDERS.length * REDIRS.length, 'every ender x redirect was drawn');
+  assert.ok(BODIES.every((b) => seen.bodies.has(b)), 'every body was drawn');
+  assert.ok(seen.n >= 600, `only ${seen.n} lines were checked`);
 });

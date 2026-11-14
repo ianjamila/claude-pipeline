@@ -2118,6 +2118,7 @@ class Parser {
     this.ctlUp = []; // the levels (ctx.up) before each construct opened
     this.ctlStack = []; // loops / function bodies / { groups open (see ctlOpen), for every nesting level of this text
     this.ctlBase = 0; // where the current level's entries start
+    this.dblOpen = false; // a `[[` was read as a command and its `]]` has not come yet: a && / || inside it splits the segment, so the `]]` is read in a later one (#352 R17-F1)
     this.ctlCond = []; // for each open construct: an if / loop whose condition is still open (no `then` / `do` yet), see the R16 rule in flushWord
     this.ctlNeg = []; // for each open construct: it was opened under a `!` (its commands are negated, see ctx.neg)
     this.ctlPS = []; // and the start of the pipeline it was opened in (an index of ctx.out), for a `&` after its closer
@@ -2497,10 +2498,11 @@ class Parser {
         if (q < 0 && (text === 'then' || text === 'do' || text === ']]' || AFTER_PAREN_RESERVED.has(text))) { if (text !== ']]') seg.condWatch = false; }
         else if (q < 0 && /^\{[A-Za-z_]\w*\}$/.test(text) && /[<>]/.test(s[this.i] ?? '')) seg.condAnon = false;
         else if (q < 0 && text === '{' && seg.condAnon) seg.condWatch = false;
-        else { ctx.ctlBroken = true; seg.condWatch = false; }
+        else { ctx.ctlBroken = true; if (seg.condDbl === true && text !== '{') ctx.truncated = true; seg.condWatch = false; } // (truncated: the body is in the argv of `[[` here, no command of its own that ctlBroken could refuse: R17-F3)
         seg.condAnon = false;
-      } else if (q < 0 && text === ']]' && seg.dblBracket === true && this.condOpenTop()) { seg.condWatch = true; seg.condAnon = false; }
-      if (q < 0 && text === '[[' && seg.kwOnly !== false) seg.dblBracket = true;
+      } else if (q < 0 && text === ']]' && this.dblOpen && this.condOpenTop()) { seg.condWatch = true; seg.condDbl = true; seg.condAnon = false; }
+      if (q < 0 && text === ']]') this.dblOpen = false;
+      if (q < 0 && text === '[[' && seg.kwOnly !== false) this.dblOpen = true;
       // (the zsh brace bodies of `repeat N { }` and `for x in a b { }`: the `{` is no command here, so it is never opened)
       if (q < 0 && text === '{' && seg.words.length > 0 && seg.words[0].qa < 0 && ['for', 'select', 'repeat', 'foreach'].includes(seg.words[0].text) && this.condOpenTop()) ctx.ctlBroken = true;
       // (#352 R13-F1: a reserved word that closes or continues a construct after `)` (`else`, `then`, `fi`, ...) is no redirect of the subshell: the segment is an ordinary one that follows a `;`.
@@ -2525,11 +2527,16 @@ class Parser {
       const cmdPos = seg.kwOnly !== false; // every word before this one is an unquoted keyword or `{` (kept as it goes: a rescan per word is quadratic)
       if (cmdPos && q < 0 && text === '!') seg.negLead = true; // (R9-F3: a `!` in front: the command, group, pipeline or construct that follows is negated)
       // (`time` and its options before a compound command: `time if ...; fi` -- review of #50)
+      // (#352 R17-F3: `repeat N BODY`: the body is in the argv of `repeat`, no command of its own; the line is refused (truncated). R17-F2: a bare { or } word that is no command is the brace group or body of a zsh
+      // form (`if C { true } { B }`, `case W { p) c }`) that the parser does not follow: the marks are not to be trusted. Not words here: `{}`, `{a,b}`, `${x}`, `{fd}>`, the { of `function f {`)
+      if (q < 0 && !(seg.fnActive === true && seg.fnHasName === true) && !cmdPos && (text === '{' || text === '}')) ctx.ctlBroken = true;
+      if (seg.repeatAt !== undefined && seg.words.length === seg.repeatAt + 2) { if (q < 0 && text === '{') { /* (a brace body: the { splits the segment, see above) */ } else ctx.truncated = true; }
+      if (q < 0 && cmdPos && text === 'repeat') seg.repeatAt = seg.words.length;
       const timeOpt = seg.timePrefix === true && /^(?:-[A-Za-z]+|--)$/.test(text);
       seg.kwOnly = cmdPos && q < 0 && (KEYWORDS.has(text) || text === '{' || text === 'time' || timeOpt);
       seg.timePrefix = cmdPos && q < 0 && (text === 'time' || timeOpt);
       if (top?.st === 'subj') top.st = 'in';
-      else if (top?.st === 'in') { if (q < 0 && text === 'in') top.st = 'pat'; else { cs.pop(); this.ctlClose(['case']); } } // `case x {` (zsh) and the like: patterns read as commands (strict)
+      else if (top?.st === 'in') { if (q < 0 && text === 'in') top.st = 'pat'; else { cs.pop(); this.ctlClose(['case']); ctx.ctlBroken = true; } } // `case x {` (zsh) and the like: patterns read as commands (strict), and its arms are no commands we can place: R17-F4
       else if (q < 0 && cmdPos && text === 'esac' && (top?.st === 'body' || top?.st === 'end')) { cs.pop(); seg.closesFrom = this.ctlClose(['case']); }
       else if (q < 0 && cmdPos && text === 'esac') ctx.ctlBroken = true; // (an esac with no case we opened: a prefix we do not model hid it)
       else if (q < 0 && cmdPos && text === 'case') { cs.push({ st: 'subj' }); this.ctlOpen('case', segNeg(seg), seg); seg.ctl = { ...seg.ctl, cond: true }; }
