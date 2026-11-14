@@ -277,8 +277,10 @@ function makeCtx(opts) {
   const cfgDir = configDirOf(opts.env ?? process.env, homePosix);
   const transcriptRoots = unique([cfgDir, cfgDir && realResolve(cfgDir, api)].filter(Boolean));
   const transcripts = transcriptRes(transcriptRoots, ci, unique([homePosix, realResolve(homePosix, api)]));
-  const pipelineHit = (p) => { const q = unFirm(p); return roots.some((r) => isInside(q, r, platform)); };
-  const pipelineAncestor = (p) => { const q = unFirm(p); return ancestors.some((a) => samePath(q, a, platform)); };
+  // (one evaluation asks about the same words again and again: the answers are kept, bounded)
+  const memo = (fn) => { const seen = new Map(); return (p) => { const k = String(p); let v = seen.get(k); if (v === undefined) { v = fn(k); if (seen.size < 4096) seen.set(k, v); } return v; }; };
+  const pipelineHit = memo((p) => { const q = unFirm(p); return roots.some((r) => isInside(q, r, platform)); });
+  const pipelineAncestor = memo((p) => { const q = unFirm(p); return ancestors.some((a) => samePath(q, a, platform)); });
   let rootIds = null;
   // #111: a symlink (or any other spelling) of the cwd's review folder. dev:ino of <cwd>/.review and of each existing
   // <cwd>/.review/round-*; none when the folder is missing (no error). NOT added to rootIds: hitInode walks the ancestors of a
@@ -699,7 +701,21 @@ const HOME_RE = new RegExp(
 const TILDE_RE = /(^|[\s'"`=:(,[{;|&<>+])~(?=\/|$|[\s'"`)\]};|&<>,+])/g;
 const USER_RE = /\$(?:USER|LOGNAME|USERNAME)(?![A-Za-z0-9_])|\$\{(?:USER|LOGNAME|USERNAME)\}|\$\(\s*(?:whoami|logname|id\s+-un)\s*\)|`\s*(?:whoami|logname|id\s+-un)\s*`|%USERNAME%|\$env:USERNAME\b/gi;
 
+const HOME_HINT = /[~$%`]|home|userprofile/i; // (every alternative of HOME_RE and TILDE_RE holds one of these: a text without any is returned as it is)
+const homeRefsSeen = new Map();
 function expandHomeRefs(text, home) {
+  if (!HOME_HINT.test(text)) return text;
+  if (text.length > 256) return expandHomeRefsUncached(text, home);
+  const key = `${home}\0${text}`;
+  let out = homeRefsSeen.get(key);
+  if (out === undefined) {
+    out = expandHomeRefsUncached(text, home);
+    if (homeRefsSeen.size >= 4096) homeRefsSeen.clear();
+    homeRefsSeen.set(key, out);
+  }
+  return out;
+}
+function expandHomeRefsUncached(text, home) {
   const mark = freeMark(text + home);
   return text
     .replace(HOME_RE, (_m, glue) => home + mark + (glue ? (glue.includes('+') ? '' : '/') : ''))
@@ -773,7 +789,11 @@ function braceRange(body) {
 // #111 (final round): ranges expand too; an expansion cut by a cap sets ctx.braceOver (rawHitOne fails closed on it while a review folder exists).
 function braceExpand(s, ctx) {
   if (!s.includes('{') || !(s.includes(',') || s.includes('..'))) return s;
-  if (s.length > 5000) { ctx.dynamic = true; return s; }
+  if (s.length > 5000) {
+    if (ctx.braceChunks === true) return braceExpandChunks(s, ctx);
+    ctx.dynamic = true;
+    return s;
+  }
   let cur = s.replace(/(?<!\$)\{([^{}\s,]+)\}/g, (m, body) => {
     const r = braceRange(body);
     if (!r) return m;
@@ -790,6 +810,36 @@ function braceExpand(s, ctx) {
     if (!changed || cur.length > 50_000) break;
   }
   return cur;
+}
+
+// #265 (g): a program's text past 5,000 characters is expanded piece by piece. A brace group holds no whitespace (the expansion above reads only `\S` runs), so the text is cut at whitespace into
+// pieces of at most 4,000 characters (a single longer run is cut where it stands: no one word of a program is that long), and each piece costs what a short text costs.
+const BRACE_CHUNK = 4000;
+const BRACE_GROWTH_CAP = 50_000; // (the cap of one text, braceExpand's, on how much all the pieces together may grow)
+function braceExpandChunks(s, ctx) {
+  const parts = [];
+  let grown = 0;
+  for (let from = 0; from < s.length;) {
+    let to = Math.min(s.length, from + BRACE_CHUNK);
+    if (to < s.length) {
+      let k = to;
+      while (k > from && !/\s/.test(s[k - 1])) k--;
+      if (k > from) to = k;
+    }
+    const piece = s.slice(from, to);
+    // #425 R1-F4: a piece costs up to a quadratic scan (a minified run of lone `{`), so the evaluation deadline is checked per piece (a GuardLimit denies); once the pieces have grown by more than the per-text cap
+    // the rest stays as it is and the cut is flagged like a cap hit inside one text (braceOver)
+    if (ctx.budget) checkDeadline(ctx.budget);
+    if (grown > BRACE_GROWTH_CAP || !piece.includes('{')) parts.push(piece);
+    else {
+      const out = braceExpand(piece, ctx);
+      grown += out.length - piece.length;
+      parts.push(out);
+    }
+    if (grown > BRACE_GROWTH_CAP) ctx.braceOver = true;
+    from = to;
+  }
+  return parts.join('');
 }
 
 // One word with unquoted braces -> { list, over }: every expansion (nested, ranges), at most BRACE_MAX of them; over: the cap cut the list.
@@ -1234,10 +1284,11 @@ function makeMatchers(ctx) {
   const ALIAS_WORD = /[^\s'"`;|&<>(){}[\],=*?$]+/g;
   const ALIAS_WORD_WIDE = /[^\s'"`;|&<>(){}[\]*?$]+/g;
   const aliasInText = (v, dirs) => {
-    if (v.length > MAX_ALIAS_TEXT) return ctx.hasReviewDir();
+    if (!ctx.hasReviewDir()) return false; // (no review folder: nothing below can match, see hitReviewInode)
+    if (v.length > MAX_ALIAS_TEXT) return true;
     const where = dirs?.length ? dirs : [ctx.cwd];
     const words = new Set([...(v.match(ALIAS_WORD) ?? []), ...(v.match(ALIAS_WORD_WIDE) ?? [])]);
-    if (words.size * where.length > MAX_ALIAS_LOOKUPS) return ctx.hasReviewDir();
+    if (words.size * where.length > MAX_ALIAS_LOOKUPS) return true;
     for (const word of words) {
       if (!/[A-Za-z0-9]/.test(word)) continue;
       const e = word === '~' || word.startsWith('~/') ? pathsFor().join(ctx.homePosix, word.slice(1)) : word;
@@ -1552,6 +1603,8 @@ const literalCommand = (w) => w === '[' || literalWord(w) || spacedPath(w) || (w
 // A cd / pushd target is a known literal folder when, after the line's known variable expansion, it is `.` / `..`, starts with `/`, `./` or `../`, or is a plain name (letters, digits and `_ . , : @ % = / + -` or a space,
 // not starting with `-` `+` `=` `~`) and CDPATH is not in play (the home forms `cd`, `cd ~`, `cd ~/x` keep their own handling). Every other target (`~user`, `-`, `+N`, a run-time value) leaves the directory unknown.
 const cdPlainName = (e) => /^[A-Za-z0-9_.,@%:][A-Za-z0-9_.,:@%=\/+ -]*$/.test(e);
+// #379: the text names CDPATH (any case: zsh's cdpath array is CDPATH), except an EMPTY assignment (`CDPATH= cd -- dir`: no search list) and `unset CDPATH`; every other mention (a value, an export, a comment) counts
+const mentionsCdpath = (text) => /CDPATH/i.test(String(text).replace(/\bCDPATH=(?:""|'')?(?=[\s;&|)]|$)/g, ' ').replace(/\bunset\s+(?:-v\s+)?CDPATH(?![\w=[])/g, ' '));
 const cdTargetLiteral = (e, cdpath) => isAbs(e) || /^\.\.?(?:[\\/]|$)/.test(e) || (cdpath !== true && cdPlainName(e));
 // R18 (B1 / F1 / F7, one class): a command that can run more than once (in a loop, a function body or a trap action; a file sourced from one runs there too) moves the shell again each time. A RELATIVE cd target
 // (`..`, `../x`, `./x`; only `.` stays put) climbs or descends once per run, so how far the shell gets is not a number the guard can count: in such a place the directory is unknown (an absolute target may still join the set).
@@ -1560,10 +1613,25 @@ const cdRelative = (e) => typeof e === 'string' && !isAbs(e) && !cdStaysPut(e);
 // R19-F1: only a target with a `..` segment climbs once per run (`./x`, `x`, `web/app` only descend: the directories the line already lists cover them), and a cd inside a `( … )` subshell the command is in ends with it
 // every time (the parser's c.grp lists the subshells the command is in; a loop that is itself inside the subshell is not told apart: that is a constructed climb, issue #373)
 const cdClimbs = (e) => cdRelative(e) && /(?:^|[\\/])\.\.(?:[\\/]|$)/.test(e);
-const cdInSubshell = (c) => (c?.grp?.length ?? 0) > 0;
 const repeats = (cmds, i) => {
   const c = cmds[i];
   return cmds.ctlBroken === true || (c?.ctl ? Boolean(c.ctl.loop || c.ctl.fn || c.ctl.trap) : inFlow(flowStart(cmds), i));
+};
+// #384: ...but a subshell that surrounds the loop survives every iteration (`(for ...; do cd ..; done; find . -delete)`), so the climbs add up. The cd is lost each run only in a subshell opened INSIDE the repeating
+// body, which the parser does not say; it is read from the commands the subshell holds: one of them that does not repeat (the `find` above, or a call of a function defined in it) was written outside the loop,
+// so the subshell started before it. A subshell that holds only repeating commands (`for ...; do (cd ..); done`) is taken as inside the body (a loop nested inside a subshell inside another loop is not told apart, #373).
+// `whole`: the text itself runs again (a file sourced from a loop), every subshell in it is inside the repetition.
+const outerSubshells = new WeakMap();
+const cdInSubshell = (c, cmds, whole = false) => {
+  const ids = c?.grp ?? [];
+  if (whole || ids.length === 0 || !cmds) return ids.length > 0;
+  let outer = outerSubshells.get(cmds);
+  if (!outer) {
+    outer = new Set();
+    for (let i = 0; i < cmds.length; i++) for (const id of cmds[i].grp ?? []) if (!outer.has(id) && !repeats(cmds, i)) outer.add(id);
+    outerSubshells.set(cmds, outer);
+  }
+  return ids.some((id) => !outer.has(id)); // (every caller asks only for a command that repeats)
 };
 // Option names are compared without case, `_` or `-` (`AUTO_CD`, `auto-cd`, `noautocd`)
 const optionWord = (w) => w.toLowerCase().replace(/[_-]/g, '');
@@ -1592,9 +1660,16 @@ function makerOps(cmds) {
 // (R18-F6/F8: an argument surely survives expansion when nothing in it is settled at run time. argv holds the dequoted words, so a quoted `"$X"` cannot be told from an unquoted one: any `$`, backtick or glob character,
 // or an expansion that comes out empty, may vanish (an empty `$X`, `$@`, a glob without a match), and the command may then be lone. A file's own text is not expanded with the line's variables.)
 // R19-F2: ...but only when the RAW text shows the word unquoted: a double-quoted word (`"$f"`, `"$@"`) or a single-quoted one never disappears, so `"$PYTHON" "$SCRIPT"` is no lone word. `unq` is the command's raw text with its quoted spans cut out.
-const mayVanish = (a, ctx, fromFile, unq) => {
+// #380: the parser says which words are quoted in every occurrence (cmd.quotedWords); the raw-text search (`unq.includes`) matched the wrong token (`$P` inside the unquoted `$PYTHON`) and is kept only for a command the parser did
+// not list. #383: a word with any quoting is kept by the shell even when it expands to nothing, except a quoted "$@" / "${@}" / "${a[@]}", which expands to no word at all.
+const POSITIONALS = /\$\{?@|\[@\]/;
+const mayVanish = (a, ctx, fromFile, unq, quoted, quotedPat) => {
   const e = fromFile ? a : expandRefs(a, ctx);
-  return (e === '' || /[$`*?[(^<]/.test(e)) && (unq === null || unq.includes(a));
+  if (!(e === '' || /[$`*?[(^<]/.test(e))) return false;
+  // (#425 R1-F3 / R2-B1: a quoted word with an unquoted glob in it (`"$dir"/*.sh`, `""*`) may still expand to nothing under nullglob, whatever its quoted part says: the parser's mark settles it)
+  if (quoted && quotedPat?.has(a)) return true;
+  if (quoted) return !quoted.has(a) || POSITIONALS.test(a);
+  return unq === null || unq.includes(a);
 };
 const unquotedText = (raw) => (typeof raw === 'string' ? raw.replace(/"(?:[^"\\]|\\[\s\S])*"|'[^']*'/g, ' ') : null);
 function dirLikeWord(cmds, ci, ctx, bases, fromFile = false) {
@@ -1605,7 +1680,7 @@ function dirLikeWord(cmds, ci, ctx, bases, fromFile = false) {
   if (w === '[' || w === '[[' || (w === '.' && u.argv.length > 1)) return false; // (the test builtin, and `. FILE`, which is source)
   // R18-F8: AUTO_CD runs a command of ONE word (zsh; bash: no other words after the name): `test -f x`, `supabase db reset`, `docs build` are programs, whatever folders exist. An argument that may vanish at run time does not count
   const unq = unquotedText(c.raw);
-  const lone = u.argv.slice(1).every((a) => mayVanish(a, ctx, fromFile, unq));
+  const lone = u.argv.slice(1).every((a) => mayVanish(a, ctx, fromFile, unq, c.quotedWords, c.quotedPatternWords));
   if (!lone) return false;
   if (u.blind) return true; // (a wrapper whose next word is only known at run time)
   // (#288 CI H2: no directory name is longer than PATH_MAX (4 kB); a longer command word is not read as one. Reading it as one made the whole line be judged again in every assumed
@@ -1689,17 +1764,17 @@ function gitRootFrom(start, ctx) {
       const common = typeof text === 'string' ? ctx.readText(pathsFor().join(gitdir, 'commondir')) : null;
       const linked = typeof common === 'string' && common.trim() !== '';
       const configs = linked ? [pathsFor().join(posix.resolve(gitdir, toPosix(common.trim())), 'config'), ...(ctx.api.existsSync(own) ? [own] : [])] : [own];
-      // (a worktree key anywhere, or an include of another file, anywhere in the repo's, the user's or the XDG config: the root may be elsewhere)
+      // (a worktree key anywhere, with or without a value and past any whitespace git skips (isspace: also \f \v \r), or an include of another file, anywhere in the repo's, the user's or the XDG config: the root may be elsewhere)
       const xdg = ctx.env.XDG_CONFIG_HOME && isAbs(toPosix(ctx.env.XDG_CONFIG_HOME)) ? toPosix(ctx.env.XDG_CONFIG_HOME) : pathsFor().join(ctx.homePosix, '.config');
       const users = [pathsFor().join(ctx.homePosix, '.gitconfig'), pathsFor().join(xdg, 'git/config')];
       // (the per-worktree file `config.worktree` is read when extensions.worktreeConfig is on: its core.worktree moves the root too)
       const texts = [...configs, pathsFor().join(gitdir, 'config.worktree')].filter((q, qi) => qi < configs.length || ctx.api.existsSync(q)).map((q) => ctx.readText(q));
       for (const q of users) if (ctx.api.existsSync(q)) texts.push(ctx.readText(q));
-      if (texts.some((x) => typeof x !== 'string') || texts.some((x) => /(?:^|\])[ \t]*worktree(?:config)?[ \t]*=/mi.test(x) || /^\s*\[\s*include/mi.test(x))) return null;
+      if (texts.some((x) => typeof x !== 'string') || texts.some((x) => /(?:^|\])\s*worktree(?:config)?\s*(?:=|$)/mi.test(x) || /^\s*\[\s*include/mi.test(x))) return null;
       return d;
     }
     // (R1-F3: git also finds a repository when the directory is itself a git directory, and honours its core.worktree: a walk that meets one reads the root as unknown)
-    if (ctx.api.existsSync(pathsFor().join(d, 'HEAD')) && ctx.api.existsSync(pathsFor().join(d, 'objects'))) return null;
+    if (['HEAD', 'objects', 'refs'].every((n) => ctx.api.existsSync(pathsFor().join(d, n)))) return null; // (#373: all three, as git's own check: a case-insensitive disk finds `head` for HEAD, which alone would make an ordinary folder read as a git directory)
     const up = pathsFor().dirname(d);
     if (up === d) break;
     d = up;
@@ -2021,7 +2096,31 @@ function toolEnvTouched(cmd, ctx, src) {
   }
   const names = [...Object.keys(cmd.env ?? {}), ...Object.keys(ctx.vars ?? {}), ...(ctx.unknownVars ?? []), ...(ctx.pickUnknown ?? []), ...(ctx.srcChanged ?? []), ...(ctx.srcTouched ?? [])];
   if (names.some((n) => p.name.test(n))) return true;
+  if (src === GIT_TOOL_ENV && inheritedToolEnvRisky(ctx.env)) return true;
   return lineTouchesToolEnv(ctx, src, p);
+}
+// #265 (d): the same variables in the HOOK's own environment (what the session was started with) reach the tool just as one on the line does. Not every inherited value is a risk: a terminal has LESS=-R,
+// PAGER=less, GIT_EDITOR=true. A name is a risk by itself when it names a program or a file (LESSOPEN, GIT_EXTERNAL_DIFF, RIPGREP_*, any GIT_ name not on the short list of
+// harmless ones), and a pager or an options variable (PAGER, GIT_PAGER, LESS, MORE ...) only when its VALUE is no plain pager name / no plain short options.
+const PLAIN_PAGER = /^\s*(?:(?:\/opt\/homebrew|\/usr\/local|\/usr)?\/s?bin\/)?(?:less|more|cat|most|bat|head|tail)(?:\s+-{1,2}[A-Za-z][A-Za-z-]*)*\s*$/;
+// (short option clusters, a few long ones; no option that names a file: -k lesskey, -o / -O log file, -t / -T tag file)
+const LESS_FLAG = '(?:-(?![A-Za-z]*[kKoOtT])[A-Za-z]{1,12}|-[jxzhb]\\d{1,3}|--(?:quit-if-one-screen|RAW-CONTROL-CHARS|raw-control-chars|no-init|ignore-case|IGNORE-CASE|chop-long-lines|LONG-PROMPT|line-numbers|squeeze-blank-lines|no-keypad|clear-screen|tabs=\\d{1,2}))';
+const PLAIN_OPTIONS = new RegExp(`^\\s*(?:${LESS_FLAG}(?:\\s+|$))*$`);
+const HARMLESS_INHERITED = /^(?:GIT_(?:EDITOR|SEQUENCE_EDITOR|AUTHOR_\w+|COMMITTER_\w+|TERMINAL_PROMPT|ASKPASS|SSH|SSH_COMMAND|SSH_VARIANT|OPTIONAL_LOCKS|MERGE_AUTOEDIT|CEILING_DIRECTORIES|DISCOVERY_ACROSS_FILESYSTEM)|LESS(?:CHARSET|CHARDEF|BINFMT|UTFBINFMT|UTFCHARDEF|ANSIENDCHARS|ANSIMIDCHARS|SECURE)|BAT_(?:THEME|STYLE|TABS))$/;
+const inheritedMemo = new WeakMap();
+function inheritedToolEnvRisky(env) {
+  if (!env || typeof env !== 'object') return false;
+  const hit = inheritedMemo.get(env);
+  if (hit !== undefined) return hit;
+  const toolName = new RegExp(`^(?:${GIT_TOOL_ENV})`);
+  let risky = false;
+  for (const [n, v] of Object.entries(env)) {
+    if (!toolName.test(n) || HARMLESS_INHERITED.test(n)) continue;
+    const value = typeof v === 'string' ? v : '';
+    if (/^(?:PAGER|MANPAGER|GIT_PAGER|BAT_PAGER)$/.test(n)) { if (!PLAIN_PAGER.test(value)) { risky = true; break; } } else if (/^(?:LESS|MORE)$/.test(n)) { if (!PLAIN_OPTIONS.test(value)) { risky = true; break; } } else { risky = true; break; }
+  }
+  inheritedMemo.set(env, risky);
+  return risky;
 }
 // R1-F2 (#288): what the LINE says is the same for every command, so it is computed once per (line, pattern) and cached on ctx; it is linear too: the line is cut at `;`, `&`, `|` and a newline, and a
 // segment is touched when its first declaring keyword is followed by a name of the family (the old single pattern backtracked from every keyword, and ran again for every isReadOnly call).
@@ -2039,6 +2138,37 @@ function lineTouchesToolEnv(ctx, src, p) {
   }
   memo.set(src, { line, touched });
   return touched;
+}
+
+// #265 (e): a line that defines a function or an alias, or changes where the shell looks for programs (PATH), can make a read-only name run something else (`function cat { tee "$@"; }; cat FILE`,
+// `PATH=/tmp/evil:$PATH; cat FILE`). So every command AFTER the first such definition on the line is no read-only call ('all': a function or alias can shadow any name, a builtin too; 'path': a builtin
+// (echo, printf, test, [, cd) still runs as itself). A command before the definition ran before it. A PATH that only adds the usual system and tool folders is no change worth refusing
+// (`export PATH=/opt/homebrew/bin:$PATH; cat FILE` is an everyday line); a prefix `PATH=… cmd` is judged for that one command.
+const SAFE_PATH_ENTRY = /^(?:\$\{?PATH\}?|\/(?:opt\/homebrew\/|usr\/local\/|usr\/)?s?bin|(?:\$HOME|\$\{HOME\}|~)\/(?:\.local\/)?bin)$/;
+const PATH_BUILTINS = new Set(['echo', 'printf', 'test', '[', ...CD_CMDS]);
+const pathValueMoves = (v) => typeof v !== 'string' || !v.split(':').every((e) => SAFE_PATH_ENTRY.test(e));
+const PATH_NAMES = ['PATH', 'path'];
+const envMovesPath = (env) => env != null && PATH_NAMES.some((k) => Object.hasOwn(env, k) && pathValueMoves(env[k]));
+const PATH_SETTERS = ['export', 'declare', 'typeset', 'readonly', 'local', 'setenv', 'env'];
+// (a cheap necessary test, run on every command of every program text before the exact one: the first word ends in one of these names, any case, with or without .exe and the like; baseOf says the rest)
+const SHADOW_WORD = /(?:alias|export|declare|typeset|readonly|local|setenv|env)(?:\.(?:exe|cmd|bat|com))?$/i;
+const setsPath = (c, name) => {
+  if (envMovesPath(c.env)) return true;
+  if (!PATH_SETTERS.includes(name)) return false;
+  return c.argv.slice(1).some((a) => { const m = /^(?:PATH|path)\+?=(.*)$/s.exec(a); return m !== null && pathValueMoves(m[1]); });
+};
+function shadowedCommands(cmds, ctx) {
+  const out = new Map();
+  let kind = null;
+  for (const c of cmds) {
+    if (kind !== null) { if (!out.has(c)) out.set(c, kind); continue; }
+    if (c.argv.length > 0 && envMovesPath(c.env)) out.set(c, 'path'); // (PATH=… cmd: for that command only)
+    const first = c.argv[0] ?? '';
+    const name = SHADOW_WORD.test(first) ? baseOf(first) : '';
+    if (c.ctl?.fn === true || name === 'alias' || (typeof c.raw === 'string' && c.raw.includes('function') && /^\s*function\b/.test(c.raw)) || (c.argv.length === 1 && ctx.lineDefs?.has(first))) kind = 'all';
+    else if (setsPath(c, name)) kind = 'path';
+  }
+  return out;
 }
 
 // T1.7 (a): isReadOnly judges the words the shell will pass. A same-line name is replaced by its value first (`D=-delete; find S $D`); a word whose value is still only known at run time
@@ -2440,6 +2570,8 @@ function isReadOnly(cmd, ctx) {
   const argv = cmd.argv;
   if (!argv.length) return false;
   const name = baseOf(argv[0]);
+  const shadow = ctx.shadowed?.get(cmd);
+  if (shadow !== undefined && (shadow === 'all' ? !CD_CMDS.has(name) : !PATH_BUILTINS.has(name))) return false; // (#265 e)
   const judged = judgedWords(name, argv.slice(1), ctx);
   if (judged.unknown) return false;
   if (evaluatesSubscript(name, argv.slice(1), ctx, cmd.raw)) return false;
@@ -3201,7 +3333,9 @@ function judgeScriptText(text, sf, abs, dir, ctx, opts) {
   // to the rule at the end of the evaluation. A script's size is no fact about the line: the flag is kept as it was, so a trusted CLI call next to a long
   // script no longer fails closed. The script's own verdict is unchanged: it never denied on that flag.)
   const dynamicBefore = ctx.dynamic;
-  const hitsProtected = text.length <= MAX_SCRIPT_BYTES && m.rawHit(text, [dir], true);
+  ctx.braceChunks = true; // (#265 g: the text is brace-expanded in pieces, so a brace-split protected path in a long program is seen)
+  let hitsProtected;
+  try { hitsProtected = text.length <= MAX_SCRIPT_BYTES && m.rawHit(text, [dir], true); } finally { ctx.braceChunks = false; }
   ctx.dynamic = dynamicBefore;
   if (hitsProtected && WRITE_HINT.test(text)) return deny(`the program ${sf.file} refers to a protected pipeline file and writes (${PROTECTED_MSG})${programHitWhere(text, m, dir, ctx, sf.file)}`);
   return null;
@@ -3263,7 +3397,7 @@ function judgeWrittenScript(w, sf, abs, dir, ctx, opts, scanRaw) {
   // script on the line, and the scripts it was copied from are the same files each time)
   const done = (ctx.budget.writtenOk ??= new Set());
   const once = (key, judge) => {
-    const k = `${sf.kind}\u0000${dir}\u0000${opts._depth ?? 0}\u0000${key}`;
+    const k = `${sf.kind}\u0000${dir}\u0000${opts._depth ?? 0}\u0000${opts._cdpath === true || ctx.cdpath === true}\u0000${key}`; // (#386: a verdict is for one CDPATH state, like the startup keys)
     if (done.has(k)) return null;
     const r = judge();
     if (!r) done.add(k);
@@ -3545,8 +3679,8 @@ function setPositionals(argv) {
   }
   return null;
 }
-function sourcedEffects(text, ctx, depth = 0, seenFiles = new Set(), rep = false) { // (rep: the file is sourced from a frame that can run it again, R18)
-  const out = { vars: new Map(), cds: [], all: false, unknownCd: false, bareCd: false, cdpath: /CDPATH/i.test(text) }; // (any case: zsh's cdpath array is CDPATH)
+function sourcedEffects(text, ctx, depth = 0, seenFiles = new Set(), rep = false, cdpSeed = false) { // (rep: the file is sourced from a frame that can run it again, R18)
+  const out = { vars: new Map(), cds: [], all: false, unknownCd: false, bareCd: false, cdpath: cdpSeed || mentionsCdpath(text) }; // (#385: cdpSeed: the file that sources this one already had CDPATH in play)
   const cdpNow = () => ctx.cdpath === true || out.cdpath; // (R20-F1: read at each cd, a nested file may set it after this point; R19: a file that mentions CDPATH may set it: its plain cd names are not followed)
   const cmds = simpleCommands(text, { bashState: ctx.bashState, expired: () => ctx.budget.now() > ctx.budget.deadline });
   if (cmds.truncated || cmds.dynamic) out.all = true;
@@ -3587,7 +3721,7 @@ function sourcedEffects(text, ctx, depth = 0, seenFiles = new Set(), rep = false
       if (cdUnknownShape(c.argv) || (v !== undefined && /[`$*?[{]/.test(v)) || bare) { out.unknownCd = true; if (bare) out.bareCd = true; }
       else {
         out.cds.push(t ?? '~');
-        if (again && !homeForm && cdClimbs(toPosix(v)) && !cdInSubshell(c)) out.unknownCd = true; // (R18: a relative cd that repeats climbs one level per run; R19-F1: only a `..` target outside a subshell)
+        if (again && !homeForm && cdClimbs(toPosix(v)) && !cdInSubshell(c, cmds, rep)) out.unknownCd = true; // (R18: a relative cd that repeats climbs one level per run; R19-F1: only a `..` target outside a subshell)
       }
       set('PWD', null, false); set('OLDPWD', null, false); // (cd rebinds both)
     }
@@ -3612,7 +3746,7 @@ function sourcedEffects(text, ctx, depth = 0, seenFiles = new Set(), rep = false
       const t = abs && !seenFiles.has(abs) && !writtenTo(ctx.frames, abs, { exists: (x) => ctx.api.existsSync(x), readText: ctx.readText, ignoreUnmodelled: false }) ? ctx.readText(abs) : null;
       if (typeof t !== 'string') out.all = true;
       else {
-        const sub = sourcedEffects(t, ctx, depth + 1, new Set([...seenFiles, abs]), again);
+        const sub = sourcedEffects(t, ctx, depth + 1, new Set([...seenFiles, abs]), again, cdpNow());
         for (const [k, val] of sub.vars) set(k, val, sure && val !== null);
         out.cds.push(...sub.cds);
         if (sub.all) out.all = true;
@@ -3832,7 +3966,7 @@ function evaluateBashForFilesFrame(command, opts) {
   const raw = typeof command === 'string' ? command : '';
   if (!raw.trim()) return allow();
   ctx.dotGlob = DOT_GLOB.test(raw) || DOT_GLOB.test(String(ctx.env.BASHOPTS ?? '')); // (makeMatchers: may a wildcard match the .review folder)
-  ctx.cdpath = opts._cdpath === true || Boolean(ctx.env.CDPATH) || /CDPATH/i.test(raw); // (R19: CDPATH in the hook's environment, in a parent's text, or on this line: a plain `cd NAME` may lead anywhere)
+  ctx.cdpath = opts._cdpath === true || Boolean(ctx.env.CDPATH) || mentionsCdpath(raw); // (R19: CDPATH in the hook's environment, in a parent's text, or on this line: a plain `cd NAME` may lead anywhere)
   opts = { ...opts, _cdpath: ctx.cdpath }; // (a script, a -c text or a file this frame runs inherits it)
   // the words a `${X:=w}` on the line (or the line this text came from) may have assigned: a later $X may be any of them
   ctx.assigned = new Map([...(opts._assigned ?? [])].map(([n, ws]) => [n, [...ws]]));
@@ -3852,6 +3986,7 @@ function evaluateBashForFilesFrame(command, opts) {
   // `e''cho x > ~/.cl""aude/settings.json` must not slip through on a text match).
   if (cmds.undecidable) return deny(UNDECIDABLE_HEREDOC);
   if (cmds.truncated) return deny('the command line is too complex to check (the parser gave up); split it into simpler commands');
+  ctx.shadowed = shadowedCommands(cmds, ctx);
   ctx.heredocPlants = /<</.test(raw) && plantsInText(raw); // (R5-F3: a heredoc body is on no command; the line's text is judged for an assigning expansion, a quoted body included)
   // prose flags: what a commit message, PR body or test name says is not a reference (the values come out of every scan)
   const prose = new Map(cmds.map((c) => [c, proseWords(c.argv)]));
@@ -3964,14 +4099,14 @@ function evaluateBashForFilesFrame(command, opts) {
       const { unknownName } = stateAt(ci);
       if (cdUnknownShape(c.argv)) return true;
       const t = c.argv.slice(1).find((a) => !a.startsWith('-') && a !== '/d');
-      if (t !== undefined) { const mc = modelledCd(t, cmds, ci, ctx); if (mc !== null) return repeats(cmds, ci) && cdClimbs(mc) && !cdInSubshell(c); } // (R18: a modelled target that climbs moves again on each run; R19-F1)
+      if (t !== undefined) { const mc = modelledCd(t, cmds, ci, ctx); if (mc !== null) return repeats(cmds, ci) && cdClimbs(mc) && !cdInSubshell(c, cmds); } // (R18: a modelled target that climbs moves again on each run; R19-F1)
       if (t === undefined || /^~(?:\/|$)|^\$\{?HOME\b/.test(t)) { if (homeMoved) return true; if (t === undefined) return false; } // (a bare cd goes home)
       const e = expandRefs(t, ctx);
       if (/[*?[{(]/.test(e) && resolveGlobCd(e, dirs, ctx, cmds, ci) === null) return true; // (a glob or a brace list can spell ~/.claude: `cd ~/.cl*`)
       if (/[`$]/.test(e) || /\$\{!/.test(t) || /[`]|\$\(/.test(t)) return true;
       // (R17: the one whitelist: a target that is not `.` / `..` or `/` `./` `../` prefixed may be read through CDPATH or cdable_vars. The deny reason then names the fix)
       if (!cdTargetLiteral(e, ctx.cdpath)) { ctx.bareCd = true; return true; }
-      if (repeats(cmds, ci) && cdClimbs(e) && !cdInSubshell(c)) return true; // (R18-B1 / F7: `cd ..` / `../x` in a loop, a function or a trap climbs once per run; R19-F1: not `./x`, `x`, and not inside a subshell)
+      if (repeats(cmds, ci) && cdClimbs(e) && !cdInSubshell(c, cmds)) return true; // (R18-B1 / F7: `cd ..` / `../x` in a loop, a function or a trap climbs once per run; R19-F1: not `./x`, `x`, and not inside a subshell)
       return [...t.matchAll(/\$\{?(\w+)/g)].some((x) => unknownName(x[1]));
     });
   };
@@ -4439,6 +4574,35 @@ function evaluateBashForFilesFrame(command, opts) {
       if (e.kind === 'else') return ';';
       return top[k].sep;
     };
+    // #410: `cd DIR || exit 1` (also `|| exit`; not `|| return`, see below): when the cd fails the shell leaves, so whatever runs after the exit command surely follows a cd that succeeded. The exit must be a plain command of its own
+    // (not a pipeline stage or a background job: those leave only a subshell), in the same construct as the cd.
+    // (the same for a brace group, `cd DIR || { echo "no dir"; exit 1; }`: its last command is the exit and every command before it is joined by ; or a newline, so the exit surely runs when the group does)
+    const leavesAfter = (k) => { // the index of the command that surely follows a cd that succeeded, or -1
+      const x = top[k + 1];
+      if (x === undefined) return -1;
+      const opens = evAt.get(k + 1);
+      let last = k + 1; // (the command that must be the exit, and the index of the command after the construct)
+      if (opens !== undefined) {
+        if (opens.length !== 1 || opens[0].kind !== '{' || opens[0].sep !== '||') return -1;
+        let j = k + 2;
+        while (j < top.length && !evAt.has(j)) j++;
+        const closes = evAt.get(j);
+        if (closes === undefined || closes.length !== 1 || closes[0].kind !== '}') return -1;
+        for (let m = k + 2; m < j; m++) if (top[m].sep !== ';') return -1;
+        last = j - 1;
+      } else if (x.sep !== '||' || evAt.has(k + 2)) return -1;
+      const e = top[last];
+      // R1-B1 (Codex round 1): only `exit` counts. A top-level `return` is an error and the shell goes on (it leaves only inside a function or a sourced file, and a function is no shape that is narrowed at all).
+      // R1-B2: a redirection on the exit, or on the group's closer (`} < f`, read as a command of no words that holds it), may fail before the exit runs, and then the shell goes on: no narrowing.
+      // (a redirection on a command before the exit, `{ echo no >&2; exit 1; }`, only fails that command)
+      // R1-F1: `exit` alone or with ONE literal number; `exit 1 2` is refused ("too many arguments") and the shell goes on, and a run-time word (`exit $X`) may split into two
+      if (!staticName(e) || e.argv[0] !== 'exit' || (e.redirects ?? []).length > 0) return -1;
+      if (e.argv.length > 2 || (e.argv.length === 2 && !/^\d+$/.test(e.argv[1]))) return -1;
+      if (last !== k + 1 && top[last + 1] !== undefined && top[last + 1].argv.length === 0 && (top[last + 1].redirects ?? []).length > 0) return -1;
+      const y = top[last + 1];
+      return y === undefined || y.sep === ';' || y.sep === '&&' ? last + 1 : -1;
+    };
+    let resume; // (the chain a cd leaves for the command after its `|| exit`, { at, chain })
     let known = unique([ctx.cwd, ...seedDirs]); // where the shell can be so far
     let chain = null; // the directories after an &&-joined run of sure cd's
     let lost = false; // a cd whose destination is not known, or a command that may change the directory: nothing after it is narrowed
@@ -4449,11 +4613,11 @@ function evaluateBashForFilesFrame(command, opts) {
         const fr = stack[stack.length - 1];
         if (e.kind === '(' || e.kind === '{') {
           if (e.sep !== '&&') chain = null;
-          stack.push({ kind: e.kind, chain0: chain, lost0: lost, live: chain !== null, touched: false, skip: e.kind === '{' && (e.sep === '||' || e.sep === '|' || e.sep === '&') });
+          stack.push({ kind: e.kind, chain0: chain, lost0: lost, live: chain !== null, touched: false, skip: e.kind === '{' && (e.sep === '||' || e.sep === '|') });
         } else if (e.kind === 'if') stack.push({ kind: 'if', from: k, live: false, touched: false });
         else if (!fr) return false;
         else if (e.kind === ')') { stack.pop(); chain = fr.chain0; lost = fr.lost0; }
-        else if (e.kind === '}') { stack.pop(); if (fr.skip) chain = null; } // (R1-B1: a group entered by || | & may not run at all, or runs in a subshell: no cd inside it leaves a chain behind)
+        else if (e.kind === '}') { stack.pop(); if (fr.skip) chain = null; } // (R1-B1: a group entered by || | may not run at all, or runs in a subshell: no cd inside it leaves a chain behind; #411: one entered by & runs in this shell, only the command before the & is the job)
         else if (e.kind === 'then') {
           if (k - fr.from !== 1 || !cdOf(top[k - 1]) || cdTarget(top[k - 1]) === null) return false; // (the condition: exactly one cd to a literal target)
           fr.live = chain !== null;
@@ -4464,7 +4628,9 @@ function evaluateBashForFilesFrame(command, opts) {
       const c = top[k];
       const sep = joinOf(k);
       const fr = stack[stack.length - 1];
-      if (sep !== '&&') chain = sep === ';' && fr !== undefined && fr.live && !fr.touched ? chain : null;
+      const entered = (evAt.get(k) ?? []).some((e) => e.kind === '(' || e.kind === '{'); // (the first command of a subshell or group: it runs whenever the construct does, whatever joined the construct to what is before it)
+      if (resume !== undefined && resume.at === k && (sep === ';' || sep === '&&')) chain = resume.chain;
+      else if (sep !== '&&') chain = sep === ';' && fr !== undefined && fr.live && !fr.touched ? chain : null;
       if (chain) narrowDirs.set(c, chain);
       if (fr && (cdOf(c) || changesDir(c))) fr.touched = true;
       if (!cdOf(c)) {
@@ -4477,7 +4643,9 @@ function evaluateBashForFilesFrame(command, opts) {
       const here = withReal(reach);
       known = unique([...known, ...here]);
       if (known.length > 32 || here.length > 32) { lost = true; chain = null; continue; }
-      chain = sep !== '||' && sep !== '|' && joinAfter(k) === '&&' ? here : null;
+      const ran = (sep !== '||' && sep !== '|') || entered; // (a cd after || or | may not have run, unless it opens the subshell or group that was entered that way)
+      chain = ran && joinAfter(k) === '&&' ? here : null;
+      if (ran && joinAfter(k) === '||') { const at = leavesAfter(k); if (at >= 0) resume = { at, chain: here }; }
     }
     return stack.length === 0;
   };
