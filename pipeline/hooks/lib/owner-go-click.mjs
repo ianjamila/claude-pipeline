@@ -6,9 +6,11 @@
 // The trust argument, in one paragraph. A human click leaves a user entry in the session transcript whose permissionDecision is EXACTLY HUMAN_DECISION (decision accept, source user_temporary,
 // grantScope once, reasonCode unknown: the whole object, no other key) and whose toolUseResult carries `annotations: {}`; an answer given by a hook (updatedInput / PermissionRequest), by the
 // model's own `answers` input, or by a non-interactive run lacks that stamp (spikes s07, s08, s10 of 2026-11-11, test/fixtures/click). The stamp is the whole object, not decision + source,
-// because on 2.1.323 a PreToolUse hook answering "ask" with a prefilled `answers` makes Claude Code show the dialog and submit that answer ITSELF after ~1.5-2 s, stamped source user_temporary
-// and annotations {} like a click; only its reasonCode (hook:PreToolUse, a person's is unknown) tells them apart. (The model's own prefilled `answers` is auto-submitted with the exact human
-// stamp: only the tool-use shape check below refuses it, and the 2 s floor is no defence against either: both were answered in about 2 s.) The transcript is the evidence, never the PostToolUse hook input (which the recorder only polls the transcript for: the entry lands 100-200 ms after the
+// because the 2.1.323 recording of a PreToolUse hook answering "ask" with a prefilled `answers` shows a result stamped source user_temporary and annotations {} like a click, about 1.5 s after
+// the tool_use; only its reasonCode (hook:PreToolUse, a person's is unknown) tells them apart. The 2.1.323 recordings were made by a script that could also press keys into the dialog, so
+// they cannot tell Claude Code submitting a prefilled answer by itself from a stray key press of that script; the owner's re-record from their own terminal decides it, and the whole-object
+// check is the stricter rule either way. (The 2.1.323 recording of the model's own prefilled `answers` carries the exact human stamp: only the tool-use shape check below refuses it, and
+// the 2 s floor is no defence: both recordings were answered in about 2 s.) The transcript is the evidence, never the PostToolUse hook input (which the recorder only polls the transcript for: the entry lands 100-200 ms after the
 // hook starts). Hooks that could still answer the dialog are the dialog-hook check's business (B5, hookCheck below, T2): this file takes it as an injected function.
 // What binds is the question TEXT: it is the typed path's closing block, so the answer goes through the SAME parsers the typed prompt does (approvalBinding, roundBinding, rulingBinding in
 // owner-go.mjs), and the ask file supplies only what a typed prompt cannot: one-time use, supersession, expiry, the dialog hash and the issue-time hook fingerprint.

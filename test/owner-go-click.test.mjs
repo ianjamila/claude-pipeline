@@ -1,8 +1,8 @@
 // #261 (click-to-approve, PR A, T1): the owner's click on a choice dialog as a recorded "merge" / "extra round" / ruling. The transcripts under test/fixtures/click/<build>/ are trimmed copies
 // (prompt, AskUserQuestion tool_use, its tool_result; cwd and repo names neutral, every metadata field as that Claude Code build wrote it), one folder per build in CLICK_BUILDS, recorded by
 // scripts/click-spike.mjs (2.1.322: the 2026-11-11 spikes by hand): genuine-click (a keystroke click), pretooluse-hook-answer, permissionrequest-hook-answer, model-prefilled-answers,
-// preview-annotations, multiselect-click, and from 2.1.323 on pretooluse-ask-prefill (a hook that answers "ask" with prefilled answers: Claude Code submits them itself, stamped user_temporary
-// but with reasonCode hook:PreToolUse). The fixture-driven cases run for EVERY build in CLICK_BUILDS, so a new build gets the whole matrix by adding its folder. A test rewrites the dialog text
+// preview-annotations, multiselect-click, and from 2.1.323 on pretooluse-ask-prefill (a hook that answers "ask" with prefilled answers: the recording shows a result stamped user_temporary
+// but with reasonCode hook:PreToolUse; whether Claude Code submitted it itself or the recording script pressed a key is not settled by that recording). The fixture-driven cases run for EVERY build in CLICK_BUILDS, so a new build gets the whole matrix by adding its folder. A test rewrites the dialog text
 // and answer inside a copy to bind a real closing block (and moves the result's time 30 s after the tool_use when the recording was answered sooner than MIN_ANSWER_MS, so the 2 s floor is
 // never what a case proves); it never touches a metadata field unless the case IS that field.
 import { test } from 'node:test';
@@ -261,13 +261,14 @@ test('an answer a hook gave (PreToolUse updatedInput, PermissionRequest) is refu
   }
 });
 
-// 2.1.323: a PreToolUse hook that answers "ask" with `updatedInput.answers` makes Claude Code show the dialog and then SUBMIT the prefilled answer itself after ~1.5-2 s, stamped
-// decision accept / source user_temporary / grantScope once, but reasonCode "hook:PreToolUse" (a person's click: "unknown"), annotations {} and no `answers` in the tool_use input.
-test('a hook-prefilled "ask" answer that Claude Code submitted itself is refused not-a-human-answer, whatever the answer time (every build that has the case)', async (t) => {
+// 2.1.323: the recording of a PreToolUse hook that answers "ask" with `updatedInput.answers` has a result about 1.5 s after the tool_use, stamped decision accept / source user_temporary /
+// grantScope once, but reasonCode "hook:PreToolUse" (a person's click: "unknown"), annotations {} and no `answers` in the tool_use input. (An auto-submit by Claude Code or a stray key
+// press of the old recording script: the recording cannot tell; the whole-permissionDecision check refuses it either way.)
+test('a hook-prefilled "ask" answer recorded with reasonCode hook:PreToolUse is refused not-a-human-answer, whatever the answer time (every build that has the case)', async (t) => {
   const builds = [...new Set(['2.1.323', ...CLICK_BUILDS.filter((b) => buildAtLeast(b, '2.1.323'))])]; // 2.1.323 always: it is the build that recorded the case
   for (const build of builds) {
     const w = world(t, { fixture: 'pretooluse-ask-prefill', build, mutate: ({ use, result }) => { result.timestamp = new Date(Date.parse(use.timestamp) + 40000).toISOString(); } });
-    assert.equal(w.result.permissionDecision.reasonCode, 'hook:PreToolUse', 'the fixture is the recorded hook auto-submit');
+    assert.equal(w.result.permissionDecision.reasonCode, 'hook:PreToolUse', 'the fixture is the recorded hook-prefilled answer (hook:PreToolUse stamp)');
     assert.deepEqual(Object.keys(w.use.message.content[0].input), ['questions']);
     const ev = clickEvidence(w.file, w.toolUseId, { home: w.home });
     assert.deepEqual([ev.ok, ev.reason], [false, 'not-a-human-answer'], `${build} clickEvidence`);
@@ -307,7 +308,7 @@ test('the human stamp is the WHOLE permissionDecision: an extra key, a missing g
   }
 });
 
-test('the model pre-filling `answers` in the tool input is refused (an input key, and the dialog was rejected on 2.1.322; auto-submitted with the human stamp on 2.1.323) (every build)', async (t) => {
+test('the model pre-filling `answers` in the tool input is refused (an input key; the 2.1.322 dialog was rejected, the 2.1.323 recording carries the human stamp) (every build)', async (t) => {
   for (const build of CLICK_BUILDS) {
     const w = world(t, { fixture: 'model-prefilled-answers', build, mutate: ({ use, result }) => { use.message.content[0].input.answers = { x: 'Merge' }; result.message.content[0].is_error = undefined; result.timestamp = new Date(Date.parse(use.timestamp) + 2500).toISOString(); } });
     assert.deepEqual(await w.click(), { refused: 'tool-use-shape' }, build);
