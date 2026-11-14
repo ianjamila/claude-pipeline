@@ -141,6 +141,8 @@ test('a running job with ANOTHER tag is a job-conflict and nothing is started', 
   assert.equal(r.json.error, 'job-conflict');
   assert.equal(r.json.tag, 'something-else');
   assert.equal(existsSync(join(w.repo.dir, '.review', 'state.json')), false);
+  // let the other job finish: on Windows a running job holds the temp repo open and its removal fails (EPERM)
+  assert.equal(w.cli(['job', 'wait', 'codex-r1', '--timeout', '60']).json.state, 'done');
 });
 
 test('still running at the limit: exit 0 state running, next rerun round codex; the rerun adopts the same job', (t) => {
