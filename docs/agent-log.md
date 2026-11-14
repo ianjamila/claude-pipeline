@@ -182,3 +182,4 @@ full record.
 - 2026-11-14 · #420 · fix(review): one default-branch anchor, resolved fully qualified; follow-ups #367 #368 #387 #388 #392 #396 #407 · risk high · rounds 5 · arbiter 5 · awaiting-owner-merge · Codex 7d: 6327 runs (6168 high)
 - 2026-11-14 · #362 · guard: a Next.js start script is no longer refused; a cd to the script's own folder no longer hides npm/npx bins (#352) · risk high · rounds 26 · arbiter 26 · needs-human · Codex 7d: 8194 runs (7972 high)
 - 2026-11-14 · #428 · Review threat models in the arbiter and Codex input, and a late fix-verify lane (opt-in; #374 PR A) · risk high · rounds 7 · arbiter 5 · awaiting-owner-merge · Codex 7d: 8926 runs (8699 high)
+- 2026-11-14 · #420 · fix(review): one default-branch anchor, resolved fully qualified; follow-ups #367 #368 #387 #388 #392 #396 #407 · risk high · rounds 7 · arbiter 6 · awaiting-owner-merge · Codex 7d: 9617 runs (9381 high)
