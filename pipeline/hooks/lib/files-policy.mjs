@@ -2853,8 +2853,8 @@ function judgedWords(name, args, ctx) {
   if (!args.some((a) => RUNTIME_PART.test(a))) return { args, unknown: false };
   const touched = (n) => Object.hasOwn(ctx.vars ?? {}, n) || ctx.unknownVars?.has(n) || ctx.pickUnknown?.has(n) || ctx.srcChanged?.has(n) || ctx.srcTouched?.has(n) || ctx.unknownAll === true;
   // #298: `python -m json.tool IN [OUT]` writes its second operand, so how many operands the words make is what judges it: it is read like an option tool (no run-time word, the split reading of an expanded word)
-  // (R1-B1: the module word is read as expanded: `M=json.tool; python3 -m "$M" $(…)` is the same call as the literal one)
-  const optionLike = OPTION_TOOLS.has(name) || (/^python3?$/.test(name) && args[0] === '-m' && args.length > 1 && (RUNTIME_PART.test(args[1]) ? expandRefs(args[1], ctx) : args[1]) === 'json.tool');
+  // (R1-B1: the module word is read as expanded: `M=json.tool; python3 -m "$M" $(…)` is the same call as the literal one; #463: so is the flag: `F=-m; python3 $F json.tool $(…)`)
+  const optionLike = OPTION_TOOLS.has(name) || (/^python3?$/.test(name) && args.length > 1 && (RUNTIME_PART.test(args[0]) ? expandRefs(args[0], ctx) : args[0]) === '-m' && (RUNTIME_PART.test(args[1]) ? expandRefs(args[1], ctx) : args[1]) === 'json.tool');
   const tool = optionLike || PROGRAM_TOOLS.has(name);
   let unknown = false;
   const words = [];
@@ -3172,7 +3172,7 @@ function splitOperands(argv, name) {
 // R1-B3 / R1-B2 (#300): rsync's own reading of its words (splitOperands is cp's: it takes `--exclude VALUE` / `--timeout 30` for operands and `-t` for a target directory). The options that take a
 // value, as `--opt=v`, as `--opt v`, and as a short letter (`-e ssh`, `-esh`, `-ae ssh`: the rest of a cluster after the letter is its value, a letter that ends it takes the next word); options may stand
 // among the operands or after them (rsync permutes), and `--` ends them. Same-line names are replaced by their value first. { pos: the operands as written, expanded: the same, as expanded, dry: a real
-// -n / --dry-run option word (a value is no option: `--exclude -n`, `-en`) }
+// -n / --dry-run option word (a value is no option: `--exclude -n`, `-en`), filesFrom: a --files-from option (R6-B1) }
 const RSYNC_VALUE_LONG = new Set(['rsh', 'rsync-path', 'max-delete', 'max-size', 'min-size', 'partial-dir', 'block-size', 'compare-dest', 'copy-dest', 'link-dest', 'exclude', 'exclude-from', 'include', 'include-from',
   'filter', 'files-from', 'out-format', 'log-file', 'log-file-format', 'bwlimit', 'timeout', 'contimeout', 'port', 'address', 'sockopts', 'password-file', 'temp-dir', 'backup-dir', 'suffix', 'chmod', 'chown',
   'usermap', 'groupmap', 'iconv', 'skip-compress', 'compress-level', 'compress-choice', 'zc', 'zl', 'checksum-choice', 'cc', 'checksum-seed', 'modify-window', 'write-batch', 'only-write-batch', 'read-batch',
@@ -3197,6 +3197,7 @@ function rsyncOperands(words, ctx, quoted, split = true) {
   const pos = [];
   const expanded = [];
   let dry = false;
+  let filesFrom = false;
   let rest = false;
   for (let i = 0; i < items.length; i++) {
     const [w, e] = items[i];
@@ -3206,7 +3207,9 @@ function rsyncOperands(words, ctx, quoted, split = true) {
       if (e[1] === '-') {
         const eq = e.indexOf('=');
         const o = eq < 0 ? e.slice(2) : e.slice(2, eq);
-        if (o === 'dry-run' && eq < 0 && !sub) dry = true;
+        // R6-B1: rsync takes any unambiguous abbreviation of a long option (`--file` is only files-from; `--fil` is filter too); the same prefix reading as `--del` in rsyncFlags
+        if (o.length >= 4 && 'files-from'.startsWith(o)) { filesFrom = true; if (eq < 0) i++; } // (its value is the next word)
+        else if (o === 'dry-run' && eq < 0 && !sub) dry = true;
         else if (eq < 0 && RSYNC_VALUE_LONG.has(o)) i++; // (the next word is its value, an option-looking one included)
       } else {
         for (let j = 1; j < e.length; j++) { // (linear: a cluster is read once, up to its first value letter)
@@ -3221,7 +3224,7 @@ function rsyncOperands(words, ctx, quoted, split = true) {
     pos.push(w);
     expanded.push(e);
   }
-  return { pos, expanded, dry };
+  return { pos, expanded, dry, filesFrom };
 }
 
 // R4-B1 / item 6 (#288): rsync's options as the shell passes them. A same-line name is replaced by its value (`D=--delete; rsync -a "$D" SRC ~/`) and a value that holds blanks is several words; a word that
@@ -5458,7 +5461,10 @@ function evaluateBashForFilesFrame(command, opts) {
       // R3-F1: bash and zsh read a changed unquoted word differently; each reading that is no dry run is judged, and either one finding a contents merge counts
       return [true, false].some((split) => {
         const r = rsyncOperands(words, ctx, c.quotedWords, split);
-        return !r.dry && r.pos.length >= 2 && contents([r.pos[r.pos.length - 1]], r.expanded.slice(0, -1));
+        if (r.dry || r.pos.length < 2) return false;
+        // R6-B1: --files-from copies each listed name, relative to the source directory, directly beneath the destination (a slash on the source or not, -r or not: it implies --relative): a contents merge of the source
+        if (r.filesFrom && hit(r.pos[r.pos.length - 1])) return true;
+        return contents([r.pos[r.pos.length - 1]], r.expanded.slice(0, -1));
       });
     };
     const homeWriter = cmds.find((c) => {

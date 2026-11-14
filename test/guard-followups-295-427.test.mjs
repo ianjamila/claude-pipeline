@@ -130,6 +130,27 @@ describe('#298: python -m json.tool is judged like the option tools (a run-time 
     ['R1-B1 after #269: the module held in a name, one operand', `M=json.tool; python3 -m "$M" ${S}`],
     ['R1-B1 after #269: the module held in a name, read from a pipe', `M=json.tool; cat ${S} | python3 -m $M`],
   ]);
+  // #463 (R6-F1): the `-m` flag itself held in a name. args[0] is `$F`, so the substitution word was not marked unknown and the call read as one operand; the line was refused only by the "which word is
+  // the script" backstop. The call must now be judged by the json.tool reading itself, so its reason is the one of the literal `-m` spelling (a file that declares no hooks, P, and the settings file, S).
+  const P = `${CFG}/pipeline/x.json`;
+  for (const [what, target] of [['a protected file that declares no hooks', P], ['the settings file', S]]) {
+    test(`deny: #463: -m held in a name, a substitution that prints two words (${what}): judged like the literal -m`, () => {
+      const held = run(`F=-m; python3 $F json.tool $(printf '%s %s' /tmp/in.json ${target})`);
+      const literal = run(`python3 -m json.tool $(printf '%s %s' /tmp/in.json ${target})`);
+      assert.equal(held.decision, 'deny');
+      assert.equal(literal.decision, 'deny');
+      if (target === P) assert.equal(held.reason, literal.reason, 'the held -m is read by the json.tool rule, not left to the backstop'); // (the settings file: main's hook-file rule words the literal form differently)
+      assert.doesNotMatch(held.reason, /which word is the script/);
+    });
+  }
+  decide('deny', [
+    ['#463: -m held in a quoted name, a protected second operand', `F=-m; python3 "$F" json.tool /tmp/in.json ${S}`],
+    ['#463: -m held in a quoted name, a protected second operand (no hooks)', `F=-m; python3 "$F" json.tool /tmp/in.json ${P}`],
+  ]);
+  decide('allow', [
+    ['#463: -m held in a name, one literal operand', 'F=-m; python3 $F json.tool /tmp/in.json'],
+    ['#463: -m held in a name, a substitution of two words that holds nothing protected', "F=-m; python3 $F json.tool $(printf '%s %s' /tmp/in.json /tmp/out.json)"],
+  ]);
 });
 
 describe('#300: a contents merge into the home directory (or a parent of it) is refused', () => {
@@ -246,6 +267,31 @@ describe('#300: a contents merge into the home directory (or a parent of it) is 
     assert.equal(run('cp -R /tmp/x/ ~/', { platform: 'darwin' }).decision, 'deny');
     assert.equal(run('cp -R /tmp/x/ ~/', { platform: 'linux' }).decision, 'allow');
   });
+});
+
+describe('R6-B1: rsync --files-from into home is a contents merge', () => {
+  // --files-from copies each listed name, relative to the source directory, directly beneath the destination (slash or no slash on the source): a listed `.claude/…` file staged under the source lands in the protected tree.
+  decide('deny', [
+    ['--files-from=F SRC ~/', 'rsync -a --files-from=/tmp/restore.list /tmp/stage ~/'],
+    ['--files-from F SRC ~/', 'rsync -a --files-from /tmp/restore.list /tmp/stage ~/'],
+    ['--files-from=F SRC into a parent of home', 'rsync -a --files-from=/tmp/l /tmp/stage /home/'],
+    ['--files-from=F SRC "$HOME/"', 'rsync -a --files-from=/tmp/l /tmp/stage "$HOME/"'],
+    ['the option after the operands', 'rsync -a /tmp/stage ~/ --files-from=/tmp/l'],
+    ['the option and its value after the operands', 'rsync -a /tmp/stage ~/ --files-from /tmp/l'],
+    ['no -a (--files-from implies --relative)', 'rsync --files-from=/tmp/l /tmp/stage ~/'],
+    ['an unambiguous abbreviation of the option', 'rsync -a --files=/tmp/l /tmp/stage ~/'],
+    ['an abbreviation with its value as the next word', 'rsync -a --files /tmp/l /tmp/stage ~/'],
+    ['the value held in a same-line name', 'L=/tmp/l; rsync -a --files-from="$L" /tmp/stage ~/'],
+    ['the whole option held in a same-line name', 'O=--files-from=/tmp/l; rsync -a $O /tmp/stage ~/'],
+    ['--files-from with --exclude among the words', 'rsync -a --exclude node_modules --files-from=/tmp/l /tmp/stage ~/'],
+  ]);
+  decide('allow', [
+    ['--files-from into a folder of home that is not protected', 'rsync -a --files-from=/tmp/l /tmp/stage ~/proj/out/'],
+    ['a named-folder copy into home (no --files-from)', 'rsync -a /tmp/stage ~/'],
+    ['--files-from into /tmp', 'rsync -a --files-from=/tmp/l /tmp/stage /tmp/dest/'],
+    ['--files-from as a dry run', 'rsync -an --files-from=/tmp/l /tmp/stage ~/'],
+    ['--files-from as the value of --exclude (a pattern, not the option)', 'rsync -a --exclude --files-from /tmp/stage ~/'],
+  ]);
 });
 
 // ---- #427: the git guard's `cd X || exit` ----
