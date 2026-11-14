@@ -2,6 +2,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseYaml } from '../pipeline/lib/yaml.mjs';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
@@ -313,4 +315,96 @@ test('rateBranch: a remote default branch that differs from config.default_branc
   assert.match(reason, /"develop"/);
   assert.match(reason, /"main"/);
   assert.match(reason, /git remote set-head origin -a/);
+});
+
+// #398: rateBranch hands the TRUSTED default branch back, so admitRound decides "does this PR target the default branch" without reading the editable working-tree value.
+test('rateBranch: defaultBranch is the remote\'s (origin/HEAD), not the one the working-tree config names (#398)', async (t) => {
+  const r = await attackWorld(t, { remote: true }).rate();
+  assert.equal(r.defaultBranch, 'main');
+  assert.equal(r.stacked, false);
+});
+
+test('rateBranch: defaultBranch falls back to the config default_branch in a clone with no remote anchor', async (t) => {
+  const w = world(t, { feature: (r) => r.write('src/a.js', lines(3)) });
+  assert.equal((await w.rate()).defaultBranch, 'main');
+});
+
+// #377: the three ways the default branch is anchored (risk.mjs#trustedDefaultBranch): origin/HEAD, `git ls-remote --symref origin HEAD` when that ref is absent, and the working-tree
+// config only when there is no origin remote at all. An origin remote that answers neither way leaves the config value, which the PR can edit, as an untrusted anchor.
+const bareOrigin = (t, repo) => {
+  const dir = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'cp-origin-')));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  repo.git(['init', '-q', '--bare', '-b', 'main', dir]);
+  repo.git(['remote', 'add', 'origin', dir]);
+  repo.git(['push', '-q', 'origin', 'main']);
+  return dir;
+};
+
+test('rateBranch: anchor is origin-head when refs/remotes/origin/HEAD is set', async (t) => {
+  const w = world(t, { feature: (r) => r.write('src/a.js', lines(3)) });
+  bareOrigin(t, w.repo);
+  w.repo.git(['fetch', '-q', 'origin']);
+  w.repo.git(['remote', 'set-head', 'origin', 'main']);
+  const r = await w.rate();
+  assert.deepEqual([r.anchor, r.defaultBranch, r.baseConfig.ok, r.reviewer], ['origin-head', 'main', true, 'judge']);
+});
+
+test('rateBranch: without origin/HEAD, the remote is asked (ls-remote --symref) and its answer anchors the default branch, trusted', async (t) => {
+  const w = world(t, { feature: (r) => r.write('src/a.js', lines(3)) });
+  bareOrigin(t, w.repo);
+  const before = w.repo.git(['for-each-ref']);
+  const r = await w.rate();
+  assert.deepEqual([r.anchor, r.defaultBranch, r.baseConfig.ok, r.reviewer], ['ls-remote', 'main', true, 'judge'], r.laneReasons.join('; '));
+  assert.equal(w.repo.git(['for-each-ref']), before, 'read-only: no ref was written');
+  assert.throws(() => w.repo.git(['symbolic-ref', 'refs/remotes/origin/HEAD']), /not a symbolic ref|No such/i);
+});
+
+test('rateBranch: an ls-remote answer that differs from the working-tree config wins and is named in the lane notes, not the lane reasons (#367)', async (t) => {
+  const w = world(t, { feature: (r) => r.write('src/a.js', lines(3)) });
+  const origin = bareOrigin(t, w.repo);
+  // the remote's own HEAD names `develop`
+  w.repo.git(['push', '-q', 'origin', 'main:develop']);
+  fs.writeFileSync(path.join(origin, 'HEAD'), 'ref: refs/heads/develop\n');
+  const r = await w.rate();
+  assert.deepEqual([r.anchor, r.defaultBranch], ['ls-remote', 'develop']);
+  assert.ok(r.laneNotes.some((x) => /git ls-remote/.test(x) && /"develop"/.test(x) && /git remote set-head origin -a/.test(x)), r.laneNotes.join('; '));
+  assert.ok(!r.laneReasons.some((x) => /git ls-remote/.test(x)), 'informational: never a Fable reason');
+});
+
+// The PR's own commit names default_branch `side`, the working tree too, and `side` forks right after that commit: the mismatch check alone passes.
+function selfAnchoredWorld(t) {
+  const repo = createTmpRepo();
+  t.after(() => repo.cleanup());
+  repo.write('.claude/pipeline.yml', yml());
+  repo.write('README.md', 'base\n');
+  repo.commit('c0');
+  repo.branch('side');
+  repo.write('.claude/pipeline.yml', yml('default_branch: side\n'));
+  repo.commit('c1 names side');
+  repo.branch('feat/x');
+  repo.write('src/a.js', lines(3));
+  repo.commit('feature');
+  const rate = async () => {
+    const loaded = await loadConfig(repo.dir);
+    assert.equal(loaded.ok, true, (loaded.errors ?? []).join('; '));
+    return rateBranch({ root: repo.dir, head: 'HEAD', config: loaded.config });
+  };
+  return { repo, rate };
+}
+
+test('rateBranch: an origin remote that no source can anchor makes the config anchor untrusted: Fable, with the remedy (#377)', async (t) => {
+  const w = selfAnchoredWorld(t);
+  w.repo.git(['remote', 'add', 'origin', path.join(os.tmpdir(), 'cp-no-such-origin-377')]);
+  const r = await w.rate();
+  assert.equal(r.anchor, 'config');
+  assert.equal(r.reviewer, 'fable');
+  assert.equal(r.baseConfig.ok, false);
+  assert.match(r.baseConfig.reason, /git remote set-head origin -a/);
+  assert.ok(r.laneReasons.some((x) => /trusted base config unreadable/.test(x) && /could not be anchored on the remote/.test(x)), r.laneReasons.join('; '));
+});
+
+test('rateBranch: a repo with no origin remote keeps the config value as a trusted anchor (local-only use)', async (t) => {
+  const w = selfAnchoredWorld(t);
+  const r = await w.rate();
+  assert.deepEqual([r.anchor, r.defaultBranch, r.baseConfig.ok, r.reviewer], ['config', 'side', true, 'judge']);
 });

@@ -22,17 +22,19 @@ import { STATE_VERSION_CLAUDE, STATE_VERSION_DEFERRAL, STATE_VERSION_SUBSTITUTE,
 import { askSummary } from '../lib/round-ask.mjs';
 import { gatherRoundStatus, reviewedDiff, trustedBaseConfig } from '../lib/round-status.mjs';
 import { createGitHub, guardGh } from '../lib/github.mjs';
+import { askFields, clickGate } from '../lib/click-ask.mjs';
+import { roundAsk, rulingAsk } from '../hooks/lib/owner-go-click.mjs';
 import { grantIdOf, ownerGrantLookups, ownerGrantedRounds, ownerRuled, ownerRulingGap, rulingConfigDirHint } from '../hooks/lib/owner-go.mjs';
 import {
   applyClaudeRuling, applyJudge, applyOwnerRuling, applyTestResult, asciiLine, claudeRulingRefusal, DECISIONS, deferEligibility, deferItemsInState, finalizeWithoutArbiter, isOwnerRuled,
   isProtectedFinal, markLightLane, reviewedRoundCount, roundAdmission, roundOutcome, rulingContentDigest, secondReviewRefusal, settleSecondReview, substituteAgentFor, validateSecondReview, validateTriage,
 } from '../lib/triage.mjs';
 import {
-  anchorBranch, currentContentHash, ensureRoundDir, findItem, findRound, readFileOrFail, refreshBaseRef, requireState, reviewBaseRef, roundDir, sha256, withRouteLock, withStateLock, writeFileAtomic, writeJson,
+  anchorBranch, currentContentHash, ensureRoundDir, findItem, findRound, readFileOrFail, refreshBaseRef, refreshTrustedDefault, requireState, reviewBaseRef, roundDir, sha256, withRouteLock, withStateLock, writeFileAtomic, writeJson,
 } from '../lib/review-context.mjs';
 import { assertCurrentAttempt, finishAttempt, readRoute, startAttempt, substituteEligibility, superseded, writeFinalRoute } from '../lib/route-record.mjs';
 import { headMoved, routeConfigFor } from '../lib/review-round.mjs';
-import { noteCodexAnswered, noteQuotaStop } from '../lib/codex-usage.mjs';
+import { noteCodexAnswered, noteQuotaStop, recordCodexRun } from '../lib/codex-usage.mjs';
 import { floorOutput, judgeAndPublish } from '../lib/floor-proof.mjs';
 import { PROOF_EFFORT, proveSubstituteRun, refuseTestOnlyFlags } from '../lib/substitute-proof.mjs';
 import {
@@ -52,9 +54,10 @@ export const meta = {
     '  -> only for a disputed bug with a possible settle test and no test result yet; exit 1 for an item that needs a human, was ruled by the arbiter or is implemented',
     '  -> a bug-disproved result on a security/auth/permissions/data item is still needsHuman',
     'pipeline triage light-lane --round R [--repo DIR]',
-    'pipeline triage ruling-request --pr N --ids ID[,ID…] [--repo DIR]',
+    'pipeline triage ruling-request --pr N --ids ID[,ID…] [--ask] [--repo DIR]',
     '  -> {ok, line}: the LAST line of the reply that asks the owner to rule, `⚖️ Owner ruling needed #N: ID, ID · content <digest12> · repo owner/name`; the digest covers the text of exactly those items in the current review state (exit 1 for an unknown id, a --pr that is not the review state\'s, or a repository off github.com)',
-    'pipeline triage round-request --pr N [--past] [--repo DIR]',
+    '  -> --ask (click-to-approve #261, owner_approval: chat): also {ask: {askId, questions}}: a choice question (Not now | Accept all | Follow-up all | Reject all) whose text is the item summaries and then exactly that line, written as an ask file (one-time use, expires after 24 h, superseded by a newer ask for the same PR); the review skill passes it to AskUserQuestion verbatim and the owner-go hook records a human click as the same ruling a typed `ID: accept|follow-up|reject` per asked id records; otherwise ask: null and askSkipped (owner_approval is not chat | owner_go.click is off | dialog hooks not approved: the owner runs `pipeline owner-go approve-dialog-hooks` once | the ask could not be issued)',
+    'pipeline triage round-request --pr N [--ask] [--past] [--repo DIR]',
     '  -> {ok, line, k, n, head, rounds, cost, open, notClean, recommend, why, discard, summary, warnings}: the LAST line of the reply that asks the owner for ONE more review round past review.max_rounds, `🔁 Extra review round needed #N: round K · head <head12> · repo owner/name`',
     '     (k = the counted round it would be: reviewed rounds + 1, base-only and resolution-only rounds not counted; n = the round number to pass to codex-review --round; head = the checked-out HEAD)',
     '  -> everything but line, k, n and head is display only and decides nothing: rounds {reviewed, max, autoExtraUsed, ownerGranted, next}; cost {bookedUsd, reviewUsd, fableUsd, perRoundUsd, lastRound, lastRoundUsd} (the last two from cost.byRound, \`cost --round R\`: the newest counted round with a booking, else null) from the PR\'s run record (read-only; null with a warning when it cannot be read);',
@@ -64,9 +67,11 @@ export const meta = {
     '  -> commit, push and quick-verify first: the grant is for that head. The owner answers `extra round` (or `grant round K`, optionally with #N); the owner-go hook records it, and',
     '     `codex-review --round n` then claims it (see its usage). Exit 1 for label mode (no grant exists), a --pr that is not the review state\'s, a repository off github.com,',
     '     or a round that is already allowed (within review.max_rounds, the automatic extra round, or an open grant for this head)',
+    '  -> --ask (click-to-approve #261): also {ask: {askId, questions}}: a choice question (No | Yes, one more round) whose text is exactly that line, written as an ask file (one-time use, expires after 24 h, superseded by a newer ask for the same PR); the review skill passes it to AskUserQuestion verbatim and the owner-go hook records a human click on Yes as the same grant a typed `extra round` records; otherwise ask: null and askSkipped (owner_go.click is off | dialog hooks not approved: the owner runs `pipeline owner-go approve-dialog-hooks` once | the ask could not be issued)',
     '  -> --past: {ok, line, k, n, head, past: true, remaining}: the LAST line of the reply that asks the owner to approve a round that ALREADY ran (before owner grants were recorded, so it carries none and review-complete refuses it), `🔂 Approve past review round #N: round K · head <head12> · repo owner/name`',
     '     (n = the round to pass to `state past-round-grant`, head = its full head, remaining: [{n, k}] the other rounds that still need it). It picks the OLDEST published counted round past review.max_rounds + 1 that has a LATER counted round and no owner grant (or one whose',
     '     record is gone). Read-only: state, markers and the PR are untouched. The owner answers `approve round` (or `extra round`, `grant round K`, optionally with #N); the hook records it as kind past-round, which never admits a new round; then run `state past-round-grant --pr N --round n`',
+    '     --past --ask (click-to-approve): a past round is approved by typing only, so the reply also carries ask: null and askSkipped: \'a past round is approved by typing\' (no ask is issued; type the closing line as before)',
     '     exit 1 {ok:false, error, reason} BEFORE the owner is asked: label-mode, no-max-rounds, state-pr-mismatch, host, history-unreadable | no-published-history | stale-history (run `pipeline state show --pr N`) | unpublished-history (run `pipeline comment --pr N --kind triage`), or nothing-to-approve',
     'pipeline triage defer-fixes --pr N --ids ID[,ID…] --fix-head SHA --reason TEXT [--repo DIR]',
     '  -> {ok, deferred: [ids], rounds: [every round number holding a deferred item], published, next?}: closes the round limit without another round when the unreviewed fixes are all LOW severity. Each fix is taken out of the tree FIRST (the caller reverted',
@@ -84,7 +89,7 @@ export const meta = {
     '     malfunction (re-run the judge/arbiter, or ACCEPT), a loosened ACCEPT (only the owner\'s typed ruling loosens), an implemented item, and anything settled by a test, the judge, the arbiter or the owner',
     '  -> the ruling is published at once, under the review lock (published: true): the triage comment is updated as a compare-and-swap on the state\'s content (lib/review-publish.mjs). When GitHub cannot be reached the ruling stands locally (published: false, next = the retry, `pipeline comment --kind triage`); when the PR holds a state this copy did not publish or restore it is published: false, publishError: \'stale-publication\' (run `pipeline state show --pr N`, then redo). It writes review state format version 2 (a state already at a higher version keeps it)',
     'pipeline triage second-review --round R --ids ID[,ID…] --pr N [--repo DIR]',
-    '  -> {ok, round, verdicts:[{id, decision, confidence, reasoning, final}], forcedAccept:[ids], published, publishError?, next}; runs ONE Codex call (review.codex_model, effort high, read-only, fresh session) over a BLIND packet of the named items',
+    '  -> {ok, round, verdicts:[{id, decision, confidence, reasoning, final}], forcedAccept:[ids], published, publishError?, next}; runs ONE Codex call (the trusted review.codex_model: the config at the fork point of the default branch, else the built-in default; effort high, read-only, fresh session) over a BLIND packet of the named items',
     '     and stores its verdict in each item (item.secondReview), for claude-ruling to read. The packet is built from the review state and git alone: the original finding (id, bucket, category, title, file, line, detail, the reviewer\'s reasoning),',
     '     the test evidence the CLI recorded, the pinned head, the PR title and risk, fenced as untrusted text; never the judge\'s, the arbiter\'s or Claude\'s reason or decision. Codex is told to verify the claims in the code, read-only',
     '  -> only with owner_approval: chat; each id must be an item of round R that waits for a human (final.needsHuman) with a cause that is not a judge/arbiter malfunction, is not implemented, is not a round-limit deferral and has no second review yet: anything else refuses the whole call naming the id (exit 1, state untouched)',
@@ -99,13 +104,14 @@ export const meta = {
     '  -> start the substitute agent with promptHeader + "\\nRead <inputPath> and verify the findings it lists.\\n", pasted exactly, description = tag, no model argument; its answer is {"items":[{id, decision, confidence, reasoning}]} (second-review.schema.json), not the findings format',
     '     substitute also carries reused (as `substitute prepare`): true = the open attempt was handed back, or a transcript anywhere under the account\'s projects folder already carries the tag (a lost session), so an agent may already have run: run `--apply` FIRST (exit 2 not-found = none did: only then start the agent). Only `substitute.eligible: true` is a packet to run; a `substitute` without it is a refusal (`why`).',
     '     One unsettled packet per item (cp #256 R5-F1): `--ids` is the caller\'s, so a packet that shares an item with another packet of the round at the same head that is open (prepared), recorded invalid or exhausted gets no attempt: substitute {eligible: false, why: overlapping-packet, packet: <packetId8 of that one>}. Apply or park that packet first; the same ids again are the same packet and retry normally. Disjoint packets are independent.',
-    '  -> review.substitute.mode, min_wait_minutes and max_packet_mb are read as the stricter of the working-tree config and the config committed at the fork point of the default branch (mode off when either says off or the base cannot be read); a mode-off refusal or verdict carries modeOffFrom, which config said off and why',
+    '  -> review.substitute.mode and min_wait_minutes are read as the stricter of the working-tree config and the config committed at the fork point of the default branch (mode off when either says off or the base cannot be read); a mode-off refusal or verdict carries modeOffFrom, which config said off and why',
     '  -> review.substitute.min_wait_minutes and the readability limit apply to a second review as to a first: a quota reset within the wait is substitute {eligible: false, why: reset-near, waitUntil}; an input the agent cannot read in full (more than 15 Read calls, counted from its lines and its estimated tokens, or one line alone of more than 20000 estimated tokens, or a NUL byte) is substitute {eligible: false, why: packet-unreadable, pages, maxPages, files} (or longLine {rel, line, tokens} / unreadableFile {rel, reason}) (nothing written, no attempt opened). It also may carry `warnings` (output beside `substitute`): the machine-wide Codex record that the PR now waits for Codex could not be written (best effort: it never changes the exit code or the substitute verdict)',
     'pipeline triage second-review --apply --pr N --tag TAG [--repo DIR]   (--projects-dir DIR and --max-age-ms N: test suite only, exit 2 test-only-flag without PIPELINE_TEST_MODE)',
     '  -> proves the transcript tagged TAG exactly as `substitute apply` does (lib/substitute-proof.mjs: exactly ONE transcript, agent type, pinned model per turn, Fable floor, effort high, only Read/Grep/Glob, the first prompt EXACTLY the prepared one, successful Reads that cover EVERY line of the input (coverage is credited from the line numbers and the text each Read RETURNED, not from its offset / limit: a returned row counts only when its text equals the file\'s line, a row cut short ends the credit, and the pages together must leave no gap),',
     '     the input on disk is still what was written, route-2nd-<packetId8>.json holds evidence quota (budget / governor are accepted kinds; no record or none / pending: refused no-route / no-evidence), and the review state is still the one asked about (HEAD, each finding\'s text, each final, no second review yet on any id:',
     '     head-moved, finding-changed, final-changed, item-changed), then stores each verdict like a Codex one with secondReview.by substitute-opus|substitute-fable (+ evidence, models, proof), version 4; the stricter-of-two rule is unchanged. A first-review transcript proves nothing (tag, mode header, fixed prompt and input digest differ)',
     '  -> unproven or a wrong-schema answer: exit 1 {ok: false, errors, attempt, retry: second-review|park}, the attempt recorded invalid, nothing stored; no transcript with the tag: exit 2 not-found; --round / --ids are not accepted (the tag names them). The Rulings row says claude+codex, claude+substitute-opus or claude+substitute-fable',
+    '  -> the Codex run is logged like a review round (kind second-review, <home>/.claude/pipeline-state/codex-usage.jsonl, see codex-review); a ledger that cannot be written adds warnings:[…] to the reply',
     'pipeline triage owner-ruling --round R --id ID --decision ACCEPT|FOLLOW-UP|REJECT --reason TEXT --owner-quote TEXT [--pr N] [--repo DIR]',
     '  -> {ok, round, id, final, published: false, next}; records the OWNER\'s decision (final.by owner, needsHuman false, the exact quote and time, the overruled final kept) for an item that needs a human',
     '  -> only with owner_approval: chat; exit 1 for label mode, an item that is not waiting for a human and has no unimplemented Claude ruling (settled items are not reopened), a missing item, an empty reason or quote, or a --pr that is not the review state\'s',
@@ -529,8 +535,9 @@ async function secondReview(rest, ctx) {
     return refuse('a second review is run only with owner_approval: chat in pipeline.yml; in label mode the owner clears needs-human by label');
   }
   const o = { cwd: root };
-  const model = config.review.codex_model;
+  refreshTrustedDefault(root, config); // the trusted model is read at the fork point from origin/<the remote's default branch>: best effort, a failed fetch keeps the cached ref
   const sub = routeConfigFor(root, config); // the stricter of the working tree's and the trusted base config's review.substitute
+  const model = sub.codexModel; // the trusted model (the base config's, else the built-in default), never the working tree's (#389)
 
   // Check under the lock; the packet is built from the state and git right here.
   const asked = await withStateLock(root, ctx, () => {
@@ -545,7 +552,7 @@ async function secondReview(rest, ctx) {
       items.push(item);
     }
     const maxRisk = maxRiskOf(state);
-    return { head: headSha(o), risk: state.risk, maxRisk, agent: substituteAgentFor(maxRisk), items: items.map(packetItem), snapshot: askedSnapshot(items) };
+    return { head: headSha(o), repo: state.repo, risk: state.risk, maxRisk, agent: substituteAgentFor(maxRisk), items: items.map(packetItem), snapshot: askedSnapshot(items) };
   }, pr);
   if (asked.exitCode !== undefined) return asked;
 
@@ -590,6 +597,11 @@ async function secondReview(rest, ctx) {
   // Codex runs WITHOUT the lock (it can take minutes). The prompt is kept before it starts, so a crashed run still leaves what it was asked.
   writeFileAtomic(path.join(dir, `second-review-${ids[0]}.md`), promptBytes);
   const ran = await execCodex({ root, env: ctx.env, args, promptBytes, outPath });
+  // The weekly Codex figure (codex-usage.mjs): one ledger line per real run; a ledger that cannot be written is only a warning.
+  const logged = recordCodexRun({
+    kind: 'second-review', repo: asked.repo || repoSlug(), pr, round: n, effort: SECOND_REVIEW_EFFORT, model, ok: ran.ok,
+  }, { env: ctx.env, ...(ctx.home ? { home: ctx.home } : {}) });
+  const usageWarnings = logged.ok ? [] : [logged.warning];
   if (!ran.ok) {
     const verdict = substituteEligibility({
       reason: ran.reason, timedOut: ran.timedOut === true, quota: ran.quota, mode: sub.mode, modeOffFrom: sub.modeOffFrom, minWaitMinutes: sub.minWaitMinutes, agent: asked.agent,
@@ -621,7 +633,7 @@ async function secondReview(rest, ctx) {
       ...(ran.retried ? { retried: ran.retried } : {}),
       ...(ran.reason === 'quota' && ran.quota ? { quota: { proof: ran.quota.proof, resetAt: ran.quota.resetAt, resetText: ran.quota.resetText } } : {}),
       substitute,
-      ...(warnings.length > 0 ? { warnings } : {}),
+      ...(warnings.length + usageWarnings.length > 0 ? { warnings: [...warnings, ...usageWarnings] } : {}),
     });
   }
   // From here on a bad answer stores nothing, so the call can simply be run again.
@@ -674,7 +686,7 @@ async function secondReview(rest, ctx) {
   }, pr);
   // Codex answered: the PR is no longer waiting for it and its last outage is over (best effort, as after a first review).
   if (recorded.exitCode !== EXIT.OK) return recorded;
-  const warnings = await noteCodexAnswered({ pr, repo: repoSlug, env: ctx.env });
+  const warnings = [...(await noteCodexAnswered({ pr, repo: repoSlug, env: ctx.env })), ...usageWarnings];
   return warnings.length === 0 ? recorded : { ...recorded, output: { ...recorded.output, warnings } };
 }
 
@@ -695,6 +707,7 @@ async function secondReviewApply(values, ctx) {
   const n = Number(m[1]);
   const id8 = m[2];
   if (config.owner_approval !== 'chat') throw fail(EXIT.FAILED, 'label-mode', 'a second review is run only with owner_approval: chat in pipeline.yml');
+  refreshTrustedDefault(root, config);
   const gates = routeConfigFor(root, config);
   if (gates.mode === 'off') throw fail(EXIT.FAILED, 'mode-off', `review.substitute.mode is off: no substitute reviewer (${gates.modeOffFrom})`, { modeOffFrom: gates.modeOffFrom });
   const env = ctx.env ?? process.env;
@@ -820,13 +833,16 @@ const contentOfState = (state) => (ids) => {
   return items ? rulingContentDigest(items) : null;
 };
 
+const oneLine = (x) => String(x ?? '').replace(/\s+/g, ' ').trim().slice(0, 120);
+
 // The line that ends the reply asking the owner to rule: the CLI writes it, so the agent cannot state a digest of its own choosing.
 async function rulingRequest(rest, ctx) {
-  const { values } = parseCommandArgs(rest, { pr: { type: 'string' }, ids: { type: 'string' }, repo: { type: 'string' } }, { allowPositionals: false });
+  const { values } = parseCommandArgs(rest, { pr: { type: 'string' }, ids: { type: 'string' }, repo: { type: 'string' }, ask: { type: 'boolean' } }, { allowPositionals: false });
   const pr = intOption(values, 'pr', { required: true, min: 1 });
   const ids = [...new Set(requireOption(values, 'ids').split(/[\s,]+/).filter(Boolean).map((id) => id.toUpperCase()))]; // (R1-B1 and r1-b1 are one item)
   if (ids.length === 0) throw new UsageError('--ids must name at least one item');
   const root = resolveRepo(values, ctx);
+  const config = values.ask === true ? (await requireConfig(root)).config : null;
   const refuse = (reason) => ({ exitCode: EXIT.FAILED, output: { ok: false, reason } });
   const gh = createGitHub({ cwd: root, env: ctx.env });
   return guardGh(() => withStateLock(root, ctx, () => {
@@ -839,7 +855,12 @@ async function rulingRequest(rest, ctx) {
     }
     const { slug, host } = gh.repo();
     if (host !== 'github.com') return refuse(`gh resolves this repository on ${host ?? 'an unknown host'}, not github.com, and the owner's recorded ruling names a repository on github.com`);
-    return { exitCode: EXIT.OK, output: { ok: true, line: `⚖️ Owner ruling needed #${pr}: ${items.map((i) => i.id).join(', ')} · content ${rulingContentDigest(items)} · repo ${slug}` } };
+    const line = `⚖️ Owner ruling needed #${pr}: ${items.map((i) => i.id).join(', ')} · content ${rulingContentDigest(items)} · repo ${slug}`;
+    if (values.ask !== true) return { exitCode: EXIT.OK, output: { ok: true, line } };
+    // The question: one summary row per item, then exactly the printed line (presentedRuling reads the LAST line, so the rows bind nothing and the owner sees what is asked).
+    const block = [...items.map((i) => `${i.id} · ${i.bucket} · ${oneLine(i.title)}${i.file ? ` · ${oneLine(i.file)}${i.line ? `:${i.line}` : ''}` : ''}`), line].join('\n');
+    const parts = rulingAsk({ repo: slug, pr, ids: items.map((i) => i.id), line: block });
+    return { exitCode: EXIT.OK, output: { ok: true, line, ...askFields({ gate: clickGate({ config, root, ctx }), parts, ctx }) } };
   }, pr));
 }
 
@@ -876,11 +897,15 @@ function pastRoundRequest({ pr, root, config, ctx }) {
 // The line that ends the reply asking the owner for one more review round: the CLI writes it (counted ordinal k, the checked-out head, the
 // repository gh resolves on github.com), so the agent cannot ask for a round or a head of its own choosing. Chat mode only.
 async function roundRequest(rest, ctx) {
-  const { values } = parseCommandArgs(rest, { pr: { type: 'string' }, past: { type: 'boolean' }, repo: { type: 'string' } }, { allowPositionals: false });
+  const { values } = parseCommandArgs(rest, { pr: { type: 'string' }, past: { type: 'boolean' }, repo: { type: 'string' }, ask: { type: 'boolean' } }, { allowPositionals: false });
   const pr = intOption(values, 'pr', { required: true, min: 1 });
   const root = resolveRepo(values, ctx);
   const { config } = await requireConfig(root);
-  if (values.past) return pastRoundRequest({ pr, root, config, ctx });
+  if (values.past) {
+    // A past round is approved by typing only (the click path has no past-round ask), so --ask still gets its contract: ask null and the reason.
+    const past = await pastRoundRequest({ pr, root, config, ctx });
+    return values.ask === true && past.output.ok === true ? { ...past, output: { ...past.output, ask: null, askSkipped: 'a past round is approved by typing' } } : past;
+  }
   const refuse = (reason) => ({ exitCode: EXIT.FAILED, output: { ok: false, reason } });
   if (config.owner_approval !== 'chat') return refuse('an extra review round is granted only with owner_approval: chat in pipeline.yml; in label mode the agent parks');
   const gh = createGitHub({ cwd: root, env: ctx.env });
@@ -910,7 +935,9 @@ async function roundRequest(rest, ctx) {
     } catch (err) {
       warnings.push(`the ask could not be summarised (${asciiLine(err?.message, 160)}): the line above still stands`);
     }
-    return { exitCode: EXIT.OK, output: { ok: true, line, k, n, head, ...shown, warnings } };
+    // (#261) click-to-approve: --ask also writes the dialog's ask file (the question text is exactly the line); it never changes the display fields above.
+    const asked = values.ask === true ? askFields({ gate: clickGate({ config, root, ctx }), parts: roundAsk({ repo: slug, pr, line }), ctx }) : {};
+    return { exitCode: EXIT.OK, output: { ok: true, line, k, n, head, ...shown, warnings, ...asked } };
   }, pr));
 }
 

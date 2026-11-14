@@ -14,12 +14,14 @@ import { scenario, named, ymlFor } from './helpers/gate-env.mjs';
 import { setup, judge, ymlWith, ciRow, accepted } from './helpers/ci-proof-env.mjs';
 import { loadConfig, validateConfig } from '../pipeline/lib/config.mjs';
 import { parseYaml } from '../pipeline/lib/yaml.mjs';
-import { anchorBranch as gitAnchorBranch, contentHash, mergeBase, remoteDefaultBranch, reviewBaseRef as gitReviewBaseRef, treeFingerprint } from '../pipeline/lib/git.mjs';
-import { anchorBranch, currentContentHash, prBaseOf, refreshBaseRef, reviewBaseRef } from '../pipeline/lib/review-context.mjs';
+import {
+  anchorBranch as gitAnchorBranch, contentHash, forgetLsRemoteAnswers, mergeBase, remoteDefaultBranch, reviewBaseRef as gitReviewBaseRef, treeFingerprint,
+} from '../pipeline/lib/git.mjs';
+import { anchorBranch, currentContentHash, refreshBaseRef, reviewBaseRef } from '../pipeline/lib/review-context.mjs';
 import { anchorOf, baseRefFor, behindFreshEnough, localContentHash } from '../pipeline/lib/finalgate.mjs';
 import { docsExemptFrom } from '../pipeline/lib/docs-exempt.mjs';
 import { laneProblem } from '../pipeline/commands/review-complete.mjs';
-import { trustedBase } from '../pipeline/lib/risk.mjs';
+import { prBaseBranch, trustedBase, trustedDefaultBranch } from '../pipeline/lib/risk.mjs';
 import { addRound, emptyState } from '../pipeline/lib/state.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -68,10 +70,29 @@ test('anchorBranch / reviewBaseRef / currentContentHash follow origin/HEAD, not 
   assert.equal(reviewBaseRef(w.root, w.cfg), 'refs/remotes/origin/main');
 });
 
-test('prBaseOf: GitHub\'s baseRefName wins; with none the PR base is the anchor branch', (t) => {
+test('anchorBranch follows the remote (ls-remote) when origin/HEAD is not set, in the order trustedDefaultBranch uses (#377)', (t) => {
   const w = world(t);
-  assert.equal(prBaseOf({ baseRefName: 'release' }, w.root, w.cfg), 'release');
-  for (const view of [{ baseRefName: '' }, {}, undefined]) assert.equal(prBaseOf(view, w.root, w.cfg), 'develop', JSON.stringify(view));
+  const scratch = realpathSync.native(mkdtempSync(join(tmpdir(), 'cp-anchor-ls-')));
+  t.after(() => rmSync(scratch, { recursive: true, force: true }));
+  const originDir = join(scratch, 'origin.git');
+  spawnSync('git', ['init', '-q', '--bare', '-b', 'main', originDir]);
+  w.repo.git(['remote', 'add', 'origin', originDir]);
+  w.repo.git(['push', '-q', 'origin', 'main:main', 'develop:develop']);
+  spawnSync('git', ['--git-dir', originDir, 'symbolic-ref', 'HEAD', 'refs/heads/develop']);
+  w.repo.git(['symbolic-ref', '--delete', 'refs/remotes/origin/HEAD']);
+  forgetLsRemoteAnswers();
+  t.after(() => forgetLsRemoteAnswers());
+  assert.equal(anchorBranch(w.root, w.cfg), 'develop', 'the remote names develop: config.default_branch (main) is not used');
+  assert.equal(trustedDefaultBranch(w.root, w.cfg).branch, anchorBranch(w.root, w.cfg), 'one order for both');
+  assert.equal(reviewBaseRef(w.root, w.cfg), REMOTE_DEVELOP);
+});
+
+test('prBaseBranch: GitHub\'s baseRefName wins; with none the PR base is the anchor branch', (t) => {
+  const w = world(t);
+  assert.deepEqual(prBaseBranch({ baseRefName: 'release' }, w.root, w.cfg), { branch: 'release', untrusted: null });
+  for (const view of [{ baseRefName: '' }, {}, undefined]) {
+    assert.deepEqual(prBaseBranch(view, w.root, w.cfg), { branch: 'develop', untrusted: null }, JSON.stringify(view));
+  }
 });
 
 test('refreshBaseRef fetches the anchor branch (origin/HEAD), not config.default_branch', (t) => {
@@ -89,15 +110,15 @@ test('refreshBaseRef fetches the anchor branch (origin/HEAD), not config.default
   assert.equal(w.repo.git(['rev-parse', REMOTE_DEVELOP]).trim(), w.d1, 'the anchor was fetched');
 });
 
-test('laneProblem: the default prBase is the anchor branch (a PR on the remote default is not "stacked")', async (t) => {
+test('laneProblem: no prBase is passed on to rateBranch, which defaults it to the trusted default branch (a PR on the remote default is not "stacked")', async (t) => {
   const w = world(t);
   const seen = [];
   const rate = async (args) => { seen.push(args.prBase); return { reviewer: 'judge', level: 'low', laneReasons: [], sizeOnly: false }; };
   const state = emptyState({ repo: 'acme/widgets', pr: 7, branch: 'feat/x', risk: 'low', maxRounds: 2 });
   assert.equal(await laneProblem(state, w.root, w.cfg, w.d1, { rate }), null);
-  assert.deepEqual(seen, ['develop']);
+  assert.deepEqual(seen, [undefined], 'never the working-tree config\'s default_branch (#398)');
   assert.equal(await laneProblem(state, w.root, w.cfg, w.d1, { rate, prBase: 'release' }), null);
-  assert.deepEqual(seen, ['develop', 'release'], 'an explicit PR base is untouched');
+  assert.deepEqual(seen, [undefined, 'release'], 'an explicit PR base is untouched');
 });
 
 // ---- docs-exempt: the base must be the one the review loop hashed from ---------------------------------------------------------
@@ -215,7 +236,8 @@ test('a local branch named origin/main does not shadow the anchor either, and a 
 // The files that may still read the config's default_branch, with the EXACT number of reads each may hold and why (R1-F4): a file is not exempt wholesale, so a new
 // decision in finalgate.mjs / risk.mjs / review-context.mjs / docs-exempt.mjs shows as a changed count. Raising a count needs the reason written here.
 const CONFIG_BRANCH_OK = new Map([
-  ['pipeline/lib/risk.mjs', [7, 'trustedBase: the fallback when origin/HEAD is unusable, and the mismatch comparison; rate\'s laneNotes text']],
+  ['pipeline/lib/risk.mjs', [9, 'trustedDefaultBranch: the config fallback (no origin remote) and the untrusted one (its value + message); trustedBase: the mismatch comparison, its text and remoteDefault; rate\'s laneNotes text']],
+  ['pipeline/commands/risk.mjs', [2, 'help text naming config.default_branch (the anchor-config fallback and the laneNotes mismatch), not a read']],
   ['pipeline/lib/review-context.mjs', [1, 'anchorBranch: the fallback when origin/HEAD is unusable']],
   ['pipeline/lib/finalgate.mjs', [2, 'anchorOf (the same fallback: the ONE read every gate decision and display text goes through, behindFreshEnough takes it as `branch`) + prOpenCheck\'s "pipeline.yml says" note']],
   ['pipeline/lib/docs-exempt.mjs', [2, 'anchorBranch input: the same fallback (config?.default_branch ?? DEFAULTS.default_branch)']],
@@ -267,12 +289,12 @@ test('the help texts and docs/cli.md document laneNotes and the origin/HEAD over
     if (name !== 'review-complete' && name !== 'state') assert.match(meta.usage, /laneNotes/, name);
   }
   const { meta } = await import('../pipeline/commands/risk.mjs');
-  assert.match(meta.usage, /origin\/HEAD overrides pipeline\.yml for the review base.*PR base the final gate requires.*CI-proof settings/);
+  assert.match(meta.usage, /refs\/remotes\/origin\/HEAD \(anchor origin-head\).*ls-remote.*that anchor overrides pipeline\.yml for the review base.*PR base the final gate requires.*CI-proof settings/s);
   assert.match(meta.usage, /laneReasons, laneNotes\?, sensitivePaths/);
   assert.ok(docs.includes(meta.usage), 'docs/cli.md carries the risk usage verbatim');
   assert.doesNotMatch(docs, /origin\/<default_branch>|a lane reason says so/);
   assert.match(docs, /`laneNotes`/);
-  assert.equal(docs.split('origin/HEAD overrides pipeline.yml').length - 1, 1, 'the override rule is stated once');
+  assert.equal(docs.split('anchor overrides pipeline.yml').length - 1, 1, 'the override rule is stated once');
 });
 
 test('behindFreshEnough prints the anchor branch (the caller\'s, else origin/HEAD\'s), not the config\'s: its refusals and the merge request\'s behind note', (t) => {

@@ -10,6 +10,7 @@ import { Fail } from './cmd-common.mjs';
 import { GitError, NETWORK_TIMEOUT_MS, anchorBranch as gitAnchorBranch, git, reviewBaseRef as gitReviewBaseRef, reviewContentHash } from './git.mjs';
 import { LockTimeoutError, withLock } from './locks.mjs';
 import { parseRemote } from './remote-url.mjs';
+import { trustedDefaultBranch } from './risk.mjs';
 import { loadState } from './state.mjs';
 
 export const EXCERPT_RADIUS = 20;
@@ -19,12 +20,9 @@ export const oneLine = (s) => String(s ?? '').replace(/\s+/g, ' ').trim();
 
 // ---- content hash ---------------------------------------------------------------------------
 
-// The default branch the review loop measures from: what the remote calls its default (origin/HEAD), else config.default_branch (git.mjs#anchorBranch; #369).
+// The default branch the review loop measures from: what the remote calls its default (origin/HEAD, else `git ls-remote --symref origin HEAD`), else
+// config.default_branch (git.mjs#anchorBranch, the same order as risk.mjs#trustedDefaultBranch; #369, #377). The branch a PR targets is risk.mjs#prBaseBranch.
 export const anchorBranch = (root, config) => gitAnchorBranch(config.default_branch, { cwd: root });
-
-// The branch the PR targets: GitHub's baseRefName when it names one, else the anchor branch.
-export const prBaseOf = (view, root, config) =>
-  (typeof view?.baseRefName === 'string' && view.baseRefName !== '' ? view.baseRefName : anchorBranch(root, config));
 
 // `refs/remotes/origin/<branch>` is what the PR will be merged into (the anchor branch unless the PR names its own base); see
 // git.mjs#reviewBaseRef for the fallback and the fully qualified form.
@@ -50,6 +48,22 @@ export function refreshBaseRef(root, config) {
   }
   const usesRemoteRef = reviewBaseRef(root, config) === `refs/remotes/origin/${branch}`;
   return { refreshed, ...(reason === undefined ? {} : { reason }), usesRemoteRef };
+}
+
+// Best-effort refresh of origin/<TRUSTED default branch> (risk.mjs#trustedDefaultBranch: what the remote calls its default, never the working-tree config's value), for the readers of the
+// trusted fork point = mergeBase(origin/<that>, head), which picks the Codex model, the effort lanes and the substitute gates (admitRound, review-complete, triage second-review): a local
+// ref behind the remote would name an older config. `except`: a branch the caller already fetched. A clone with no origin remote or an anchor only the working tree gives has nothing to
+// fetch; a failed fetch is not an error (the cached ref is used). -> true when it was fetched now.
+export function refreshTrustedDefault(root, config, { except } = {}) {
+  const { branch, anchor, untrusted } = trustedDefaultBranch(root, config);
+  if (anchor === 'config' || untrusted !== null || branch === except) return false;
+  try {
+    git(['fetch', '--no-tags', 'origin', `+refs/heads/${branch}:refs/remotes/origin/${branch}`], { cwd: root, timeoutMs: NETWORK_TIMEOUT_MS });
+    return true;
+  } catch (err) {
+    if (!(err instanceof GitError)) throw err;
+    return false;
+  }
 }
 
 // What the branch changes relative to where it forked, minus the agent log. One definition, in git.mjs, shared with the

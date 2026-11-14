@@ -35,6 +35,10 @@ export const DEFAULTS = deepFreeze({
   // owner adds human-approved / test-change-approved; 'chat' = no label and CI does not fail on those: the review skill stops
   // before the merge, asks in chat, and runs the merge when the owner says "merge".
   owner_approval: 'label',
+  // owner_go: click-to-approve (#261). click 'on' (default) = under owner_approval: chat the review skill may offer the owner's "merge" / "extra round" / rulings as a click on a choice dialog
+  // (`--ask` on `merge --dry-run` and `triage round-request|ruling-request`); the owner may still type. 'off' = typed words only. It can only switch clicks OFF: the Claude Code builds a click is trusted on
+  // are installed code, never this file. Needs `P owner-go approve-dialog-hooks` run once by the owner.
+  owner_go: { click: 'on' },
   default_branch: 'main',
   worktree_dir: '.worktrees',
   // worktrees: `pipeline worktrees prune`. mode 'report' (default) only reports; nothing is removed until 'on'.
@@ -132,9 +136,11 @@ export function requiredChecks(ci) {
   return [...new Set([...configured, ...guards, ...review])];
 }
 
-const EFFORTS = ['low', 'medium', 'high', 'xhigh'];
-const EFFORT_LANES = ['low', 'medium', 'high', 'followup', 'small_fix'];
+// Lowest to highest: the order the stricter-of-two readers of review.effort compare in (review-round.mjs#strictestRouteConfig).
+export const EFFORTS = Object.freeze(['low', 'medium', 'high', 'xhigh']);
+export const EFFORT_LANES = Object.freeze(['low', 'medium', 'high', 'followup', 'small_fix']);
 const OWNER_APPROVALS = ['label', 'chat'];
+const OWNER_GO_CLICKS = ['on', 'off'];
 const PROVIDERS = ['vercel', 'github-deployments', 'other'];
 // Who owns the production smoke: a session or a CI workflow that posts the result on the merged PR.
 // `preview` and `production` are validated exactly as before, but the final gate and `pipeline merge` no longer read them;
@@ -176,6 +182,7 @@ export const SUBSTITUTE_MODES = Object.freeze(['auto', 'off']);
 // Allowed keys per mapping. Anything else is a typo (or a removed option) and is rejected.
 const KEYS = {
   top: [...Object.keys(DEFAULTS), 'project'],
+  owner_go: ['click'],
   worktrees: ['mode', 'protect', 'min_idle_hours', 'min_merged_hours', 'delete', 'archive', 'memory_dirs'],
   verify: ['full', 'quick', 'report', 'screenshots', 'expected_steps', 'skippable_steps', 'stop_queue_wait_minutes', 'after_fix', 'after_fix_steps_by_path', 'after_fix_never', 'max_parallel_full', 'max_load', 'max_load_wait_minutes', 'deferrable_steps', 'ci_proof', 'ci_proof_inputs', 'ci_proof_wait_minutes'],
   ci_proof: ['workflow', 'job', 'event', 'steps'],
@@ -635,6 +642,9 @@ export function validateConfig(obj) {
   if (!isStr(config.project)) errors.push('project is required (a non-empty string)');
   if (!['github', 'gate'].includes(config.enforcement)) errors.push('enforcement must be github|gate');
   if (!OWNER_APPROVALS.includes(config.owner_approval)) errors.push(`owner_approval must be ${OWNER_APPROVALS.join('|')}`);
+
+  const ownerGo = section(config, 'owner_go', errors);
+  if (ownerGo && !OWNER_GO_CLICKS.includes(ownerGo.click)) errors.push(`owner_go.click must be ${OWNER_GO_CLICKS.join('|')}`);
 
   const verify = section(config, 'verify', errors);
   if (verify) {

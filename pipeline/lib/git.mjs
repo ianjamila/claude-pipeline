@@ -739,9 +739,36 @@ export function remoteDefaultBranch(o) {
   }
 }
 
-// The default branch every trust decision is anchored on: what the remote calls its default (remoteDefaultBranch), else `configBranch` (the
-// working-tree config's default_branch, which a PR can edit: only a clone without a usable origin/HEAD has to rely on it).
-export const anchorBranch = (configBranch, o) => remoteDefaultBranch(o) ?? configBranch;
+// Is an `origin` remote configured at all? (`git config --get` answers exit 1 with nothing on stderr for a missing key.) A repo without one (a local-only clone, a fixture)
+// has no remote to anchor the default branch on.
+export const hasOriginRemote = (o) => gitOrNull(['config', '--get', 'remote.origin.url'], 1, o) !== null;
+
+// What the remote says its default branch is, asked over the wire (`git ls-remote --symref origin HEAD`), for a clone that has no refs/remotes/origin/HEAD (#377). The
+// answer of the remote is a source a PR cannot edit, like origin/HEAD. Read-only (no ref is written), best effort (a network failure, a timeout or a remote that names no
+// branch is null, never a throw) and bounded by NETWORK_TIMEOUT_MS. Asked once per repository per process: the callers (trustedBase) run many times and must not each
+// wait on the network, and a failure is remembered too. GIT_TERMINAL_PROMPT=0: a remote that wants credentials fails instead of waiting for a person.
+const lsRemoteAnswers = new Map();
+export function lsRemoteDefaultBranch(o) {
+  const key = o?.cwd ?? process.cwd();
+  if (lsRemoteAnswers.has(key)) return lsRemoteAnswers.get(key);
+  let branch = null;
+  try {
+    const out = git(['ls-remote', '--symref', 'origin', 'HEAD'], { ...o, timeoutMs: NETWORK_TIMEOUT_MS, env: { ...o?.env, GIT_TERMINAL_PROMPT: '0' } });
+    branch = /^ref: refs\/heads\/(?!-)(\S+)\tHEAD$/m.exec(out)?.[1] ?? null;
+  } catch (err) {
+    if (!(err instanceof GitError)) throw err;
+  }
+  lsRemoteAnswers.set(key, branch);
+  return branch;
+}
+// For tests that change a repository's remote inside one process.
+export const forgetLsRemoteAnswers = () => lsRemoteAnswers.clear();
+
+// The default branch every trust decision is anchored on, in the order risk.mjs#trustedDefaultBranch uses (#369, #377): what the remote calls its default
+// (refs/remotes/origin/HEAD, else `git ls-remote --symref origin HEAD` when an origin remote exists), else `configBranch` (the working-tree config's default_branch,
+// which a PR can edit: only a clone the remote does not answer for has to rely on it; trustedDefaultBranch reports that case as untrusted).
+export const anchorBranch = (configBranch, o) =>
+  remoteDefaultBranch(o) ?? (hasOriginRemote(o) ? lsRemoteDefaultBranch(o) : null) ?? configBranch;
 
 // THE content hash of "the code that was reviewed": what HEAD changes relative to where it forked from the PR base,
 // minus the agent log the pipeline itself appends to. The review loop (round coverage, review-complete) and the final

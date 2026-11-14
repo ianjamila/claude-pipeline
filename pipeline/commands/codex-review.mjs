@@ -24,11 +24,12 @@ import { EXIT, UsageError, intOption, parseCommandArgs, requireOption } from '..
 import { FINDINGS_SCHEMA_PATH, buildCodexArgs, validateFindings } from '../lib/codex.mjs';
 import { CODEX_TIMEOUT_MS, execCodex, readCodexAnswer } from '../lib/codex-exec.mjs';
 import { Fail, guarded, requireConfig, resolveRepo } from '../lib/cmd-common.mjs';
+import { DEFAULTS } from '../lib/config.mjs';
 import { headSha, revParse } from '../lib/git.mjs';
 import { admitRound, baseOnlyFindings, headMoved, planRound, recordRound, roundPrompt, routeConfigFor, unavailable } from '../lib/review-round.mjs';
 import { roundDir, writeFileAtomic } from '../lib/review-context.mjs';
 import { createGitHub } from '../lib/github.mjs';
-import { noteCodexAnswered, noteQuotaStop } from '../lib/codex-usage.mjs';
+import { noteCodexAnswered, noteQuotaStop, recordCodexRun } from '../lib/codex-usage.mjs';
 import { higherRisk, maxRiskOf } from '../lib/state.mjs';
 import { substituteAgentFor } from '../lib/triage.mjs';
 import {
@@ -54,6 +55,9 @@ export const meta = {
     '  review.effort.small_fix_lines, review.codex_round_budget, review.codex_budget.soft / .hard and review.substitute.mode / min_wait_minutes / max_packet_mb are each read as the stricter of the working-tree config and the config',
     '    committed at the fork point of the default branch (lower small_fix_lines and max_packet_mb, higher budgets and min_wait_minutes, mode off when either says off), so a PR cannot loosen them; an unreadable base config means mode off;',
     '    a mode-off plan or substitute verdict carries modeOffFrom: which config said off (the working tree, the base at the fork point, or an unreadable base with the reason)',
+    '  review.effort.low|medium|high|followup|small_fix are each read as the HIGHER effort (low < medium < high < xhigh) of the working-tree config and the config at the fork point of the default branch (an unreadable base: held against the built-in lanes; a base config that names another default_branch than the working tree\'s, under a trusted anchor, still counts: the stricter of the working tree, that config and the built-in lanes), so a PR cannot lower its own review effort;',
+    '    review.codex_model is the base config\'s (an unreadable base or an untrusted anchor: the built-in default), never the working tree\'s, and --model must name it, else exit 2 {error:model-mismatch, expected}; it is read at the fork point admission fetched (origin/<default branch>, refreshed best effort even when the PR\'s base is another branch, a stack), so this check follows admission',
+    '  when GitHub names no base branch and the default branch cannot be anchored on the remote (an origin remote that answered neither origin/HEAD nor ls-remote: the working tree\'s default_branch is the PR\'s to edit), exit 3 {reason:github, error:unanchored-base}; with such an untrusted anchor the commits merged in from the base branch are never left out of a later round (the range is the previous round\'s head, kind previous)',
     '  a whole-PR round is owed (state outcome wholePrOwed) when an Opus substitute round came before the PR\'s risk rose to high and no whole-PR round has run since: that round must use the PR\'s merge base as --base (else exit 2 base-mismatch),',
     '    reviews the whole PR (reviewBaseKind merge-base, never base-only or resolution-only, counts toward the cap) and records wholePr:true and patchSha256. An all-Codex history owes none',
     '  --base must be the PR\'s merge base for round 1 and the previous round\'s toHead after that, else exit 2 {error:base-mismatch}',
@@ -93,6 +97,8 @@ export const meta = {
     '  every Codex attempt first replaces .review/round-R/route.json with {attemptId, evidence:pending, round, base, head, patchSha256, risk, agent, at} and keeps its files in',
     '    round-R/attempt-<attemptId>/ (codex-raw.json, prompt.md). The final evidence (quota | none) and a recorded round are written under the review lock and a per-PR route lock (review, then route; the pending record takes the route lock alone, so a held review lock never stops Codex from starting) only while route.json still',
     '    holds this attempt in pending, else exit 2 {error:superseded} (nothing written, nothing deleted); the winner\'s files are copied to round-R/. The file is written by this command only',
+    '  every real Codex run (not a base-only round), answered or failed, adds one line to <home>/.claude/pipeline-state/codex-usage.jsonl (the weekly figure `pipeline summary` prints);',
+    '    a ledger that cannot be written never fails the round: it adds warnings:[…] to the reply',
     '  env: PIPELINE_CODEX_TIMEOUT_MS overrides the 30 minute Codex timeout, PIPELINE_CODEX_CAPACITY_RETRY_MS the 30 second wait before the capacity retry (tests)',
   ].join('\n'),
 };
@@ -134,17 +140,32 @@ export const run = guarded(async (argv, ctx) => {
   }
 
   const dir = roundDir(root, round);
-  const model = values.model ?? config.review.codex_model;
-  const argsFor = (outPath) => {
+  // The model is the TRUSTED one (the config at the default branch's fork point, else the built-in default: review-round.mjs#strictestRouteConfig), never the working tree's, which a PR
+  // can edit; --model must name it too (#389). The SHAPE of the effort and of a --model is checked first (a usage error before anything runs); which model is the trusted one is only
+  // known once admitRound has fetched the default branch (the PR's base, and the default branch itself when that is another one: a stack) and fixed the trusted fork point (a local
+  // origin/<default> behind the remote would name an older model), so the model and the model-mismatch check come after it (R1-B2, R2-F1).
+  const argsFor = (outPath, model) => {
     try {
       return buildCodexArgs({ cwd: root, model, effort, schemaPath: FINDINGS_SCHEMA_PATH, outPath });
     } catch (err) {
       throw new UsageError(err.message);
     }
   };
-  argsFor(path.join(dir, 'codex-raw.json')); // a bad effort or model is a usage error before anything runs
+  argsFor(path.join(dir, 'codex-raw.json'), values.model ?? DEFAULTS.review.codex_model);
 
   const adm = await admitRound({ root, config, ctx, pr, round, base, head });
+  // The stricter of the working tree's and the trusted base config (a PR must not turn its own substitute on / shorten the wait / lower its own effort); its model is the trusted one.
+  const sub = routeConfigFor(root, config, adm.rated.trustedFork);
+  const trustedModel = sub.codexModel;
+  const model = values.model ?? trustedModel;
+  if (model !== trustedModel) {
+    throw new Fail(EXIT.USAGE, {
+      ok: false, error: 'model-mismatch', expected: trustedModel,
+      message: `--model ${model} is not the configured Codex model: use --model ${trustedModel} or leave --model out (the model is review.codex_model of the pipeline.yml at the default branch's fork point, else the built-in default; the working-tree value is ignored)`,
+    });
+  }
+  // The model that will run is checked for shape too, before the plan and before any attempt starts (a malformed codex_model committed at the default branch must not leave a pending route.json) (R2-F2).
+  argsFor(path.join(dir, 'codex-raw.json'), model);
   const { baseOnly, resolutionOnly, resolutionView, resolution, resolutionIneligible } = adm;
   const prompt = roundPrompt(adm);
 
@@ -153,7 +174,7 @@ export const run = guarded(async (argv, ctx) => {
   if (planOnly) {
     return {
       exitCode: EXIT.OK,
-      output: { ok: true, plan: plan === null ? { baseOnly: true, round, base: adm.review.base } : planOutput(plan), expectedEffort: plan?.effort ?? config.review.effort.followup },
+      output: { ok: true, plan: plan === null ? { baseOnly: true, round, base: adm.review.base } : planOutput(plan), expectedEffort: plan?.effort ?? sub.effort.followup },
     };
   }
 
@@ -173,8 +194,7 @@ export const run = guarded(async (argv, ctx) => {
       return null;
     }
   };
-  // The verdict on a substitute reads the stricter of the working tree's and the trusted base config (a PR must not turn its own substitute on / shorten the wait).
-  const sub = routeConfigFor(root, config, adm.rated.trustedFork);
+  // (`sub`, above: the verdict on a substitute reads the same stricter config.)
 
   // The effort is the configuration's, not the caller's: a round that is a small fix-check (or runs while the weekly Codex governor is soft) is cheaper,
   // every other round keeps the normal effort. A round the budget / governor sends to the substitute never runs Codex, so the effort is not asked about.
@@ -207,7 +227,7 @@ export const run = guarded(async (argv, ctx) => {
       });
     }
     outPath = path.join(attempt.dir, 'codex-raw.json');
-    args = argsFor(outPath);
+    args = argsFor(outPath, model);
   }
 
   // A failed run: the verdict on a substitute, the final evidence (compare-and-swap: a superseded attempt exits 2 here instead), the machine-wide record.
@@ -231,16 +251,22 @@ export const run = guarded(async (argv, ctx) => {
       ...(ran?.retried ? { retried: ran.retried } : {}),
       ...(quotaStop || (reason === 'quota' && ran?.quota) ? { quota: { proof: ran.quota.proof, resetAt: ran.quota.resetAt, resetText: ran.quota.resetText } } : {}),
       substitute: verdict,
-      ...(warnings.length > 0 ? { warnings } : {}),
+      ...(warnings.length + usageWarnings.length > 0 ? { warnings: [...warnings, ...usageWarnings] } : {}),
     });
   };
 
   // Runs Codex over the prepared prompt and returns its validated findings (every failure is an exit-3 Fail).
+  const usageWarnings = [];
   const askCodex = async () => {
     // execCodex removes whatever is at the output path first (so it can never be read as this run's answer; the mtime check in
     // readCodexAnswer is the second line of defence, the tree kill on timeout the third).
     writeFileAtomic(path.join(attempt.dir, 'prompt.md'), promptBytes);
     const ran = await execCodex({ root, env: ctx.env, args, promptBytes, outPath });
+    // One line per real Codex run, kept or not (the weekly figure in the agent-log line); a ledger that cannot be written is a warning.
+    const logged = recordCodexRun({
+      kind: 'review', repo: adm.state?.repo || repoSlug(), pr, round, effort, model, ok: ran.ok, resolutionOnly,
+    }, { env: ctx.env, ...(ctx.home ? { home: ctx.home } : {}) });
+    if (!logged.ok) usageWarnings.push(logged.warning);
     if (!ran.ok) throw await failed(ran.reason, { code: ran.code, timedOut: ran.timedOut, detail: ran.detail }, { ran, detail: ran.detail });
 
     if (headSha(o) !== head) throw headMoved();
@@ -295,7 +321,7 @@ export const run = guarded(async (argv, ctx) => {
       },
       ...(baseOnly ? { baseOnly: true } : {}),
       ...(retried ? { retried } : {}),
-      ...(warnings.length > 0 ? { warnings } : {}),
+      ...(warnings.length + usageWarnings.length > 0 ? { warnings: [...warnings, ...usageWarnings] } : {}),
       ...(resolutionOnly ? { resolutionOnly: true, conflicted: resolutionView.conflicted, conflictedCount: resolution.conflictedCount } : {}),
       ...(resolutionIneligible === undefined ? {} : { resolutionIneligible }),
       ...(grantUsed === undefined ? {} : { grantUsed }),

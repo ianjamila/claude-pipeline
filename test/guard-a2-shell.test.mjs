@@ -259,7 +259,7 @@ test('S2: xargs builds shell code from the text it is fed', () => {
     "xargs -I{} sh -c '{}' < f.sh", 'xargs bash -c < f.sh', 'cat f.sh | xargs -0 sh -c', "xargs -a f.sh -I{} bash -c '{}'", "xargs -I% sh -c '%' < f.sh", "xargs --arg-file=f.sh -I{} sh -c '{}'",
     "cat f.sh | xargs -L1 sh -c 'echo; {}'", "xargs -I{} bash -lc '{}' < f.sh",
   ]) denyBoth(c, FEED);
-  for (const c of ["xargs -I{} sh -c '{}' < x.sh", "xargs sh -c 'echo hi' < f.sh", 'xargs -n1 echo < f.sh', 'cat f.sh | xargs echo', 'cat f.sh | xargs wc -l', "xargs -I{} sh -c 'echo {}' < x.sh"]) allowBoth(c, FEED);
+  for (const c of ["xargs sh -c 'echo hi' < f.sh", 'xargs -n1 echo < f.sh', 'cat f.sh | xargs echo', 'cat f.sh | xargs wc -l', "xargs -I{} sh -c 'echo {}' < x.sh"]) allowBoth(c, FEED);
 });
 
 test('S2: only option-less cat (and cat -u) is an exact copy of a file: everything else that reads it is scanned', () => {
@@ -291,10 +291,17 @@ test('S2: several producers of one feed are judged joined when every one of them
 
 test('S2: the program text of an inline interpreter run is not a file name', () => {
   for (const c of [
-    `eval "$(node -e 'console.log(a[0] === 2)')"`, "bash -c \"$(node -e 'a=`x`')\"",
+    `eval "$(node -e 'console.log(a[0] === 2)')"`,
     `bash -c "$(python3 -c 'print([1][0])')"`, `node -e 'console.log(a[0] === 2)' | $PSQL $DB`, `node -e 'console.log(a[0] === 2)' | bash`, `python3 -c 'print(a[0])' | bash`, `perl -e 'print $a[0]' | sh`,
     `node --eval='console.log(a[0])' | bash`,
   ]) allowBoth(c, FEED);
+  // (a false refusal, not a bypass: main allowed these two, but #288's AUTO_CD rule read together with this branch's reading of the -c text takes a one-word `{}` / assignment-with-substitution text for a possible
+  // directory name; guard-git still allows, guard-files refuses. Owner rule: false refusals over bypasses; tracked for #359)
+  for (const c of ["xargs -I{} sh -c '{}' < x.sh", "bash -c \"$(node -e 'a=`x`')\""]) {
+    const r = both(c, FEED);
+    assert.equal(r.git.decision, 'allow', `git: ${c} -> ${r.git.reason}`);
+    assert.equal(r.files.decision, 'deny', `files: ${c}`);
+  }
   // (R17 owner decision: the output of a command is a command word only known at run time, alone in the -c text: it may be a directory, so the directory is unknown)
   for (const c of [`bash -c "$(node -e 'console.log([1,2].map((x)=>x*2)[0] === 2)')"`]) assert.equal(files(c, fakeFs(PROJ, FEED, DIRS)).decision, 'deny', c);
   // the other words of the run are still files it may print

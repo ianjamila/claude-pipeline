@@ -15,11 +15,12 @@ import { docsExemptFrom } from '../lib/docs-exempt.mjs';
 import { readReviewGate } from '../lib/model-floor.mjs';
 import { wholePrOwed } from '../lib/review-route.mjs';
 import { roundStats } from '../lib/round-stats.mjs';
+import { prBaseBranch } from '../lib/risk.mjs';
 import { addRound, loadState, saveState, updateItems } from '../lib/state.mjs';
 import { arbiterFailures, countsTowardCap, finalIsReopenable, isOwnerRuled, isProtectedFinal, reviewedRoundCount, roundOutcome, staleFableRounds, staleSubstituteFableRounds } from '../lib/triage.mjs';
 import { pastRoundHistoryProblem, publishTriage, readBaseline, readPublished, reviewContentHash, writeBaseline } from '../lib/review-publish.mjs';
 import {
-  allItems, anchorBranch, canonicalJson, prBaseOf, currentContentHash, decidedItemsKey, findItem, findRound, followupsPending, newStaleDir, quarantineReviewDir, refreshBaseRef, requireState, reviewBaseRef,
+  allItems, anchorBranch, canonicalJson, currentContentHash, decidedItemsKey, findItem, findRound, followupsPending, newStaleDir, quarantineReviewDir, refreshBaseRef, requireState, reviewBaseRef,
   adoptPublishedGrants, roundDir, stateExtends, withStateLock,
 } from '../lib/review-context.mjs';
 
@@ -60,6 +61,7 @@ export const meta = {
     '     a Fable older than MIN_FABLE (or the lower hold of model-floor reset --hold) is re-reviewed. Refused (exit 2) unless a proven Fable round - or a substitute-fable review that stood in for Codex - is below that and no later whole-PR pass at or above it replaced it (error nothing-stale), every earlier round is finished',
     '     (error unfinished-round: a Fable pass owed, an undecided, human-owed, unimplemented or newly accepted item), HEAD is the head of PR N on GitHub (error head-not-pushed; exit 3 when GitHub is unreachable)',
     '     and the content is what the last round reviewed, or only ledger rows were added since (review.docs_exempt_paths; the round then stays pinned at the last reviewed head) (error content-moved: run a normal codex-review round instead, its Fable pass already reads the whole PR). Then: arbiter needed --round R, the arbiter, arbiter apply',
+    '     the whole-PR range starts at the PR\'s merge base with its base branch at the time of the call (a base branch merged in since the last round moves it); when GitHub names no base branch and the default branch cannot be anchored on the remote (the working tree\'s default_branch is the PR\'s to edit) the fork point the last round recorded is kept instead',
     'pipeline state record-followup --id ID --url URL [--repo DIR]',
     'pipeline state set-outcome --outcome TEXT [--repo DIR]',
     'pipeline state past-round-grant --pr N --round n [--repo DIR]',
@@ -689,8 +691,9 @@ async function fableRefresh(rest, ctx) {
     // The whole-PR range starts at the PR's merge base now (a base branch merged in since the last round moves it).
     let forkPoint = last.forkPoint ?? state.rounds[0]?.reviewBase;
     try {
-      const prBase = prBaseOf(view, root, config);
-      forkPoint = mergeBase(reviewBaseRef(root, config, prBase), head, o);
+      // An untrusted anchor (GitHub named no base branch and the remote did not name the default one) is the PR's to choose: keep the fork point the last round recorded rather than let it move the range (S1).
+      const { branch: prBase, untrusted } = prBaseBranch(view, root, config);
+      if (untrusted === null) forkPoint = mergeBase(reviewBaseRef(root, config, prBase), head, o);
     } catch (err) {
       if (!(err instanceof GitError)) throw err;
     }
