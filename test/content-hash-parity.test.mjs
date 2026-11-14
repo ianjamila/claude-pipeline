@@ -6,8 +6,9 @@ import assert from 'node:assert/strict';
 import { randomBytes } from 'node:crypto';
 import { currentContentHash } from '../pipeline/lib/review-context.mjs';
 import { localContentHash } from '../pipeline/lib/finalgate.mjs';
-import { reviewContentHash } from '../pipeline/lib/git.mjs';
+import { GitError, reviewContentHash } from '../pipeline/lib/git.mjs';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
+import { addOrigin, breakOrigin } from './helpers/origin.mjs';
 
 const LOG = 'docs/agent-log.md';
 const config = { default_branch: 'main', agent_log: LOG };
@@ -145,4 +146,42 @@ test('review-loop and final-gate hashes stay identical, and follow the bytes, wh
   repo.rm('exports/data.xlsx');
   repo.commit('drop it again');
   assert.equal(both(repo), h0, 'a skipped file leaves no residue once it is gone from the range');
+});
+
+// ---- the branch both hashes measure from is the trusted one (#448), never the working-tree default_branch a PR can edit ----
+
+const hashes = (repo, cfg) => [currentContentHash(repo.dir, cfg), localContentHash(repo.dir, cfg)];
+
+test('a working-tree default_branch edit moves neither hash', (t) => {
+  const repo = world(t);
+  addOrigin(t, repo);
+  repo.git(['push', '-q', 'origin', 'HEAD:refs/heads/evil']); // origin/evil sits on the PR head: measured from it, the patch would be empty
+  repo.git(['fetch', '-q', 'origin']);
+  const trusted = both(repo);
+  const [a, b] = hashes(repo, { default_branch: 'evil', agent_log: LOG });
+  assert.equal(a, trusted);
+  assert.equal(b, trusted);
+});
+
+test('an untrusted anchor (origin remote, no origin/HEAD, ls-remote fails) hashes from the config value in both, no throw', (t) => {
+  const repo = world(t);
+  addOrigin(t, repo, { head: false });
+  breakOrigin(repo); // before the first read: ls-remote answers are remembered per process
+  const expected = reviewContentHash({ branch: 'main', agentLog: LOG }, { cwd: repo.dir });
+  // the same repository seen with the network gone: origin/HEAD absent, ls-remote fails -> the working-tree value
+  const [a, b] = hashes(repo, config);
+  assert.equal(a, expected);
+  assert.equal(b, expected);
+  // and it really is the config value that is read (the only anchor left): another branch there moves both, equally
+  repo.git(['update-ref', 'refs/remotes/origin/other', 'HEAD']);
+  const [c, d] = hashes(repo, { default_branch: 'other', agent_log: LOG });
+  assert.notEqual(c, expected);
+  assert.equal(c, d);
+});
+
+test('a base that resolves nowhere throws a GitError from both hash wrappers (no manufactured hash)', (t) => {
+  const repo = world(t);
+  const missing = { default_branch: 'no-such-branch', agent_log: LOG };
+  assert.throws(() => currentContentHash(repo.dir, missing), GitError);
+  assert.throws(() => localContentHash(repo.dir, missing), GitError);
 });

@@ -2,7 +2,7 @@
 # Validate with: node ~/.claude/pipeline/bin/pipeline.mjs config
 version: 1
 project: my-app
-default_branch: main
+default_branch: main            # must equal GitHub's default branch (what origin/HEAD names): preflight reports a mismatch and the merge gate refuses it
 enforcement: github            # github = branch protection must be live; gate = skills only
 # owner_approval: label        # label (default) = the owner adds `human-approved` / `test-change-approved` to let a blocking hard-stop
 #                              # or test-integrity violation merge. chat = no labels: CI does not fail on those, the review skill

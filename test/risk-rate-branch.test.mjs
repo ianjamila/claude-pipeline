@@ -314,6 +314,7 @@ test('rateBranch: a remote default branch that differs from config.default_branc
   assert.match(reason, /"develop"/);
   assert.match(reason, /"main"/);
   assert.match(reason, /git remote set-head origin -a/);
+  assert.match(reason, /supports only GitHub's default branch as its main: set default_branch: develop in pipeline\.yml/, 'the unsupported setup is named with its fix (#430)');
 });
 
 // #398: rateBranch hands the TRUSTED default branch back, so admitRound decides "does this PR target the default branch" without reading the editable working-tree value.
