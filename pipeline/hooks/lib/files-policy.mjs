@@ -3129,8 +3129,19 @@ function readOnlyWith(name, args, cmd, ctx, argv) {
     return !(['less', 'more', 'bat', 'rg'].includes(name) && toolEnvTouched(cmd, ctx, GIT_TOOL_ENV));
   }
   // (#352 merge of main: zsh's print writes its words to standard output like echo; an option cluster before the first operand that binds a name (-v), feeds the history (-s / -S) or the
-  // edit buffer (-z), writes to a numbered descriptor (-u, -p) or prompt-expands its words (-P) is not read-only. A word after `-` / `--` or the first operand ends the options.)
-  if (name === 'print') { for (const a of args) { if (a === '-' || a === '--' || !/^[-+]/.test(a)) break; if (/[vsSzuPp]/.test(a.slice(1))) return false; } return true; }
+  // edit buffer (-z), writes to a numbered descriptor (-u, -p) or prompt-expands its words (-P) is not read-only. A word after `-` / `--` or the first operand ends the options.
+  // R28-F2: an option that takes a value (-C -f -u -v -x -X) takes the rest of its cluster (`-C2`), or the next word when it ends the cluster (`-C 1`), and the scan goes on after it.)
+  if (name === 'print') {
+    for (let i = 0; i < args.length; i++) {
+      const a = args[i];
+      if (a === '-' || a === '--' || !/^[-+]/.test(a)) break;
+      for (let k = 1; k < a.length; k++) {
+        if ('vsSzuPp'.includes(a[k])) return false;
+        if ('CfxX'.includes(a[k])) { if (k === a.length - 1) i++; break; }
+      }
+    }
+    return true;
+  }
   if (name === 'find') return !args.some((a) => FIND_UNSAFE.test(a));
   if (name === 'git') return gitReadOnly(args) && !toolEnvTouched(cmd, ctx, GIT_TOOL_ENV);
   if (name === 'gh') return ghReadOnly(args, cmd, ctx);

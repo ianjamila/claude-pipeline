@@ -1999,8 +1999,13 @@ function loopEndDirs(cmds, loop, from, ctx, cdp) {
       && !(cmds[j + 2] !== undefined && cmds[j + 2].argv.length === 0 && (cmds[j + 2].redirects ?? []).length > 0);
     const may = c.ctl?.cond || c.sep === '&&' || c.sep === '||' || c.sep === '&' || c.sep === '|' || next?.sep === '&' || next?.sep === '|' || (next?.sep === '||' && !orExits);
     let moved = dirs.map((d) => (nm === 'chdir' ? null : nextDir(d, nm, c.argv, ctx, cdp, c.env ?? {}))); // (#425 R1-F2: chdir leaves the directory unknown)
-    // (`cd a && cd b`: the second runs only when the first did, so the pair either moves twice or not at all)
-    if (!may && next?.sep === '&&' && next.argv.length && DIR_CHANGERS.includes(baseName(next.argv[0])) && (next.grp?.length ?? 0) <= own && !next.ctl?.cond) {
+    // (`cd a && cd b`: the second runs only when the first did, so the pair either moves twice or not at all. #352 R28-F1: only when the second moves this shell as surely as the first:
+    // not started by a wrapper or in a process of its own, not chdir (no builtin in bash), no redirection that may fail it, not a pipeline stage or in the background; and neither is
+    // negated (`! cd a && cd b`: b runs only when a failed). Else the general rule keeps a as a place the body may end in.)
+    const surely = (x, k) => !x.spawn && !x.up?.some((u) => u.proc && !cmds[loop.start].up.includes(u)) && baseName(x.argv[0]) !== 'chdir' && !(x.redirects ?? []).length
+      && x.negated !== true && x.bg !== true && x.pipe !== true && cmds[k + 1]?.sep !== '|' && cmds[k + 1]?.sep !== '&';
+    if (!may && next?.sep === '&&' && next.argv.length && DIR_CHANGERS.includes(baseName(next.argv[0])) && (next.grp?.length ?? 0) <= own && !next.ctl?.cond
+      && c.negated !== true && surely(next, j + 1)) {
       const after = moved.map((d) => nextDir(d, baseName(next.argv[0]), next.argv, ctx, cdp, next.env ?? {}));
       moved = [...dirs, ...after];
       j++;

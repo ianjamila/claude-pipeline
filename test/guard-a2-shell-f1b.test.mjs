@@ -205,8 +205,10 @@ test('#352 merge: a named descriptor word is no AUTO_CD directory unless a direc
 // of that name. Options that do more than print stay refused, and a PATH change keeps print a possible program unless the script is run by zsh, where it is a builtin)
 test('#352 merge: zsh print is read-only like echo, unless an option binds, feeds history or a descriptor, or prompt-expands', () => {
   const fs = fakeFs(PROJ, {}, DIRS);
-  for (const p of ['print "a $Y"', 'print -r -- "a $Y"', 'print -l "a $Y" b', 'print -- -s "a $Y"']) assert.equal(files(`cd "$X" || exit 1; ${p}`, fs).decision, 'allow', p);
-  for (const p of ['print -s "a $Y"', 'print -S "a $Y"', 'print -z "a $Y"', 'print -u3 "a $Y"', 'print -rP "a $Y"', 'print -p "a $Y"', 'print -v V "a $Y"']) assert.equal(files(`cd "$X" || exit 1; ${p}`, fs).decision, 'deny', p);
+  for (const p of ['print "a $Y"', 'print -r -- "a $Y"', 'print -l "a $Y" b', 'print -- -s "a $Y"', 'print -C 2 "a $Y" b', 'print -C2 "a $Y"', 'print -f \'%s\' "a $Y"', 'print -x 4 -- -s "a $Y"']) assert.equal(files(`cd "$X" || exit 1; ${p}`, fs).decision, 'allow', p);
+  for (const p of ['print -s "a $Y"', 'print -S "a $Y"', 'print -z "a $Y"', 'print -u3 "a $Y"', 'print -rP "a $Y"', 'print -p "a $Y"', 'print -v V "a $Y"',
+    // (R28-F2: an option that takes a value (-C -f -x -X -u -v) given it in the next word does not end the options: the scan goes on past the value)
+    'print -C 1 -u3 "a $Y"', 'print -f \'%s\' -P "a $Y"', 'print -x 4 -z "a $Y"', 'print -C 1 -s "a $Y"', 'print -rC 1 -s "a $Y"', 'print -X 2 -S "a $Y"', 'print -Cf -s "a $Y"']) assert.equal(files(`cd "$X" || exit 1; ${p}`, fs).decision, 'deny', p);
   const script = '#!/bin/zsh\nexport PATH="$HOME/.npm-global/bin:$PATH"\ncd "$X" || exit 1\nprint "starting $(date)"\n';
   const zfs = fakeFs(PROJ, { 'run.sh': script }, DIRS);
   assert.equal(files(`${PROJ}/run.sh`, zfs).decision, 'allow', 'run by zsh: print is a builtin');

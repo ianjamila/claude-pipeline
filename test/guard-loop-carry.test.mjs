@@ -133,3 +133,20 @@ test('#352 R5 allow twins: a body that stays in the repository, or moves only in
   allows('cd into another repository, no push in the loop', 'for i in 1 2; do cd /work/other; git status; done');
   allows('in a script', RUN_SH, script('echo', `for i in 1 2; do (cd sub && make); ${PB} origin HEAD; cd ${GIT_ROOT}/sub; done`));
 });
+// (#352 R28-F1: `cd a && cd b` moves twice or not at all only when the second cd moves this shell as surely as the first: one a wrapper starts, one in a pipeline stage or the background,
+// one whose redirection may fail, chdir (no builtin in bash), or a pair whose first cd is negated (`! cd a && cd b`: b runs only when a FAILED) may leave the body in a)
+test('#352 R28-F1: the cd-pair shortcut holds only when the second cd surely moves this shell', () => {
+  for (const [what, loop] of [
+    ['second cd started by a wrapper', `for i in 1 2; do ${PB} origin HEAD; cd /work/other && env cd ${GIT_ROOT}; done`],
+    ['second cd in a pipeline stage', `for i in 1 2; do ${PB} origin HEAD; cd /work/other && cd ${GIT_ROOT} | cat; done`],
+    ['second cd with a redirection that may fail', `for i in 1 2; do ${PB} origin HEAD; cd /work/other && cd ${GIT_ROOT} < /missing; done`],
+    ['second cd is chdir', `for i in 1 2; do ${PB} origin HEAD; cd /work/other && chdir ${GIT_ROOT}; done`],
+    ['second cd in the background', `for i in 1 2; do ${PB} origin HEAD; cd /work/other && cd ${GIT_ROOT} & done`],
+    ['first cd negated', `for i in 1 2; do ${PB} origin HEAD; ! cd /work/other && cd ${GIT_ROOT}; done`],
+  ]) {
+    denies(what, loop, {}, DIRS);
+    denies(`${what}, in a script`, RUN_SH, script('echo', loop), DIRS);
+  }
+  allows('a plain pair out and back', `for i in 1 2; do ${PB} origin HEAD; cd /work/other && cd ${GIT_ROOT}; done`);
+  allows('a plain pair out and back, in a script', RUN_SH, script('echo', `for i in 1 2; do ${PB} origin HEAD; cd /work/other && cd ${GIT_ROOT}; done`));
+});
