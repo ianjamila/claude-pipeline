@@ -541,7 +541,8 @@ async function secondReview(rest, ctx) {
   refreshTrustedDefault(root, config); // the trusted model is read at the fork point from origin/<the remote's default branch>: best effort, a failed fetch keeps the cached ref
   const sub = routeConfigFor(root, config); // the stricter of the working tree's and the trusted base config's review.substitute
   const model = sub.codexModel; // the trusted model (the base config's, else the built-in default), never the working tree's (#389)
-  const modelNote = modelNoteFor({ config, configPath, trustedModel: model, codexModelFrom: sub.codexModelFrom }); // #445: the working tree names another model than the one that runs
+  const dflt = hashBranch(root, config); // the trusted default branch, named in the notes and messages below, never the working-tree value a PR can edit
+  const modelNote = modelNoteFor({ config, configPath, trustedModel: model, codexModelFrom: sub.codexModelFrom, defaultBranch: dflt }); // #445: the working tree names another model than the one that runs
 
   // Check under the lock; the packet is built from the state and git right here.
   const asked = await withStateLock(root, ctx, () => {
@@ -577,7 +578,7 @@ async function secondReview(rest, ctx) {
   try {
     args = buildCodexArgs({ cwd: root, model, effort: SECOND_REVIEW_EFFORT, schemaPath: SECOND_REVIEW_SCHEMA_PATH, outPath });
   } catch (err) {
-    throw new UsageError(`${err.message}; the model comes from review.codex_model of the pipeline.yml at ${config.default_branch}'s fork point: fix it on ${config.default_branch}, then bring that fix into this branch`);
+    throw new UsageError(`${err.message}; the model comes from review.codex_model of the pipeline.yml at ${dflt}'s fork point: fix it on ${dflt}, then bring that fix into this branch`);
   }
 
   // The attempt (route-2nd-<packetId8>.json, the lifecycle of route.json): pending before Codex runs, so evidence of an earlier attempt for this packet is gone; the final evidence
@@ -645,7 +646,7 @@ async function secondReview(rest, ctx) {
       ...(ran.retried ? { retried: ran.retried } : {}),
       ...(modelNote === undefined ? {} : { modelNote }),
       ...(ran.reason === 'quota' && ran.quota ? { quota: { proof: ran.quota.proof, resetAt: ran.quota.resetAt, resetText: ran.quota.resetText } } : {}),
-      ...(ran.reason === 'model' ? { modelStop: { proven: modelStopProven, proof: ran.modelStop?.proof ?? null, model, ...(ran.modelStop?.unproven ? { unproven: ran.modelStop.unproven } : {}) }, message: modelRefusalMessage({ model, verdict: substitute, defaultBranch: config.default_branch, next: `call ${substitute.agent} once on the prepared packet (${substitute.inputPath}), then \`pipeline triage second-review --apply --pr ${pr} --tag "${substitute.tag}"\`` }) } : {}),
+      ...(ran.reason === 'model' ? { modelStop: { proven: modelStopProven, proof: ran.modelStop?.proof ?? null, model, ...(ran.modelStop?.unproven ? { unproven: ran.modelStop.unproven } : {}) }, message: modelRefusalMessage({ model, verdict: substitute, defaultBranch: dflt, next: `call ${substitute.agent} once on the prepared packet (${substitute.inputPath}), then \`pipeline triage second-review --apply --pr ${pr} --tag "${substitute.tag}"\`` }) } : {}),
       substitute,
       ...(warnings.length + usageWarnings.length > 0 ? { warnings: [...warnings, ...usageWarnings] } : {}),
     });

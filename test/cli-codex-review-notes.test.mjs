@@ -216,6 +216,18 @@ test('a working tree that moves default_branch with a trusted anchor (origin/HEA
   assert.deepEqual(p.json.plan.effortNote, { workingTree: 'medium', configured: 'high', lane: 'low', from: 'anchored-fork-point' });
   const r = review(w, 'medium');
   assertExit(r, 2, r.stdout + r.stderr);
-  // the branch named is config.default_branch, the working tree's (here the moved one), as modelNote does
-  assert.match(r.json.message, /the higher of the working tree's and the lane at \w+'s genuine fork point \(here high\)/);
+  // the trusted default branch (what the remote calls its default), never the moved one the working tree names
+  assert.ok(r.json.message.includes("the higher of the working tree's and the lane at main's genuine fork point (here high), so a lower lane applies only once it is on main"), r.json.message);
+  assert.equal(r.json.message.includes('side'), false, r.json.message);
+});
+
+test('a working tree that moves default_branch with a trusted anchor and names another review.codex_model: the modelNote names main\'s genuine fork point and main, not the moved branch', (t) => {
+  const w = roundWorld(t, { max: 3, review: '  codex_model: gpt-test-1\n' });
+  w.repo.git(['update-ref', 'refs/remotes/origin/main', 'main']);
+  w.repo.git(['symbolic-ref', 'refs/remotes/origin/HEAD', 'refs/remotes/origin/main']);
+  w.repo.git(['branch', 'side', 'main']);
+  w.config({ review: '  codex_model: gpt-test-9\n', yml: 'default_branch: side\n' });
+  const p = plan(w);
+  assertExit(p, 0, p.stdout + p.stderr);
+  assert.equal(p.json.modelNote, "review.codex_model gpt-test-9 in the working tree is not used: this round runs gpt-test-1, the value at main's genuine fork point (the working tree moved default_branch); the edit applies once it is on main and this branch includes it");
 });

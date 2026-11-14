@@ -26,6 +26,7 @@ import { CODEX_TIMEOUT_MS, execCodex, readCodexAnswer } from '../lib/codex-exec.
 import { Fail, guarded, requireConfig, resolveRepo } from '../lib/cmd-common.mjs';
 import { DEFAULTS } from '../lib/config.mjs';
 import { headSha, revParse } from '../lib/git.mjs';
+import { hashBranch } from '../lib/risk.mjs';
 import { admitRound, baseOnlyFindings, effortNoteText, headMoved, modelNoteFor, planRound, recordRound, roundPrompt, routeConfigFor, unavailable } from '../lib/review-round.mjs';
 import { roundDir, writeFileAtomic } from '../lib/review-context.mjs';
 import { createGitHub } from '../lib/github.mjs';
@@ -160,6 +161,7 @@ export const run = guarded(async (argv, ctx) => {
   // The stricter of the working tree's and the trusted base config (a PR must not turn its own substitute on / shorten the wait / lower its own effort); its model is the trusted one.
   const sub = routeConfigFor(root, config, adm.rated.trustedFork);
   const trustedModel = sub.codexModel;
+  const dflt = hashBranch(root, config); // the trusted default branch (what the remote calls its default), named in the notes and messages below, never the working-tree value a PR can edit
   const model = values.model ?? trustedModel;
   if (model !== trustedModel) {
     throw new Fail(EXIT.USAGE, {
@@ -172,10 +174,10 @@ export const run = guarded(async (argv, ctx) => {
   try {
     argsFor(path.join(dir, 'codex-raw.json'), model);
   } catch (err) {
-    throw new UsageError(`${err.message}; the model comes from review.codex_model of the pipeline.yml at ${config.default_branch}'s fork point: fix it on ${config.default_branch}, then bring that fix into this branch`);
+    throw new UsageError(`${err.message}; the model comes from review.codex_model of the pipeline.yml at ${dflt}'s fork point: fix it on ${dflt}, then bring that fix into this branch`);
   }
   // #445: the working tree names another model than the one that runs (it is never used): say so; the round still runs.
-  const modelNote = modelNoteFor({ config, configPath, trustedModel, codexModelFrom: sub.codexModelFrom });
+  const modelNote = modelNoteFor({ config, configPath, trustedModel, codexModelFrom: sub.codexModelFrom, defaultBranch: dflt });
   const { baseOnly, resolutionOnly, resolutionView, resolution, resolutionIneligible } = adm;
   const prompt = roundPrompt(adm);
 
@@ -214,7 +216,7 @@ export const run = guarded(async (argv, ctx) => {
   if (plan !== null && plan.route === 'codex' && effort !== plan.effort) {
     throw new Fail(EXIT.USAGE, {
       ok: false, error: 'effort-mismatch', expected: plan.effort, why: plan.why,
-      message: `--effort ${effort} is not the configured effort for round ${round}: use --effort ${plan.effort} (${plan.why}; \`pipeline codex-review --plan\` prints it)${plan.effortNote === undefined ? '' : `; ${effortNoteText(plan.effortNote, config.default_branch)}`}`,
+      message: `--effort ${effort} is not the configured effort for round ${round}: use --effort ${plan.effort} (${plan.why}; \`pipeline codex-review --plan\` prints it)${plan.effortNote === undefined ? '' : `; ${effortNoteText(plan.effortNote, dflt)}`}`,
       ...(plan.effortNote === undefined ? {} : { effortNote: plan.effortNote }),
     });
   }
@@ -269,7 +271,7 @@ export const run = guarded(async (argv, ctx) => {
       : [];
     return unavailable(reason, {
       ...extra,
-      ...(reason === 'model' ? { modelStop: { proven: modelStopProven, proof: ran.modelStop?.proof ?? null, model, ...(ran.modelStop?.unproven ? { unproven: ran.modelStop.unproven } : {}) }, message: modelRefusalMessage({ model, verdict, defaultBranch: config.default_branch }) } : {}),
+      ...(reason === 'model' ? { modelStop: { proven: modelStopProven, proof: ran.modelStop?.proof ?? null, model, ...(ran.modelStop?.unproven ? { unproven: ran.modelStop.unproven } : {}) }, message: modelRefusalMessage({ model, verdict, defaultBranch: dflt }) } : {}),
       ...(ran?.retried ? { retried: ran.retried } : {}),
       ...(modelNote === undefined ? {} : { modelNote }),
       ...(plan?.effortNote === undefined ? {} : { effortNote: plan.effortNote }),
