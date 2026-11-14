@@ -162,6 +162,8 @@ export const run = guarded(async (argv, ctx) => {
       message: `--model ${model} is not the configured Codex model: use --model ${trustedModel} or leave --model out (the model is review.codex_model of the pipeline.yml at the default branch's fork point, else the built-in default; the working-tree value is ignored)`,
     });
   }
+  // The model that will run is checked for shape too, before the plan and before any attempt starts (a malformed codex_model committed at the default branch must not leave a pending route.json) (R2-F2).
+  argsFor(path.join(dir, 'codex-raw.json'), model);
   const { baseOnly, resolutionOnly, resolutionView, resolution, resolutionIneligible } = adm;
   const prompt = roundPrompt(adm);
 

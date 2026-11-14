@@ -75,3 +75,20 @@ test('R2-F1: a stacked PR (base is not the default branch) also gets the default
   assertExit(fresh, 0, fresh.stderr + fresh.stdout);
   assert.equal(w.state().rounds[0].codexModel, 'gpt-test-2');
 });
+
+// R2-F2: the trusted model is the one that runs, so its shape is checked before the attempt starts (and by --plan): a malformed codex_model committed at the default branch is a usage error, not a
+// throw after a pending route.json was written and never closed.
+test('R2-F2: a malformed codex_model in the trusted base config is a usage error (exit 2) before any attempt or route.json is written; --plan refuses too', (t) => {
+  const w = roundWorld(t, { max: 3, review: '  codex_model: gpt 5\n' });
+  const reviewDir = path.join(w.repo.dir, '.review');
+  const plan = w.cli(['codex-review', '--pr', '7', '--round', '1', '--base', w.base, '--head', w.head, '--plan']);
+  assertExit(plan, 2, plan.stderr + plan.stdout);
+  assert.match(plan.stderr + plan.stdout, /model/i);
+  const r = w.codex(1, findingsOf());
+  assertExit(r, 2, r.stderr + r.stdout);
+  assert.match(r.stderr + r.stdout, /model/i);
+  const left = fs.existsSync(reviewDir)
+    ? fs.readdirSync(reviewDir, { recursive: true }).filter((p) => /route\.json$|attempt-/.test(String(p)))
+    : [];
+  assert.deepEqual(left, []);
+});
