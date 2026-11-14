@@ -15,6 +15,7 @@ import { Fail, guarded, requireConfig, resolveRepo } from '../lib/cmd-common.mjs
 import { SECOND_REVIEW_SCHEMA_PATH, buildCodexArgs, buildSecondReviewPrompt } from '../lib/codex.mjs';
 import { execCodex, readCodexAnswer } from '../lib/codex-exec.mjs';
 import { git, headSha, isAncestor, mergeBase, revParse, reviewContentHash, showFile } from '../lib/git.mjs';
+import { hashBranch } from '../lib/risk.mjs';
 import { matchAny } from '../lib/glob.mjs';
 import { GhError, runShellAsync } from '../lib/proc.mjs';
 import { findSubagentTranscript, proveModel, extractJsonBlock } from '../lib/transcript.mjs';
@@ -1051,7 +1052,7 @@ async function deferFixes(rest, ctx) {
       else if (fixBase !== null && headIsPushedWithFixBase()) reviewedHead = revParse('HEAD', o);
       else warnings.push(`the follow-up issues compare the removed fix with ${String(ancestorAnchor.toHead).slice(0, 12)}, but the default branch merged into the fix head is not the same one: the compare may show that merge too`);
     }
-    const fixHash = reviewContentHash({ branch: config.default_branch, agentLog: config.agent_log, head: fixFull }, o);
+    const fixHash = reviewContentHash({ branch: hashBranch(root, config), agentLog: config.agent_log, head: fixFull }, o);
     if ([last, anchor, lastReviewed].some((r) => fixHash === r.contentHashAtToHead)) {
       return refuse(`--fix-head ${fixFull.slice(0, 12)} has the reviewed content, so it is not the head that held the fixes: pass the head the round-request line named`);
     }

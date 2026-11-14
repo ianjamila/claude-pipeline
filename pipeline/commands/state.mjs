@@ -15,7 +15,7 @@ import { docsExemptFrom } from '../lib/docs-exempt.mjs';
 import { readReviewGate } from '../lib/model-floor.mjs';
 import { wholePrOwed } from '../lib/review-route.mjs';
 import { roundStats } from '../lib/round-stats.mjs';
-import { prBaseBranch } from '../lib/risk.mjs';
+import { hashBranch, prBaseBranch } from '../lib/risk.mjs';
 import { addRound, loadState, saveState, updateItems } from '../lib/state.mjs';
 import { arbiterFailures, countsTowardCap, finalIsReopenable, isOwnerRuled, isProtectedFinal, reviewedRoundCount, roundOutcome, staleFableRounds, staleSubstituteFableRounds } from '../lib/triage.mjs';
 import { pastRoundHistoryProblem, publishTriage, readBaseline, readPublished, reviewContentHash, writeBaseline } from '../lib/review-publish.mjs';
@@ -529,7 +529,7 @@ async function markImplemented(rest, ctx) {
     if (refresh.usesRemoteRef && !refresh.refreshed) {
       throw new Fail(EXIT.UNAVAILABLE, {
         ok: false, unavailable: true, reason: 'base-refresh',
-        message: `origin/${config.default_branch} could not be refreshed${refresh.reason ? ` (${refresh.reason})` : ''}, and a stale base would count the default branch's new commits as the fix: nothing was marked; retry when the remote is reachable`,
+        message: `origin/${hashBranch(root, config)} could not be refreshed${refresh.reason ? ` (${refresh.reason})` : ''}, and a stale base would count the default branch's new commits as the fix: nothing was marked; retry when the remote is reachable`,
       });
     }
     // An accepted item is only "implemented" by a change to the code: the branch content must differ from what the

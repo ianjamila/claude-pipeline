@@ -3,7 +3,9 @@
 // review that reads as clean, whose Rulings rows carry each deferral for the owner's "merge" to bind. Real CLI, real git, fake gh and codex (test/helpers/round-world.mjs).
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { rmSync } from 'node:fs';
+import { mkdtempSync, realpathSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { grantIdOf, markerPath } from '../pipeline/hooks/lib/owner-go.mjs';
 import { assertExit } from './helpers/assert-exit.mjs';
 import { cleanupAtExit, OWNER_ENTRY, ownerGrants, ownerRules, roundRequest, rulingRequest } from './helpers/owner-go.mjs';
@@ -195,6 +197,23 @@ test('defer-fixes: --fix-head must be a commit that is an ancestor of HEAD with 
   refused(w, () => defer(w, 'R2-S1', side), /not an ancestor of HEAD/, 'a commit on another branch');
   assertExit(defer(w, 'R2-S1', h2.slice(0, 10)), 0);
   assert.equal(w.item('R2-S1').roundCapDeferral.fixHead, h2, 'an abbreviated head is stored in full');
+});
+
+// #448 (Codex C5): the fix head's content hash is measured from the trusted default branch, like currentContentHash: a working-tree default_branch edit cannot change the outcome.
+test('defer-fixes: a working-tree default_branch edit does not change the refusal outcome (the fix hash uses the trusted branch)', (t) => {
+  // The config (committed AND working tree) names `evil` as default branch, which at first is the same commit as main, so the rounds are recorded as usual; the remote's default is main.
+  const w = roundWorld(t, { yml: 'default_branch: evil\n' });
+  w.repo.git(['branch', 'evil', 'main']);
+  const { h3 } = reverted(w);
+  const bare = realpathSync.native(mkdtempSync(join(tmpdir(), 'cp-origin-')));
+  t.after(() => rmSync(bare, { recursive: true, force: true }));
+  w.repo.git(['init', '-q', '--bare', '-b', 'main', bare]);
+  w.repo.git(['remote', 'add', 'origin', bare]);
+  w.repo.git(['push', '-q', 'origin', 'main']);
+  w.repo.git(['fetch', '-q', 'origin']);
+  w.repo.git(['symbolic-ref', 'refs/remotes/origin/HEAD', 'refs/remotes/origin/main']);
+  w.repo.git(['branch', '-f', 'evil', 'HEAD']); // the named branch moves onto the reverted head: measured from it, h3's hash would not equal the reviewed one
+  refused(w, () => defer(w, 'R2-S1', h3), /has the reviewed content/, 'the reverted head, config naming another default branch');
 });
 
 test('defer-fixes: a typed "extra round" always wins: ask -> owner grants -> revert -> defer-fixes is refused (the grant is for the head before the revert)', (t) => {

@@ -15,7 +15,7 @@ import { git, headSha, isAncestor, mergeBase, revParse } from '../lib/git.mjs';
 import { behindFreshEnough, lazyDiff } from '../lib/finalgate.mjs';
 import { QueueUnreadable, queueModeFor } from '../lib/merge-queue.mjs';
 import { createGitHub, guardGh } from '../lib/github.mjs';
-import { assessRisk, prBaseBranch, rateBranch, reviewLane } from '../lib/risk.mjs';
+import { assessRisk, hashBranch, prBaseBranch, rateBranch, reviewLane } from '../lib/risk.mjs';
 import { routeConfigFor } from '../lib/review-round.mjs';
 import { isSubstituteRound, loadState } from '../lib/state.mjs';
 import { readReviewGate } from '../lib/model-floor.mjs';
@@ -166,9 +166,9 @@ const oneLine = (err) => String(err?.message ?? err).split('\n')[0].slice(0, 200
 // -> { refusal } (the output of the exit-1 refusal) | { warning } (the check could not be made: offline refresh, a merge queue, an unreadable queue or
 // ancestry; never a block) | {} (not a draft, or not behind). merge.behind_base: 'update' = behind when origin/<branch> is not an ancestor of HEAD;
 // 'disjoint' = behind only when the merge path would refuse it too (finalgate.behindFreshEnough, which reads the mode from the BASE commit's config).
-function draftBehindBase({ root, config, gh, pr, view, refresh }) {
+export function draftBehindBase({ root, config, gh, pr, view, refresh }) {
   if (view.isDraft !== true) return {};
-  const branch = config.default_branch;
+  const branch = hashBranch(root, config); // the trusted default branch (risk.mjs#trustedDefaultBranch), never the working-tree value a PR can edit
   if (!refresh.refreshed) return { warning: `behind-base check skipped: origin/${branch} could not be refreshed (${refresh.reason ?? 'fetch failed'})` };
   const o = { cwd: root };
   let baseSha;
@@ -190,7 +190,7 @@ function draftBehindBase({ root, config, gh, pr, view, refresh }) {
   // checks (mode, overlapping files, toolchain paths) still refuse as usual. Only CONFLICTING is a real answer.
   const known = view.mergeable === 'MERGEABLE' || view.mergeable === 'CONFLICTING';
   const fresh = behindFreshEnough({
-    root, config, diff: lazyDiff(root, config, { sha: baseSha, branch }), baseSha,
+    root, config, diff: lazyDiff(root, config, { sha: baseSha, branch }, branch), baseSha, branch,
     info: { mergeStateStatus: 'CLEAN', mergeable: known ? view.mergeable : 'MERGEABLE' },
   });
   if (fresh.ok) {
@@ -241,7 +241,7 @@ export const run = guarded(async (argv, ctx) => {
       // The hash is measured from origin/<default_branch>; after `update-branch` + `git pull --ff-only` that ref is older than the main that
       // was merged in, so refresh it first (best effort: offline keeps the cached ref and the round's own hash is what it is compared to).
       const refresh = refreshBaseRef(root, config);
-      refreshTrustedDefault(root, config, { except: config.default_branch }); // the trusted fork point (model, lanes) is measured from the remote's default branch, which can be another one
+      refreshTrustedDefault(root, config, { except: hashBranch(root, config) }); // the trusted fork point (model, lanes) is measured from the remote's default branch, which can be another one
       const hash = currentContentHash(root, config);
       // The review is valid for the content as it is, or (review.docs_exempt_paths) the content is the reviewed one plus lines added to
       // listed documents. The same helper decides it in the final gate; everything below (grants, Fable, the lane) runs either way.
@@ -253,7 +253,7 @@ export const run = guarded(async (argv, ctx) => {
           const note = ex && !ex.off ? `; the docs-only exemption does not apply: ${ex.reason}` : '';
           // A stale origin/<branch> is the one cause a person cannot see: say that the ref could not be refreshed.
           const stale = !refresh.refreshed && refresh.usesRemoteRef && why.startsWith('no review round covers')
-            ? ` (origin/${config.default_branch} could not be refreshed: ${refresh.reason})` : '';
+            ? ` (origin/${hashBranch(root, config)} could not be refreshed: ${refresh.reason})` : '';
           return { exitCode: EXIT.FAILED, output: { ok: false, reason: `${why}${stale}${note}`, currentContentHash: hash } };
         }
         docsExempt = ex;

@@ -13,6 +13,7 @@ import { classifyMergeCommand, commandTail } from './merge-cleanup.mjs';
 import { QueueRecordUnreadable, beginAttempt, confirmAttempt, endRecord, failingChecksOn, mayRequeue, noteRemoval, openRecord, queueRulesOf, queueWaitMs, readQueueRecord, reconcile, restoreHoldLabel, watchQueue } from './merge-queue.mjs';
 import { RESTORE_NOTE } from './hold.mjs';
 import { headSha } from './git.mjs';
+import { hashBranch } from './risk.mjs';
 import { envWithGhDir, runShellAsync } from './proc.mjs';
 import { canonicalPath, samePath } from './paths.mjs';
 import { gitCommonDir } from './repo.mjs';
@@ -109,7 +110,7 @@ export async function recheckGatedRecorded({ root, config, pr, gh, env, head, re
   const prHead = gh.prView(pr, [...PR_FIELDS]).headRefOid;
   let hash = '';
   try {
-    hash = localHash(root, config);
+    hash = localHash(root, config, typeof gate.trustedBranch === 'string' && gate.trustedBranch !== '' ? gate.trustedBranch : undefined); // the branch the gate measured from
   } catch { /* gateRefusals reports the mismatch */ }
   const refusals = gateRefusals({ gate, pr, head, prHead, hash, repo, now: now() });
   if (refusals.length > 0) return { ok: false, error: 'live-check', reasons: refusals.map((why) => `${why}: run the final gate again`) };
@@ -183,7 +184,7 @@ export function createQueueRoute({
   let requeued = 0;
   let rules = null;
   try {
-    rules = queueRulesOf(gh.branchRules(config.default_branch));
+    rules = queueRulesOf(gh.branchRules(hashBranch(root, config)));
   } catch { /* unreadable: queueWaitMs falls back to its default */ }
   const budgetMs = Math.min(queueWaitMs(rules), timing.waitCapMs ?? Infinity);
 

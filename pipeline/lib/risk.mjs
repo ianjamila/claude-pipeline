@@ -289,7 +289,7 @@ export async function rateBranch({ root, head, config, prBase, base }) {
   else if (mismatch !== null) laneReasons.push(`trusted base config unreadable: ${mismatch}`);
   if (remoteDefault !== null) {
     const source = anchor === 'ls-remote' ? 'the remote (git ls-remote --symref origin HEAD; origin/HEAD is not set)' : 'origin/HEAD';
-    laneReasons.push(`${source} names default branch ${JSON.stringify(remoteDefault)}, pipeline.yml names ${JSON.stringify(config.default_branch)}: the rating follows ${anchor === 'ls-remote' ? 'the remote' : 'origin/HEAD'} (fix a stale one with \`git remote set-head origin -a\`)`);
+    laneReasons.push(`${source} names default branch ${JSON.stringify(remoteDefault)}, pipeline.yml names ${JSON.stringify(config.default_branch)}: the rating follows ${anchor === 'ls-remote' ? 'the remote' : 'origin/HEAD'}. The pipeline supports only GitHub's default branch as its main: set default_branch: ${remoteDefault} in pipeline.yml, or make ${JSON.stringify(config.default_branch)} the default branch on GitHub (fix a stale origin/HEAD with \`git remote set-head origin -a\`)`);
   }
   // The collector's own identity (hardstops.mjs makeSink: rule, file, line; the detail when there is no line), and the stricter status
   // (blocking > ownerMerge > report-only) when both configs report the same hit.
