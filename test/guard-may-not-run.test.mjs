@@ -401,3 +401,13 @@ test('#352 R14-F1: a zsh anonymous function or short-form body after ) still con
   allows('twin: switch; () { push; }', `${RESET}; () { ${SHIP}; }`);
   allows('twin: cd d && if (true) echo hi && push', `cd /work/other2 && if (true) echo hi && ${SHIP}`);
 });
+
+// (#352 R15-F1: after a `( )` that ends the condition of if / while / until in zsh, the next word is the BODY, which runs when the condition FAILED: it must not keep the `&&` that stood before the `(`)
+test('#352 R15-F1: the body after a ( ) that ends a zsh if / until condition is not on the && list of the condition', () => {
+  denies('until cd d && (true) { push; break; }', `until cd /work/other2 && (true) { ${SHIP}; break; }`);
+  denies('until switch && (true) { push; break; }', `until ${RESET} && (true) { ${SHIP}; break; }`);
+  denies('if cd d && (true) { : } else { push }', `if cd /work/other2 && (true) { : } else { ${SHIP} }`);
+  denies('until cd d && ((1)) push', `until cd /work/other2 && ((1)) ${SHIP}`);
+  allows('twin: cd d && until (false) { push; break; }', `cd /work/other2 && until (false) { ${SHIP}; break; }`);
+  allows('twin: cd d && if (true) { push }', `cd /work/other2 && if (true) { ${SHIP} }`);
+});
