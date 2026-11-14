@@ -874,7 +874,6 @@ export function implicitBindsOf(c) {
   const el = /^([A-Za-z_]\w*)\[[^\]]*\]\+?=/.exec(argv[0] ?? '');
   if (el) out.push(el[1]);
   for (const a of argv) { const fd = /^\{([A-Za-z_]\w*)\}$/.exec(a); if (fd) out.push(fd[1]); }
-  for (const m of String(c.raw ?? '').matchAll(/\{([A-Za-z_]\w*)\}(?=[<>])/g)) out.push(m[1]); // (R19-F2b: the `{fd}>f` word is not in argv any more; the segment text names it. Over-reading is the safe side: more names bound)
   if (/^\s*coproc\b/.test(String(c.raw ?? ''))) {
     out.push('COPROC', 'COPROC_PID');
     if (/^[A-Za-z_]\w*$/.test(argv[0] ?? '')) out.push(argv[0], `${argv[0]}_PID`);
@@ -2422,7 +2421,7 @@ class Parser {
         const tail = subTail && lastSep === ';' && /^(?:[ \t\r]|\\\r?\n)*$/.test(s.slice(subTail.end, wstart)) ? subTail : null;
         seg = {
           words: [], heredocs: [], herestrings: [], redirects: [], stdinSubs: [], stdinFile: false, stdinFiles: [], outSubs: [], fdFeeds: [], vf: ctx.varFeeds, fns: ctx.fns, defs: ctx.defs, cmd: null, meta: new Map(), win: new Map(),
-          start: this.i, depth, pending: 0, muted, raw: '', final: null, groupStage: null, pat: new Set(), grp: ctx.grp, ctl: ctlMarks(ctx.ctl), loops: ctx.loops,
+          start: this.i, afterParen: tail !== null, depth, pending: 0, muted, raw: '', final: null, groupStage: null, pat: new Set(), grp: ctx.grp, ctl: ctlMarks(ctx.ctl), loops: ctx.loops,
           pipedFrom: lastSep === '|' ? this.lastStage : null, pipeSkip: lastSep === '|' && this.lastStageParen ? this.lastStage : null, sep: tail ? tail.sep : lastSep, lead: tail ? tail.lead : lastSep === '|' ? this.pipeLead : null, afterClose: tail ? tail.afterClose : lastSep === '&&' && lastAfterClose,
           up: ctx.up, negIn: ctx.neg > 0, negPipe: lastSep === '|' && lastNeg, negLead: false, // (negation: R9-F3; up: R9-F1)
         };
@@ -3100,15 +3099,28 @@ class Parser {
 
   // Returns the command object that was emitted for this group of words (or null).
   finalizeGroup(words, seg) {
-    // (#352 R19-F2b: a `{fd}>file` redirect prefix is no word wherever it stands: `X=1 {fd}>f git push`, `command {fd}>f git push`, `git {fd}>f push` run git push. implicitBindsOf reads the names from the segment text)
-    words = words.filter((w) => w.fdRedir !== true);
     let i = 0;
+    let fdLead = false; // a leading `{fd}>file` word was skipped
     for (;;) {
       const w = words[i];
       if (!w || w.qa >= 0) break;
-      if (KEYWORDS.has(w.text)) i++;
-      else if (w.text === 'function' && i + 1 < words.length) i += 2;
+      // (#352 R20-F1: a reserved word after a `{fd}>file` word is a plain command word in zsh / bash >= 4.1 (not found), so what the stripping below reads as a keyword never ran: refused)
+      if (w.fdRedir === true) { i++; fdLead = true; }
+      else if (KEYWORDS.has(w.text)) { i++; if (fdLead) this.ctx.truncated = true; }
+      else if (w.text === 'function' && i + 1 < words.length) { i += 2; if (fdLead) this.ctx.truncated = true; }
       else break;
+    }
+    // (#352 R20-F2: `{x}>f` is a redirect in zsh / bash >= 4.1 and the plain word {x} in sh / dash / bash 3.2 (macOS /bin/bash): the two readings run different commands (a leading word is the command, an option value
+    // moves). No cd or branch switch on a line with such a word is certain (ctlBroken); one that is not leading is refused (truncated) when a word follows it, or it ends a git / gh command, except before `exec`
+    // (`exec {fd}>f` opens a descriptor). Narrowed: `ls {x}>f` ends the command and shifts nothing; a lone `{fd}>f` right after the `)` of a subshell (`(cmd) {fd}>f`) or the `]]` of a [[ ]] is zsh's
+    // redirect on that command and a syntax error elsewhere, so it runs nothing the other reading could run)
+    if (words.some((w) => w.fdRedir === true)) {
+      if (!(seg.afterParen === true && words.every((w) => w.fdRedir === true))) this.ctx.ctlBroken = true;
+      let j = i;
+      while (j < words.length && assignOf(words[j])) j++;
+      const execCmd = j < words.length && words[j].qa < 0 && words[j].text === 'exec';
+      const gitish = j < words.length && words[j].qa < 0 && ['git', 'gh'].includes(base(words[j].text));
+      if (words.some((w, k) => w.fdRedir === true && k >= i && !(execCmd && k > j) && (k < words.length - 1 || gitish))) this.ctx.truncated = true;
     }
     if (words.slice(0, i).some((w) => w.text === '!' && w.qa < 0)) seg.negated = true; // (`! cmd`: its status is inverted, so a command chained with && after it runs when cmd FAILED. R9-F3: never taken back by the next group of the segment: `! { cmd; }`)
     const env = {};
