@@ -176,15 +176,22 @@ export function reviewLane({ level, files, config, sizeOnly = false }) {
 // -> { branch, remote, anchor: 'origin-head'|'ls-remote'|'config', untrusted: string | null }
 export function trustedDefaultBranch(root, config) {
   const o = { cwd: root };
+  const configured = config?.default_branch ?? DEFAULTS.default_branch; // a partial or null config is tolerated (Fable F7)
   const fromHead = remoteDefaultBranch(o);
   if (fromHead !== null) return { branch: fromHead, remote: fromHead, anchor: 'origin-head', untrusted: null };
-  if (!hasOriginRemote(o)) return { branch: config.default_branch, remote: null, anchor: 'config', untrusted: null };
+  if (!hasOriginRemote(o)) return { branch: configured, remote: null, anchor: 'config', untrusted: null };
   const asked = lsRemoteDefaultBranch(o);
   if (asked !== null) return { branch: asked, remote: asked, anchor: 'ls-remote', untrusted: null };
   return {
-    branch: config.default_branch, remote: null, anchor: 'config',
-    untrusted: `the default branch could not be anchored on the remote (no refs/remotes/origin/HEAD, and \`git ls-remote --symref origin HEAD\` named none), so the working-tree config's default_branch ${JSON.stringify(config.default_branch)} is the only source and a PR can edit it (fix: \`git remote set-head origin -a\`)`,
+    branch: configured, remote: null, anchor: 'config',
+    untrusted: `the default branch could not be anchored on the remote (no refs/remotes/origin/HEAD, and \`git ls-remote --symref origin HEAD\` named none), so the working-tree config's default_branch ${JSON.stringify(configured)} is the only source and a PR can edit it (fix: \`git remote set-head origin -a\`)`,
   };
+}
+
+// The ONE branch every content-hash and behind-base site measures from (#448): trustedDefaultBranch's answer, never the working-tree config's default_branch a PR can edit (that value is
+// only the fallback of a clone with no origin remote). `config` may be partial or null. -> string
+export function hashBranch(root, config) {
+  return trustedDefaultBranch(root, config).branch;
 }
 
 // The branch a PR is read as targeting, for the commands that fetch / measure a range from it: GitHub's answer (the PR's baseRefName) wins; without one, the TRUSTED default branch

@@ -42,7 +42,7 @@ export function refreshBaseRef(root, config) {
     if (!(err instanceof GitError)) throw err;
     reason = String(err.message).split('\n')[0].slice(0, 200);
   }
-  const usesRemoteRef = reviewBaseRef(root, config) === `origin/${branch}`;
+  const usesRemoteRef = reviewBaseRef(root, config) === `refs/remotes/origin/${branch}`;
   return { refreshed, ...(reason === undefined ? {} : { reason }), usesRemoteRef };
 }
 

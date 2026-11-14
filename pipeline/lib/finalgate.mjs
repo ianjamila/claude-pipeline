@@ -345,7 +345,7 @@ const CI_PROOF_STATES = new Set(['pass', 'pending', 'failure', 'missing']);
 function baseProofSettings({ root, config }) {
   const o = { cwd: root };
   const branch = config.default_branch;
-  const ref = `origin/${branch}`;
+  const ref = `refs/remotes/origin/${branch}`;
   try {
     git(['fetch', '--no-tags', 'origin', `+refs/heads/${branch}:refs/remotes/origin/${branch}`], { ...o, timeoutMs: NETWORK_TIMEOUT_MS });
   } catch (err) {

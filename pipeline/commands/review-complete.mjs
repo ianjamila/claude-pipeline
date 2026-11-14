@@ -173,7 +173,7 @@ function draftBehindBase({ root, config, gh, pr, view, refresh }) {
   const o = { cwd: root };
   let baseSha;
   try {
-    baseSha = revParse(`origin/${branch}^{commit}`, o);
+    baseSha = revParse(`refs/remotes/origin/${branch}^{commit}`, o);
     if (isAncestor(baseSha, 'HEAD', o)) return {};
   } catch (err) {
     return { warning: `behind-base check skipped: could not compare HEAD with origin/${branch} (${oneLine(err)})` };
