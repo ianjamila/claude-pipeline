@@ -3127,6 +3127,8 @@ class Parser {
     if (cmd) Object.defineProperty(cmd, 'subWords', { value: new Set(a.filter((w) => seg.meta.get(w)?.one === true)), enumerable: false });
     // (the words that have quoting in EVERY occurrence: an empty expansion in them leaves an empty word, never none, except "$@" and "${a[@]}"; a word the parser did not read as one, or with a bare occurrence, is not listed)
     if (cmd) Object.defineProperty(cmd, 'quotedWords', { value: new Set(a.filter((w) => seg.quo?.has(w) && !seg.bare?.has(w))), enumerable: false });
+    // (#425 R1-F3: of those, the ones the parser marks as a pattern: `""*.nomatch` has quoting but its glob part may still expand to no word (nullglob), so the caller keeps the raw-text test for them)
+    if (cmd) Object.defineProperty(cmd, 'quotedPatternWords', { value: new Set(a.filter((w) => seg.quo?.has(w) && !seg.bare?.has(w) && seg.pat.has(w))), enumerable: false });
     if (cmd) Object.defineProperty(cmd, 'litWords', { value: new Set(a.filter((w) => !seg.meta.get(w)?.dyn && !seg.pat.has(w))), enumerable: false });
     if (!isExec) { seg.final = { argv: a }; seg.cmd = cmd; }
     // what the command prints and what it reads on stdin, for callers that ask which text a write of its output holds (see line-writes.mjs); lazy, most commands never need it

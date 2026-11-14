@@ -157,6 +157,7 @@ describe('#380 / #383: which argument words may vanish at run time (AUTO_CD: a l
     ['a quoted word that is also the stem of an unquoted redirect target', '"$BIN" "$f" > $f.log; find . -delete', at],
     ['a quoted scalar is an empty word, not a vanished one', '$D "$X"; find . -delete', at],
     ['a partly quoted word never vanishes', '$D "a"$X; find . -delete', at],
+    ['#425 R1-F3: the everyday quoted-dir glob stays allowed (R1-F3 must not deny it)', '$RUNNER "$dir"/*.sh; find . -delete', at],
   ]);
   decide('deny', [
     ['the same variable unquoted can vanish', '$D $P; find . -delete', at],
@@ -165,6 +166,7 @@ describe('#380 / #383: which argument words may vanish at run time (AUTO_CD: a l
     ['a quoted "${@}" vanishes too', '"$RUNNER" "${@}"; rm -f settings.json', runner],
     ['a quoted "${arr[@]}" vanishes with an empty array', '"$RUNNER" "${arr[@]}"; rm -f settings.json', runner],
     ['an unquoted $@', '$RUNNER $@; rm -f settings.json', runner],
+    ['#425 R1-F3: an empty quote then a glob (nullglob: no match, no word)', '$D ""*.nomatch; rm -f settings.json', runner],
   ]);
 });
 

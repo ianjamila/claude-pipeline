@@ -1652,10 +1652,11 @@ function makerOps(cmds) {
 // #380: the parser says which words are quoted in every occurrence (cmd.quotedWords); the raw-text search (`unq.includes`) matched the wrong token (`$P` inside the unquoted `$PYTHON`) and is kept only for a command the parser did
 // not list. #383: a word with any quoting is kept by the shell even when it expands to nothing, except a quoted "$@" / "${@}" / "${a[@]}", which expands to no word at all.
 const POSITIONALS = /\$\{?@|\[@\]/;
-const mayVanish = (a, ctx, fromFile, unq, quoted) => {
+const mayVanish = (a, ctx, fromFile, unq, quoted, quotedPat) => {
   const e = fromFile ? a : expandRefs(a, ctx);
   if (!(e === '' || /[$`*?[(^<]/.test(e))) return false;
-  if (quoted) return !quoted.has(a) || POSITIONALS.test(a);
+  // (#425 R1-F3: a quoted word with a glob in it may still expand to nothing under nullglob: the raw-text test below, as before #380)
+  if (quoted && !quotedPat?.has(a)) return !quoted.has(a) || POSITIONALS.test(a);
   return unq === null || unq.includes(a);
 };
 const unquotedText = (raw) => (typeof raw === 'string' ? raw.replace(/"(?:[^"\\]|\\[\s\S])*"|'[^']*'/g, ' ') : null);
@@ -1667,7 +1668,7 @@ function dirLikeWord(cmds, ci, ctx, bases, fromFile = false) {
   if (w === '[' || w === '[[' || (w === '.' && u.argv.length > 1)) return false; // (the test builtin, and `. FILE`, which is source)
   // R18-F8: AUTO_CD runs a command of ONE word (zsh; bash: no other words after the name): `test -f x`, `supabase db reset`, `docs build` are programs, whatever folders exist. An argument that may vanish at run time does not count
   const unq = unquotedText(c.raw);
-  const lone = u.argv.slice(1).every((a) => mayVanish(a, ctx, fromFile, unq, c.quotedWords));
+  const lone = u.argv.slice(1).every((a) => mayVanish(a, ctx, fromFile, unq, c.quotedWords, c.quotedPatternWords));
   if (!lone) return false;
   if (u.blind) return true; // (a wrapper whose next word is only known at run time)
   // (#288 CI H2: no directory name is longer than PATH_MAX (4 kB); a longer command word is not read as one. Reading it as one made the whole line be judged again in every assumed
