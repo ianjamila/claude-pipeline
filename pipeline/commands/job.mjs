@@ -17,7 +17,10 @@ export const meta = {
     'pipeline job start [--repo DIR] [--tag TAG] NAME -- CMD...   -> {ok, name, jobDir, pid, runId, tag}; exit 1 {ok:false, refused:true, reason} when a guard denies CMD',
     '  --tag TAG: what the job is about (default: the repo HEAD sha); keep the returned runId and hand it to wait/read as --run-id',
     'pipeline job wait  [--repo DIR] [--run-id ID] NAME [--timeout SEC]   (default 540, max 570) -> {ok, name, state, tag, runId, exitCode?, tail}',
-    'pipeline job read  [--repo DIR] [--run-id ID] NAME   -> same shape, without waiting',
+    'pipeline job wait  [--repo DIR] [--run-id ID] --until-done [--max-minutes M] NAME   (M default 60, max 120) -> same shape; BACKGROUND ONLY (Bash run_in_background): a foreground call is killed at 600 s,',
+    '  which ends only the wait (the job keeps running; wait again to pick it up). Without --until-done the 570 s cap above applies. Still running after M minutes -> state "running", exit 0',
+    'pipeline job read  [--repo DIR] [--run-id ID] [--full] NAME   -> same shape, without waiting',
+    '  --full (read, wait): a finished job also returns {output, outputTruncated, drainTimedOut?}: the command\'s whole stdout (first 4 MiB); output is null for a job an older runner started; drainTimedOut:true = a process the command left running still held stdout open 3 s after it exited (its later lines are in the log only; it keeps logging)',
     '  --run-id ID: the runId start returned; if the job name was started again since, state is "replaced" ({ok:false}, exit 1)',
     '  exit 0: running, or done with exit code 0 · exit 1: done non-zero, lost, replaced, refused, name already running · exit 2: no such job / usage',
     '  CMD is the argument list after "--"; arguments with spaces, quotes or shell metacharacters are quoted for the shell',
@@ -28,6 +31,8 @@ export const meta = {
 
 export const MAX_WAIT_SECONDS = 570;
 export const DEFAULT_WAIT_SECONDS = 540;
+export const DEFAULT_UNTIL_DONE_MINUTES = 60;
+export const MAX_UNTIL_DONE_MINUTES = 120;
 const POLL_MS = 250;
 
 const POSIX_SAFE = /^[A-Za-z0-9_@%+=:,./-]+$/;
@@ -125,17 +130,25 @@ function nameOf(positionals, sub) {
 }
 
 async function inspect(sub, rest, ctx) {
-  const options = { repo: { type: 'string' }, 'run-id': { type: 'string' }, ...(sub === 'wait' ? { timeout: { type: 'string' } } : {}) };
+  const options = {
+    repo: { type: 'string' }, 'run-id': { type: 'string' }, full: { type: 'boolean' },
+    ...(sub === 'wait' ? { timeout: { type: 'string' }, 'until-done': { type: 'boolean' }, 'max-minutes': { type: 'string' } } : {}),
+  };
   const { values, positionals } = parseCommandArgs(rest, options);
   const name = nameOf(positionals, sub);
-  const timeoutSec = sub === 'wait' ? intOption(values, 'timeout', { min: 0, max: MAX_WAIT_SECONDS }) ?? DEFAULT_WAIT_SECONDS : 0;
+  const untilDone = sub === 'wait' && values['until-done'] === true;
+  if (sub === 'wait' && !untilDone && values['max-minutes'] !== undefined) throw new UsageError('--max-minutes needs --until-done');
+  if (untilDone && values.timeout !== undefined) throw new UsageError('--until-done takes --max-minutes, not --timeout');
+  const timeoutSec = untilDone
+    ? (intOption(values, 'max-minutes', { min: 1, max: MAX_UNTIL_DONE_MINUTES }) ?? DEFAULT_UNTIL_DONE_MINUTES) * 60
+    : sub === 'wait' ? intOption(values, 'timeout', { min: 0, max: MAX_WAIT_SECONDS }) ?? DEFAULT_WAIT_SECONDS : 0;
   const root = resolveRepo(values, ctx);
   const expectRunId = values['run-id'];
   if (expectRunId !== undefined && expectRunId.trim() === '') throw new UsageError('--run-id must not be empty');
   try {
     const snap = sub === 'wait'
-      ? await waitJob(name, { cwd: root, timeoutMs: timeoutSec * 1000, pollMs: POLL_MS, expectRunId })
-      : readJob(name, { cwd: root, expectRunId });
+      ? await waitJob(name, { cwd: root, timeoutMs: timeoutSec * 1000, pollMs: POLL_MS, expectRunId, full: values.full === true })
+      : readJob(name, { cwd: root, expectRunId, full: values.full === true });
     return jobResult(name, snap);
   } catch (err) {
     const mapped = jobError(err);
@@ -148,5 +161,5 @@ export const run = guarded(async (argv, ctx) => {
   const [sub, ...rest] = argv;
   if (sub === 'start') return start(rest, ctx);
   if (sub === 'wait' || sub === 'read') return inspect(sub, rest, ctx);
-  throw new UsageError('usage: pipeline job (start [--tag TAG] NAME -- CMD... | wait [--run-id ID] NAME [--timeout SEC] | read [--run-id ID] NAME)');
+  throw new UsageError('usage: pipeline job (start [--tag TAG] NAME -- CMD... | wait [--run-id ID] NAME [--timeout SEC | --until-done [--max-minutes M]] | read [--run-id ID] [--full] NAME)');
 });

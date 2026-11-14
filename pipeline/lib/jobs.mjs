@@ -5,6 +5,8 @@
 //   meta.json   what was started (name, command, cwd, tag, runId, startedAt) and the runner's pid
 //   log         the command's stdout + stderr
 //   child.json  the command's pid           exit.json   written by job-runner.mjs when it ends
+//   stdout      the command's whole stdout (first 4 MiB; exit.json says outputTruncated), complete before exit.json exists
+//               (jobs started by an older runner have none: readJob --full reports output: null)
 // Each start gets a random runId. Callers pass a tag (the HEAD sha or tree fingerprint the job is
 // about) and hand the runId back as expectRunId, so a result that belongs to a replaced run reads as
 // 'replaced' instead of being mistaken for the current one.
@@ -20,6 +22,7 @@ import {
 import { constants as osConstants } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { STDOUT_CAP_BYTES, STDOUT_FILE } from './job-output.mjs';
 
 const RUNNER = path.join(path.dirname(fileURLToPath(import.meta.url)), 'job-runner.mjs');
 const NAME_RE = /^[A-Za-z0-9._-]+$/;
@@ -220,7 +223,19 @@ function exitCodeOf({ code, signal }) {
   return num ? 128 + num : 1; // killed by a signal: report it the way a shell does
 }
 
-function snapshot(jobDir, expectRunId) {
+// The captured stdout of a finished job: { output: string, outputTruncated, drainTimedOut? } or { output: null } when this run has none (an older runner).
+// drainTimedOut: a process the command left running still held stdout open when the runner's drain deadline passed, so later output is in the log only.
+function fullOutput(jobDir, exit) {
+  if (!Number.isInteger(exit.outputBytes)) return { output: null, outputTruncated: false };
+  try {
+    const buf = readFileSync(path.join(jobDir, STDOUT_FILE));
+    return { output: buf.subarray(0, STDOUT_CAP_BYTES).toString('utf8'), outputTruncated: exit.outputTruncated === true, ...(exit.drainTimedOut === true ? { drainTimedOut: true } : {}) };
+  } catch {
+    return { output: null, outputTruncated: false };
+  }
+}
+
+function snapshot(jobDir, expectRunId, { full = false } = {}) {
   const meta = readJson(path.join(jobDir, 'meta.json'));
   if (!meta) return { state: 'missing' };
   if (expectRunId !== undefined && meta.runId !== expectRunId) return { state: 'replaced' };
@@ -244,11 +259,12 @@ function snapshot(jobDir, expectRunId) {
     finishedAt: exit.finishedAt,
     elapsedMs: Date.parse(exit.finishedAt) - startedMs,
     tail: tailOf(jobDir),
+    ...(full ? fullOutput(jobDir, exit) : {}),
   };
 }
 
 export function readJob(name, opts = {}) {
-  return snapshot(locate(name, opts).jobDir, opts.expectRunId);
+  return snapshot(locate(name, opts).jobDir, opts.expectRunId, { full: opts.full === true });
 }
 
 // Could the job `name` still be running? For callers that must fail CLOSED (the installer's live-work scan, the lease judge). readJob answers
@@ -287,12 +303,14 @@ export function jobMayBeRunning(name, opts = {}) {
 // Resolves with 'running' when the job is still going at timeoutMs, so callers loop on it; keep
 // timeoutMs under the 10-minute tool limit (default 9 minutes). With expectRunId, a job directory that
 // now belongs to another run (checked on every poll) resolves as 'replaced'.
-export async function waitJob(name, { cwd, dir, timeoutMs = 540_000, pollMs = 1000, expectRunId } = {}) {
+// shouldStop() (optional) is polled with the snapshot: true ends the wait with the job still running (the caller's parent is gone).
+export async function waitJob(name, { cwd, dir, timeoutMs = 540_000, pollMs = 1000, expectRunId, full = false, shouldStop } = {}) {
   const { jobDir } = locate(name, { cwd, dir });
   const deadline = Date.now() + timeoutMs;
   for (;;) {
-    const s = snapshot(jobDir, expectRunId);
+    const s = snapshot(jobDir, expectRunId, { full });
     if (s.state !== 'running') return s;
+    if (shouldStop?.()) return { ...s, stopped: true };
     const left = deadline - Date.now();
     if (left <= 0) return s;
     await new Promise((resolve) => setTimeout(resolve, Math.min(pollMs, left)));

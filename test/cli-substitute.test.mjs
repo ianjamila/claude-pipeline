@@ -302,7 +302,7 @@ test('R2-F1: reused attempt with no agent run yet: apply first is exit 2 not-fou
 });
 
 test('R2-F1: the review skill tells a resumed session to run apply first when prepare says reused', () => {
-  const skill = readFileSync(new URL('../skills/review/SKILL.md', import.meta.url), 'utf8');
+  const skill = readFileSync(new URL('../skills/review/reference/substitute.md', import.meta.url), 'utf8');
   const step = skill.split('\n').find((l) => l.includes('P substitute prepare --pr N --round R'));
   assert.ok(step, 'the substitute step');
   assert.match(step, /`reused: true`[^]*P substitute apply --pr N --round R` FIRST[^]*not-found/);

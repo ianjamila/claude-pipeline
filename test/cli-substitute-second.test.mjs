@@ -531,7 +531,7 @@ test('R5-F3: a second review prepared again while its attempt is open, or after 
   assertExit(r, 0, r.stdout + r.stderr);
   assert.equal(w.item('R1-B1').secondReview.by, 'substitute-opus');
 
-  const skill = readFileSync(new URL('../skills/review/SKILL.md', import.meta.url), 'utf8');
+  const skill = readFileSync(new URL('../skills/review/reference/park-and-rulings.md', import.meta.url), 'utf8');
   const tail = skill.split('\n').find((l) => l.includes('Exit 3 ⇒ rule 2') && l.includes('second-review'));
   assert.ok(tail, 'the second-review step');
   assert.match(tail, /`substitute\.eligible: true`/, 'keys on eligible, not on the presence of substitute');

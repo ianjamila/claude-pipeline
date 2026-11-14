@@ -83,7 +83,7 @@ export async function main(argv = process.argv.slice(2), ctx = {}) {
   }
 }
 
-// Node realpaths import.meta.url but not argv[1], so compare real paths (a symlinked ~/.claude, macOS /tmp).
+// Node realpaths import.meta.url but not argv[1], so compare real paths (a symlinked account config folder, macOS /tmp).
 function isMain() {
   try {
     return Boolean(process.argv[1]) && realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url));

@@ -10,8 +10,10 @@ import { BRIEFS } from '../pipeline/lib/fix-verify.mjs';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const read = (rel) => readFileSync(join(root, rel), 'utf8');
-// the review skill plus the reference file it sends the agent to (owner rulings, extra round, the 3.3 endings)
-const reviewText = () => `${read('skills/review/SKILL.md')}\n${read('skills/review/reference/owner-merge.md')}`;
+// The review skill is SKILL.md plus the reference files it sends the agent to. Every fact is asserted against the ONE file it lives in (never a merged corpus),
+// so a fact cannot pass from the wrong file.
+const skillMd = () => read('skills/review/SKILL.md');
+const ref = (name) => read(`skills/review/reference/${name}.md`);
 
 test('installer hook matchers are what the docs say', () => {
   assert.equal(GUARD_GIT_MATCHER, 'Bash|PowerShell|Monitor|mcp__.*');
@@ -63,22 +65,21 @@ test('a needs-human comment always carries --reason (the command exits 2 without
     }
     assert.ok(!/triage settle[^\n]*--evidence/.test(text), `${doc} still uses triage settle --evidence`);
   }
-  assert.ok(reviewText().includes('--test-cmd') && reviewText().includes('--test-file'));
+  assert.ok(ref('judge-and-settle').includes('--test-cmd') && ref('judge-and-settle').includes('--test-file'));
 });
 
 test('the review skill teaches reading the job exit code, and keeps the update-branch route for a PR whose base moved', () => {
-  const review = reviewText();
-  assert.match(review, /exitCode/);
-  assert.match(review, /update-branch/);
+  assert.match(skillMd(), /exitCode/);
+  assert.match(ref('ready-and-handoff'), /update-branch/);
 });
 
 test('the owner-granted extra round: the review skill asks with round-request and never forges the owner; the docs name the grant, the gate machine and the nested-claude vector', () => {
-  const review = reviewText();
-  assert.match(review, /`reachedMax`.*`owner_approval: chat`/s);
-  assert.match(review, /P triage round-request --pr N/);
-  assert.match(review, /ends with the exact `line`\*\*, nothing after it/);
-  assert.match(review, /Never\s+type, paraphrase or forge the owner's words/);
-  assert.match(review, /Label mode ⇒ no grant exists: park as before/);
+  assert.match(skillMd(), /`reachedMax`.*`owner_approval: chat`/s);
+  const rulings = ref('park-and-rulings');
+  assert.match(rulings, /P triage round-request --pr N/);
+  assert.match(ref('owner-merge'), /ends with the exact `line`\*\*, nothing after it/);
+  assert.match(rulings, /Never\s+type, paraphrase or forge the owner's words/);
+  assert.match(ref('owner-merge'), /Label mode ⇒ no grant exists: park as before/);
   const cli = read('docs/cli.md');
   assert.match(cli, /grantedRound/);
   assert.match(cli, /grantUsed/);
@@ -159,7 +160,7 @@ test('the docs-only review exemption is documented where owners and agents look:
   const yml = read('pipeline/templates/pipeline.yml');
   assert.match(yml, /^ {2}docs_exempt_paths: \[\]/m);
   assert.ok(parseYaml(yml).review.docs_exempt_paths.length === 0, 'the template ships the feature off');
-  const skill = reviewText();
+  const skill = ref('ready-and-handoff');
   assert.match(skill, /review\.docs_exempt_paths/);
   assert.match(skill, /only add lines|ONLY ADD lines/);
   assert.match(skill, /Verification .*still owed/s);
@@ -178,24 +179,24 @@ test('R2-F2 review.threat_models: the template and the config defaults say the C
 });
 
 test('the review skill says one closing keyword per issue (GitHub links only the first number of `Closes #1, #2`)', () => {
-  const skill = read('skills/review/SKILL.md');
-  assert.match(skill, /one keyword per issue, `Closes #1\. Closes #2\.`/);
+  assert.match(skillMd(), /one keyword per issue, `Closes #1\. Closes #2\.`/);
+  const skill = ref('build');
   assert.match(skill, /one keyword per issue, `Closes #170\. Closes #171\.` \(GitHub closes only the first number of\s+`Closes #170, #171`\)/);
 });
 
 test('extra-round discipline: the ask shows rounds, cost and severity; "follow up" is the owner\'s literal words and starts a revert, CI wait and defer-fixes; one implementer builds a PR unless it is big', () => {
-  const review = reviewText();
-  const merge = read('skills/review/reference/owner-merge.md');
+  const build = ref('build');
+  const merge = ref('owner-merge');
   assert.match(merge, /pastes `summary`/);
   assert.match(merge, /only the owner's literal "follow up" or "file follow-ups" starts it/);
   assert.match(merge, /P ci-wait --pr N` on THAT head/);
   assert.match(merge, /P triage defer-fixes --pr N --ids/);
   assert.match(merge, /ONE PR per reply/);
   assert.match(merge, /With `recommend: extra-round` never offer the follow-up path/);
-  assert.match(review, /ONE `implementer` dispatch builds the whole change/);
-  assert.match(review, /continue THE SAME agent/);
-  assert.match(review, /booked ONCE, after its last leg/);
-  assert.ok(!/Split the work into small tasks/.test(review));
+  assert.match(build, /ONE `implementer` dispatch builds the whole change/);
+  assert.match(build, /continue THE SAME agent/);
+  assert.match(ref('cost-booking'), /booked ONCE, after its last leg/);
+  assert.ok(!/Split the work into small tasks/.test(build + skillMd()));
   const implementer = read('agents/implementer.md');
   assert.match(implementer, /the whole change of a PR \(or one part of a big one\)/);
   assert.match(implementer, /Work through the task list in order, commit per step/);
@@ -205,16 +206,43 @@ test('extra-round discipline: the ask shows rounds, cost and severity; "follow u
 });
 
 test('the review skill sends a quota stop, a withheld round and a second review to the substitute, and the owner hand-off explains it', () => {
-  const review = read('skills/review/SKILL.md');
   const merge = read('skills/review/reference/owner-merge.md');
-  assert.match(review, /with `substitute\.eligible` ⇒ the substitute path/);
-  assert.match(review, /P substitute prepare --pr N --round R/);
-  assert.match(review, /P substitute apply --pr N --round R --tag/);
-  assert.match(review, /BEFORE every codex-review call run it with `--plan`.*`expectedEffort` as `--effort`/);
-  assert.match(review, /`nextRound\.base`/);
-  assert.match(review, /codex-status --wait/);
-  assert.match(review, /P triage second-review --apply --pr N --tag/);
-  assert.match(review, /substitute-opus\|substitute-fable/);
+  assert.match(skillMd(), /with `substitute\.eligible` ⇒ the substitute path/);
+  const substitute = ref('substitute');
+  assert.match(substitute, /P substitute prepare --pr N --round R/);
+  assert.match(substitute, /P substitute apply --pr N --round R --tag/);
+  assert.match(substitute, /codex-status --wait/);
+  const oneByOne = ref('special-rounds');
+  assert.match(oneByOne, /BEFORE every codex-review call run it with `--plan`.*`expectedEffort` as `--effort`/);
+  assert.match(oneByOne, /`nextRound\.base`/);
+  assert.match(ref('park-and-rulings'), /P triage second-review --apply --pr N --tag/);
+  assert.match(ref('cost-booking'), /substitute-opus\|substitute-fable/);
   assert.match(merge, /\*\*Substitute reviews\*\* \(`ownerStep\.substitute`/);
   assert.match(merge, /label mode never merges one|Label mode ⇒ no request/);
+});
+
+test('SKILL.md itself carries the steps a short text must not drop: the e2e label before gh pr ready, the Fable-round diff clause, the read-first line', () => {
+  const skill = skillMd();
+  assert.match(skill, /re-run 1\.5[^\n]*`gh pr edit N --add-label <ci\.e2e_label>`[^\n]*then `gh pr ready N`/);
+  assert.match(skill, /rule on every item in it\.` \(Fable round: and review the diff it names\)/);
+  assert.match(skill, /Full text: `reference\/ready-and-handoff\.md`: read it before step 1/);
+  assert.match(skill, /`step: "arbiter-needed"` ⇒ the round IS recorded \(never discard or rerun it\)[^\n]*`result\.restartRequired`/);
+  assert.match(ref('arbiter-errors'), /`result\.restartRequired`/);
+  assert.ok(Buffer.byteLength(skill) <= 12 * 1024, 'SKILL.md stays within 12 KB');
+  // the by-hand Codex step is whole in special-rounds.md: the wait and the non-substitute exits are there, and substitute.md opens on a sentence
+  const oneByOne = ref('special-rounds');
+  assert.match(oneByOne, /then `P job wait codex-rR --run-id <runId> --timeout 540`/);
+  for (const needle of ['`empty-range`', '`base-mismatch`', '`head-moved`']) assert.ok(oneByOne.includes(needle), `special-rounds.md must handle ${needle}`);
+  assert.doesNotMatch(ref('substitute'), /^\s+then `P job wait/m);
+});
+
+test('every doc path a round bundle can print exists (action-valued next, like "rerun round codex", is not a path)', async () => {
+  const { ROUND_DOCS } = await import('../pipeline/commands/round.mjs');
+  assert.ok(ROUND_DOCS.length > 0);
+  for (const doc of ROUND_DOCS) {
+    assert.match(doc, /^reference\/[a-z-]+\.md$/, doc);
+    assert.ok(read(`skills/review/${doc}`).length > 0, `skills/review/${doc} must exist`);
+  }
+  // every reference file SKILL.md names exists
+  for (const m of skillMd().matchAll(/reference\/([a-z-]+)\.md/g)) assert.ok(read(`skills/review/reference/${m[1]}.md`).length > 0, m[0]);
 });

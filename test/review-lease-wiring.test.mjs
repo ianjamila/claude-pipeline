@@ -90,7 +90,7 @@ const summaryGh = () => createFakeGh([
 test('wiring: the leased commands are exactly the ones that read or write a worktree\'s review state (read-only commands take none)', () => {
   assert.deepEqual([...LEASED_COMMANDS].sort(), [
     'agent-log', 'arbiter', 'checkpoint', 'ci-wait', 'codex-review', 'comment', 'cost', 'final-gate', 'followups', 'job', 'merge', 'merge-hold',
-    'redraft', 'review-complete', 'smoke', 'state', 'substitute', 'summary', 'triage', 'update-branch', 'verify',
+    'redraft', 'review-complete', 'round', 'smoke', 'state', 'substitute', 'summary', 'triage', 'update-branch', 'verify',
   ]);
   for (const name of ['preflight', 'config', 'labels', 'update', 'version', 'model-floor', 'risk', 'hardstops', 'integrity', 'queue-sweep', 'protect', 'vendor']) {
     assert.equal(LEASED_COMMANDS.has(name), false, name);
