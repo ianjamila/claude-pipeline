@@ -705,15 +705,17 @@ export function reviewPatch(from, to, o) {
   return { patch, skipped: names };
 }
 
-// `origin/<branch>` is what a PR will be merged into; a repo without that remote ref (a fresh clone of a local fixture,
-// a test) falls back to the local branch. Any other git failure is not swallowed.
+// `refs/remotes/origin/<branch>` is what a PR will be merged into; a repo without that remote ref (a fresh clone of a local fixture,
+// a test) falls back to `refs/heads/<branch>`. Both are returned FULLY QUALIFIED: git resolves an abbreviated `origin/<b>` (or a bare `<b>`) through refs/tags and refs/heads
+// first, so a PR that pushes a branch or a tag named `origin/main` would otherwise move the base every hash and fork point measures from (Fable F1, #448). Any other git failure
+// is not swallowed.
 export function reviewBaseRef(branch, o) {
-  const remote = `origin/${branch}`;
+  const remote = `refs/remotes/origin/${branch}`;
   try {
     revParse(remote, o);
     return remote;
   } catch (err) {
-    if (err instanceof GitError) return branch;
+    if (err instanceof GitError) return `refs/heads/${branch}`;
     throw err;
   }
 }
@@ -726,7 +728,7 @@ export function remoteDefaultBranch(o) {
   const m = /^refs\/remotes\/origin\/(.+)\n?$/.exec(out ?? '');
   if (!m) return null;
   try {
-    revParse(`origin/${m[1]}`, o);
+    revParse(`refs/remotes/origin/${m[1]}`, o);
     return m[1];
   } catch (err) {
     if (err instanceof GitError) return null;

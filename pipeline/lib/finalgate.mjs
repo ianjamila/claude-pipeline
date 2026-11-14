@@ -19,6 +19,7 @@ import { matchGlob } from './glob.mjs';
 import { blockingHits, collectHardStops, ownerMergeHits } from './hardstops.mjs';
 import { checkIntegrity } from './integrity.mjs';
 import { runPreflight } from './preflight.mjs';
+import { hashBranch, trustedDefaultBranch } from './risk.mjs';
 import { toPosix } from './paths.mjs';
 import { isDocPath } from './doc-paths.mjs';
 import { loadState } from './state.mjs';
@@ -146,23 +147,25 @@ function ciExplicitlyEmpty(root) {
 // ---- refs, hashes -------------------------------------------------------------------------------
 
 // `origin/<default>` when the remote ref exists (the PR's real base), else the local default branch.
-export const baseRefFor = (root, config) => reviewBaseRef(config.default_branch, { cwd: root });
+// `branch`: the trusted default branch (risk.mjs#trustedDefaultBranch), which the gate resolves once per run and passes down; omitted, it is worked out here.
+export const baseRefFor = (root, config, branch = hashBranch(root, config)) => reviewBaseRef(branch, { cwd: root });
 
 // The review's content hash for HEAD: the patch against the merge-base, minus the agent log the pipeline appends to.
 // Literally the review loop's hash: both call git.mjs#reviewContentHash.
-export const localContentHash = (root, config) =>
-  reviewContentHash({ branch: config.default_branch, agentLog: config.agent_log }, { cwd: root });
+export const localContentHash = (root, config, branch = hashBranch(root, config)) =>
+  reviewContentHash({ branch, agentLog: config.agent_log }, { cwd: root });
 
 // `explicit` ({ sha, branch }, --owner-go): scan merge-base(sha, HEAD)..HEAD for the base commit GitHub names (baseRefOid), never a local
 // ref. The commit must be a local object already (no fetch here, and no fallback to origin/<branch> or the local branch).
-export function lazyDiff(root, config, explicit = null) {
+// Without one, the diff starts at the trusted default branch (`branch`, else risk.mjs#hashBranch: read only when needed).
+export function lazyDiff(root, config, explicit = null, branch = null) {
   let cached = null;
   return () => {
     if (cached) return cached;
     try {
       const o = { cwd: root };
       if (explicit !== null) assertBaseObject(explicit, o);
-      const mb = mergeBase(explicit !== null ? explicit.sha : baseRefFor(root, config), 'HEAD', o);
+      const mb = mergeBase(explicit !== null ? explicit.sha : baseRefFor(root, config, branch ?? hashBranch(root, config)), 'HEAD', o);
       cached = { ok: true, mb, files: diffFiles(mb, 'HEAD', o) };
     } catch (err) {
       cached = { ok: false, error: String(err?.message ?? err) };
@@ -186,7 +189,24 @@ function assertBaseObject(explicit, o) {
 // ---- the checks ---------------------------------------------------------------------------------
 
 // `queueMode`: GitHub merges through its merge queue, which tests the PR on top of the base itself, so being behind is no problem.
-function prOpenCheck({ info, head, config, behind = null, queueMode = false }) {
+// The ONE default-branch answer of a gate run (#448): the trusted default branch (risk.mjs#trustedDefaultBranch, never the working-tree value a PR can edit), resolved once and
+// passed to every helper, plus GitHub's own answer for the cross-check in pr-open. No fetch here, for a real gate or a dry run: the hashes and the diff are measured from the ref as it is
+// (#417: a real gate that fetched first would scan a different range than the dry run that previews it). The branch NAME comes from origin/HEAD or `git ls-remote --symref origin HEAD`, which a
+// fetch of the branch does not change, so a fetch first would add nothing to the one-answer-per-run guarantee. The only fetch of a gate is the deferred step's, in baseProofSettings, of this same branch.
+// -> { tdb, branch, ghDefault: string | null }
+function resolveTrustedBranch({ root, config, gh }) {
+  const tdb = trustedDefaultBranch(root, config);
+  let ghDefault = null;
+  try {
+    const d = gh.repo()?.defaultBranch;
+    ghDefault = typeof d === 'string' && d !== '' ? d : null;
+  } catch { /* unreadable: pr-open fails closed */ }
+  return { tdb, branch: tdb.branch, ghDefault };
+}
+
+// `trusted` ({ tdb, branch, ghDefault }): resolveTrustedBranch's answer, which pr-open holds the PR's base and the local anchor against.
+function prOpenCheck({ info, head, config, behind = null, queueMode = false, trusted }) {
+  const { tdb, branch, ghDefault } = trusted;
   const problems = [];
   if (info.state !== 'OPEN') problems.push(`PR state is ${info.state}`);
   if (info.isDraft !== false) problems.push('PR is a draft');
@@ -195,9 +215,14 @@ function prOpenCheck({ info, head, config, behind = null, queueMode = false }) {
   if (info.headRefOid !== head) problems.push(`PR head ${short(info.headRefOid)} is not the local HEAD ${short(head)}`);
   // Branch protection is not strict (spec 6.6), so GitHub will merge a PR that is behind its base: that would land code on a
   // base nobody verified it against. The branch must be updated (and re-verified) first.
-  if (behind && !queueMode) problems.push(`behind-base: ${behind}; update the branch from ${config.default_branch} and re-verify before merging`);
+  if (behind && !queueMode) problems.push(`behind-base: ${behind}; update the branch from ${branch} and re-verify before merging`);
   // The hard-stop, integrity and review diffs are taken against the default branch; any other base would be judged on the wrong diff.
-  if (info.baseRefName !== config.default_branch) problems.push(`PR base is ${JSON.stringify(info.baseRefName)}, not ${config.default_branch}`);
+  if (info.baseRefName !== branch) problems.push(`PR base is ${JSON.stringify(info.baseRefName)}, not ${branch}`);
+  // The local answer must be GitHub's: an unanchored one (the working tree is its only source, and a PR can edit it), a stale origin/HEAD or a renamed / missing origin remote (the 'config' anchor)
+  // would otherwise judge the PR against a branch GitHub does not merge into. The pipeline supports only GitHub's default branch as its main (#430).
+  if (tdb.untrusted !== null) problems.push(`default branch not anchored: ${tdb.untrusted}`);
+  if (ghDefault === null) problems.push("could not read GitHub's default branch");
+  else if (ghDefault !== tdb.branch) problems.push(`the local default branch ${JSON.stringify(tdb.branch)} (${tdb.anchor}) is not GitHub's default ${JSON.stringify(ghDefault)}: fix with \`git remote set-head origin -a\` (or restore the origin remote)`);
   return problems.length ? check('pr-open', false, problems.join('; ')) : check('pr-open', true, `open at ${short(head)}`);
 }
 
@@ -206,13 +231,13 @@ function prOpenCheck({ info, head, config, behind = null, queueMode = false }) {
 // GitHub's own mergeStateStatus is the authority.
 // `baseSha` (--owner-go): the base tip is the commit GitHub names, not the local ref.
 // `queueMode`: never behind (the queue builds the PR on the current base before merging it).
-function behindBase({ info, diff, root, config, baseSha = null, queueMode = false }) {
+function behindBase({ info, diff, root, config, baseSha = null, queueMode = false, branch }) {
   if (queueMode) return null;
   if (info?.mergeStateStatus === 'BEHIND') return 'GitHub reports the PR is BEHIND its base (mergeStateStatus BEHIND)';
   const d = diff();
   if (!d.ok) return null; // the checks that need the diff report it themselves
   try {
-    const ref = baseSha ?? baseRefFor(root, config);
+    const ref = baseSha ?? baseRefFor(root, config, branch);
     const tip = baseSha ?? revParse(`${ref}^{commit}`, { cwd: root });
     if (tip !== d.mb) return `the base (${baseSha ? 'GitHub\'s base commit' : ref} at ${short(tip)}) is not an ancestor of HEAD; the branch forked from ${short(d.mb)}`;
   } catch { /* an unreadable ref was already reported by the diff */ }
@@ -258,9 +283,10 @@ const namedFiles = (list) => `${list.slice(0, NAMED_SHOWN).join(', ')}${list.len
 //   4. none of main's paths changes how the checks run (built-in list, the base's verify.ci_proof_inputs and merge.behind_base_stale_paths);
 //   4b. main did not remove a directory the PR adds into.
 // -> { ok: true, behindBy, mergeBase, mainFiles } or { ok: false, reason }. Never throws, never null: every doubt is a refusal.
-export function behindFreshEnough({ root, config, diff, baseSha, info }) {
+export function behindFreshEnough({ root, config, diff, baseSha, info, branch: given }) {
   const no = (reason) => ({ ok: false, reason });
   const o = { cwd: root };
+  const branch = given ?? hashBranch(root, config); // the trusted default branch, named in the reasons
   try {
     if (typeof baseSha !== 'string' || !FULL_SHA.test(baseSha)) return no('GitHub did not name the base commit (baseRefOid)');
     const settings = baseBehindSettings({ root, baseSha });
@@ -279,12 +305,12 @@ export function behindFreshEnough({ root, config, diff, baseSha, info }) {
     const prPaths = d.files.flatMap(pathsOf);
     const prFolded = new Set(prPaths.map(foldPath));
     const both = mainPaths.filter((p) => prFolded.has(foldPath(p)));
-    if (both.length > 0) return no(`${config.default_branch} changed ${both.length} file(s) this PR also touches (${namedFiles(both)})`);
+    if (both.length > 0) return no(`${branch} changed ${both.length} file(s) this PR also touches (${namedFiles(both)})`);
 
     const globs = [...CI_PROOF_PROTECTED, ...BEHIND_TOOLCHAIN, ...settings.inputs, ...settings.stale];
     for (const p of mainPaths) {
       const hit = globs.find((g) => matchGlob(p, g, { nocase: true }) || matchGlob(nfc(p), nfc(g), { nocase: true }));
-      if (hit !== undefined) return no(`${config.default_branch} changed ${p}, which changes how the checks run (matches ${hit})`);
+      if (hit !== undefined) return no(`${branch} changed ${p}, which changes how the checks run (matches ${hit})`);
     }
 
     // 4b: a path-level clash disjoint names cannot see (main moves src/foo/, the PR adds src/foo/new.js). Directories are compared folded,
@@ -305,12 +331,12 @@ export function behindFreshEnough({ root, config, diff, baseSha, info }) {
       const parts = f.newPath.split('/');
       for (let i = 1; i < parts.length; i += 1) {
         const dir = parts.slice(0, i).join('/');
-        if (removed.has(foldPath(dir))) return no(`${config.default_branch} removed ${dir}/, which this PR adds into (${f.newPath})`);
+        if (removed.has(foldPath(dir))) return no(`${branch} removed ${dir}/, which this PR adds into (${f.newPath})`);
       }
     }
     return { ok: true, behindBy, mergeBase: mb, mainFiles: mainPaths.length };
   } catch (err) {
-    return no(`could not compare ${config.default_branch}'s new commits with the PR: ${firstLine(err)}`);
+    return no(`could not compare ${branch}'s new commits with the PR: ${firstLine(err)}`);
   }
 }
 
@@ -342,27 +368,27 @@ const CI_PROOF_STATES = new Set(['pass', 'pending', 'failure', 'missing']);
 
 // The proof settings as the BASE branch has them (never the PR's own copy: a PR must not be able to grant itself a CI proof). Fetches
 // the base first; any failure to fetch, read or validate it is { ok: false, reason }, which the caller turns into ci-proof-missing.
-function baseProofSettings({ root, config }) {
+function baseProofSettings({ root, config, branch = hashBranch(root, config) }) {
   const o = { cwd: root };
-  const branch = config.default_branch;
-  const ref = `origin/${branch}`;
+  const ref = `refs/remotes/origin/${branch}`; // what git reads (fully qualified: a local branch or tag named origin/<b> cannot shadow it)
+  const shown = `origin/${branch}`; // what the reasons say
   try {
     git(['fetch', '--no-tags', 'origin', `+refs/heads/${branch}:refs/remotes/origin/${branch}`], { ...o, timeoutMs: NETWORK_TIMEOUT_MS });
   } catch (err) {
-    return { ok: false, reason: `could not fetch ${ref}: ${firstLine(err)}` };
+    return { ok: false, reason: `could not fetch ${shown}: ${firstLine(err)}` };
   }
   try {
     const text = showFile(ref, '.claude/pipeline.yml', o);
-    if (text === null) return { ok: false, reason: `${ref} has no .claude/pipeline.yml` };
+    if (text === null) return { ok: false, reason: `${shown} has no .claude/pipeline.yml` };
     const parsed = validateConfig(parseYaml(text));
-    if (!parsed.ok) return { ok: false, reason: `${ref}'s .claude/pipeline.yml is not a valid config: ${parsed.errors.slice(0, 2).join('; ')}` };
+    if (!parsed.ok) return { ok: false, reason: `${shown}'s .claude/pipeline.yml is not a valid config: ${parsed.errors.slice(0, 2).join('; ')}` };
     const v = parsed.config.verify;
     return {
-      ok: true, ref, branch, sha: revParse(`${ref}^{commit}`, o),
+      ok: true, ref, shown, branch, sha: revParse(`${ref}^{commit}`, o),
       deferrable: v.deferrable_steps ?? [], proof: v.ci_proof ?? {}, inputs: v.ci_proof_inputs ?? [],
     };
   } catch (err) {
-    return { ok: false, reason: `could not read the proof settings from ${ref}: ${firstLine(err)}` };
+    return { ok: false, reason: `could not read the proof settings from ${shown}: ${firstLine(err)}` };
   }
 }
 
@@ -371,7 +397,7 @@ function baseProofSettings({ root, config }) {
 // commit. The settings' ref AND sha are both that commit: the protected-input scan (diffFiles(ref, 'HEAD')) and the proof check's base
 // must never use a local origin/<base> that may be stale. The commit must also exist locally (the diff needs it): no fetching to get it.
 // Every failure is { ok: false, reason: 'proof-settings-unverified: …' }, never a silent pass.
-function baseProofSettingsReadOnly({ root, config, gh, baseSha }) {
+function baseProofSettingsReadOnly({ root, config, gh, baseSha, branch = hashBranch(root, config) }) {
   const o = { cwd: root };
   const unverified = (why) => ({ ok: false, reason: `proof-settings-unverified: ${why}` });
   if (typeof baseSha !== 'string' || !FULL_SHA.test(baseSha)) return unverified('GitHub did not name the base commit of the PR (baseRefOid)');
@@ -393,7 +419,7 @@ function baseProofSettingsReadOnly({ root, config, gh, baseSha }) {
     if (!parsed.ok) return unverified(`the base's .claude/pipeline.yml is not a valid config: ${parsed.errors.slice(0, 2).join('; ')}`);
     const v = parsed.config.verify;
     return {
-      ok: true, ref: baseSha, branch: config.default_branch, sha: baseSha,
+      ok: true, ref: baseSha, branch, sha: baseSha,
       deferrable: v.deferrable_steps ?? [], proof: v.ci_proof ?? {}, inputs: v.ci_proof_inputs ?? [],
     };
   } catch (err) {
@@ -418,9 +444,10 @@ async function proveDeferredStep({ step, ctx }) {
   try {
     const settings = ctx.settings();
     if (!settings.ok) return missing(settings.reason);
-    if (!settings.deferrable.includes(step)) return missing(`${settings.ref} does not list ${step} in verify.deferrable_steps`);
+    const shown = settings.shown ?? settings.ref;
+    if (!settings.deferrable.includes(step)) return missing(`${shown} does not list ${step} in verify.deferrable_steps`);
     const spec = Object.hasOwn(settings.proof, step) ? settings.proof[step] : undefined;
-    if (!isObject(spec)) return missing(`${settings.ref} has no verify.ci_proof entry for ${step}`);
+    if (!isObject(spec)) return missing(`${shown} has no verify.ci_proof entry for ${step}`);
     const hit = ctx.protectedHit();
     if (hit !== null) return missing(`this PR changes ${hit}, an input of the CI proof, so only a local run can vouch for ${step}`);
     const res = await ctx.ciProof({
@@ -458,7 +485,7 @@ function sameTreeAs(sha, o) {
 // cover .verify/ today). What backs it: a step deferred to CI is proved from GitHub (ciProof above), and branch protection requires
 // the CI checks on the merge itself.
 // readOnly (P merge --dry-run): the base's proof settings come from GitHub at baseSha, not from a fetch (baseProofSettingsReadOnly).
-export async function verifyReportCheck({ root, config, head, tree, o, pr, gh, env, ciProof, proofs = [], readOnly = false, baseSha = null }) {
+export async function verifyReportCheck({ root, config, head, tree, o, pr, gh, env, ciProof, proofs = [], readOnly = false, baseSha = null, branch = hashBranch(root, config) }) {
   let report;
   try {
     report = JSON.parse(readFileSync(resolve(root, config.verify.report), 'utf8'));
@@ -523,7 +550,7 @@ export async function verifyReportCheck({ root, config, head, tree, o, pr, gh, e
     let hit;
     const ctx = {
       root, pr, head, tree, gh, env, ciProof: ciProof ?? defaultCiProof,
-      settings: () => (settings ??= (readOnly ? baseProofSettingsReadOnly({ root, config, gh, baseSha }) : baseProofSettings({ root, config }))),
+      settings: () => (settings ??= (readOnly ? baseProofSettingsReadOnly({ root, config, gh, baseSha, branch }) : baseProofSettings({ root, config, branch }))),
       protectedHit: () => {
         if (hit === undefined) {
           try {
@@ -621,7 +648,7 @@ const OWNER_QUOTE_SHOWN = 100;
 
 // `repo`: the PR's repository (the gh repo). `ownerGo`: { home, now } for the owner's records, tests only (default: the account's own folder).
 // `floorOpts`: { env, dir, home } for reading the Fable floor registry (the owner's hold and exact-id allowances), tests only.
-export function reviewCheck({ root, config, pr, repo, diff, hash, hashError, ownerGo = {}, readOnly = false, floorOpts = {} }) {
+export function reviewCheck({ root, config, pr, repo, diff, hash, hashError, ownerGo = {}, readOnly = false, floorOpts = {}, branch }) {
   const d = diff();
   if (!d.ok) return check('review', false, `could not diff against the base: ${d.error}`);
   if (isLogOnly(d.files, config.agent_log)) return check('review', true, 'log-only');
@@ -634,7 +661,7 @@ export function reviewCheck({ root, config, pr, repo, diff, hash, hashError, own
   // helper review-complete uses. Verify/CI coverage of that head is judged by the other checks, as ever.
   let exempt = null;
   if (!reviewValidFor(state, hash)) {
-    const ex = docsExemptFrom(state, { root, config, hash });
+    const ex = docsExemptFrom(state, { root, config, hash, branch });
     if (!ex.exempt) {
       return check('review', false, `no clean review round covers the current content (${short(hash)}), or findings are unresolved${ex.off ? '' : `; the docs-only exemption does not apply: ${ex.reason}`}`);
     }
@@ -796,12 +823,14 @@ export async function evaluateGate({ root, config, pr, gh, env, sleep = defaultS
   const o = { cwd: root };
   const head = headSha(o);
   const info = await readPrSettled({ gh, pr, fields: readOnly ? [...PR_FIELDS, 'baseRefOid'] : [...PR_FIELDS], sleep, pauseMs: mergeablePause(env) });
-  const diff = lazyDiff(root, config);
+  const trusted = resolveTrustedBranch({ root, config, gh });
+  const { branch } = trusted;
+  const diff = lazyDiff(root, config, null, branch);
 
   let hash = '';
   let hashError = null;
   try {
-    hash = localContentHash(root, config);
+    hash = localContentHash(root, config, branch);
   } catch (err) {
     hashError = String(err?.message ?? err);
   }
@@ -819,13 +848,13 @@ export async function evaluateGate({ root, config, pr, gh, env, sleep = defaultS
 
   const proofs = [];
   const checks = [
-    await safely('pr-open', () => prOpenCheck({ info, head, config, behind: behindBase({ info, diff, root, config, queueMode }), queueMode })),
+    await safely('pr-open', () => prOpenCheck({ info, head, config, behind: behindBase({ info, diff, root, config, queueMode, branch }), queueMode, trusted })),
     await safely('labels', () => labelsCheck(info)),
     await safely('preflight', () => preflightCheck({ root, env, gh })),
-    await safely('verify-report', () => verifyReportCheck({ root, config, head, tree, o, pr, gh, env, ciProof, proofs, readOnly, baseSha: info?.baseRefOid ?? null })),
+    await safely('verify-report', () => verifyReportCheck({ root, config, head, tree, o, pr, gh, env, ciProof, proofs, readOnly, baseSha: info?.baseRefOid ?? null, branch })),
     await safely('hardstops', () => hardstopsCheck({ root, config, diff })),
     await safely('integrity', () => integrityCheck({ config, diff })),
-    await safely('review', () => reviewCheck({ root, config, pr, repo, diff, hash, hashError, readOnly, floorOpts: { env } })),
+    await safely('review', () => reviewCheck({ root, config, pr, repo, diff, hash, hashError, readOnly, floorOpts: { env }, branch })),
     await safely('ci', () => ciCheck({ gh, pr, head, diff, config, explicitEmpty: ciExplicitlyEmpty(root) })),
     ...(queueError === null ? [] : [queueStateCheck(queueError)]),
   ];
@@ -841,6 +870,7 @@ export async function evaluateGate({ root, config, pr, gh, env, sleep = defaultS
     head,
     tree,
     contentHash: hash,
+    trustedBranch: branch, // the default branch every check of this run measured from; merge.mjs's post-gate hash uses it too
     checks,
     // owner_approval: chat: items the owner merges in chat (0 = none, merge as usual). The review skill reads this.
     ownerMerge: checks.reduce((n, c) => n + (c.ownerMerge ?? 0), 0),
@@ -994,7 +1024,7 @@ const rulingsOf = (state) => {
   return { block, digest: rulingsDigest(state), blockDigest: rulingsBlockDigest(block), count: rulingsInventory(state).count };
 };
 
-export async function reviewCompletionCheck({ root, config, pr, gh, hash, sleep = defaultSleep, env }) {
+export async function reviewCompletionCheck({ root, config, pr, gh, hash, sleep = defaultSleep, env, branch }) {
   let sub = NO_SUBSTITUTE; // set once the local state is known: every result below (a refusal too) carries it, so the owner-go scan lists the item whatever else fails
   const fail = (detail, rulings = NO_RULINGS) => ({ ...check('review-complete', false, detail), rulings, substitute: sub });
   const RUN = `run \`pipeline review-complete --pr ${pr}\``;
@@ -1016,12 +1046,12 @@ export async function reviewCompletionCheck({ root, config, pr, gh, hash, sleep 
   let liveHash = hash;
   if (!liveHash) {
     try {
-      liveHash = localContentHash(root, config);
+      liveHash = localContentHash(root, config, branch);
     } catch (err) {
       return fail(`cannot compute the content hash: ${String(err?.message ?? err).slice(0, 160)}`, rulings);
     }
   }
-  if (!reviewValidFor(local, liveHash) && !docsExemptFrom(local, { root, config, hash: liveHash }).exempt) {
+  if (!reviewValidFor(local, liveHash) && !docsExemptFrom(local, { root, config, hash: liveHash, branch }).exempt) {
     return fail(`no clean review round covers the current content (${short(liveHash)}), or findings are unresolved: run another codex-review round, then ${RUN}`, rulings);
   }
   const mine = stateContentHash(local);
@@ -1059,10 +1089,12 @@ export async function reviewCompletionCheck({ root, config, pr, gh, hash, sleep 
 export async function evaluateOwnerGo({ root, config, pr, gh, env, sleep = defaultSleep, exemptHold = false, queueMode }) {
   const head = headSha({ cwd: root });
   const info = await readPrSettled({ gh, pr, fields: [...OWNER_GO_FIELDS], sleep, pauseMs: mergeablePause(env) });
+  const trusted = resolveTrustedBranch({ root, config, gh }); // the scan is bound to GitHub's base commit, never a local ref
   // The range is GitHub's: the PR's base commit and head, as read now. headRefOid must be the local HEAD (pr-open), baseRefOid a local object.
-  const explicit = { sha: info?.baseRefOid, branch: typeof info?.baseRefName === 'string' && info.baseRefName !== '' ? info.baseRefName : config.default_branch };
+  const explicit = { sha: info?.baseRefOid, branch: typeof info?.baseRefName === 'string' && info.baseRefName !== '' ? info.baseRefName : trusted.branch };
   const baseSha = typeof explicit.sha === 'string' && FULL_SHA.test(explicit.sha) ? explicit.sha : null;
-  const diff = lazyDiff(root, config, explicit);
+  const { branch } = trusted;
+  const diff = lazyDiff(root, config, explicit, branch);
   const hardstops = await safely('hardstops', () => hardstopsCheck({ root, config, diff }));
   const integrity = await safely('integrity', () => integrityCheck({ config, diff }));
   const items = [...(hardstops.ownerItems ?? []), ...(integrity.ownerItems ?? [])];
@@ -1071,7 +1103,7 @@ export async function evaluateOwnerGo({ root, config, pr, gh, env, sleep = defau
     // Measured from GitHub's base, as the scan is: after `update-branch` + `git pull --ff-only` the local origin/<branch> is older than the main that was
     // merged in, so a hash measured from it would include main's commits and differ from the marker's. (Dry runs fetch nothing, so a refresh is no answer here.)
     const hash = baseSha ? reviewContentHash({ branch: explicit.branch, agentLog: config.agent_log, baseSha }, { cwd: root }) : undefined;
-    completion = await reviewCompletionCheck({ root, config, pr, gh, hash, sleep, env });
+    completion = await reviewCompletionCheck({ root, config, pr, gh, hash, sleep, env, branch });
   } catch (err) {
     completion = { ...check('review-complete', false, `could not evaluate: ${String(err?.message ?? err)}`), rulings: NO_RULINGS, substitute: NO_SUBSTITUTE };
   }
@@ -1080,7 +1112,7 @@ export async function evaluateOwnerGo({ root, config, pr, gh, env, sleep = defau
   // Behind its base: refused as always, unless the BASE's merge.behind_base is "disjoint" and main's new commits are fresh enough (behindFreshEnough).
   let behind = null;
   let queueError = null;
-  let behindReason = behindBase({ info, diff, root, config, baseSha, queueMode: queueMode === true });
+  let behindReason = behindBase({ info, diff, root, config, baseSha, queueMode: queueMode === true, branch });
   if (behindReason !== null && queueMode === undefined) {
     try {
       if (queueModeFor({ gh, pr }).queue) behindReason = null;
@@ -1090,7 +1122,7 @@ export async function evaluateOwnerGo({ root, config, pr, gh, env, sleep = defau
     }
   }
   if (behindReason !== null) {
-    const fresh = behindFreshEnough({ root, config, diff, baseSha, info });
+    const fresh = behindFreshEnough({ root, config, diff, baseSha, info, branch });
     if (fresh.ok) {
       behind = { behindBy: fresh.behindBy, mergeBase: fresh.mergeBase, baseRefOid: baseSha, mainFiles: fresh.mainFiles, rule: 'disjoint' };
       behindReason = null;
@@ -1099,7 +1131,7 @@ export async function evaluateOwnerGo({ root, config, pr, gh, env, sleep = defau
     }
   }
   const checks = [
-    await safely('pr-open', () => prOpenCheck({ info, head, config, behind: behindReason, queueMode: queueMode === true })),
+    await safely('pr-open', () => prOpenCheck({ info, head, config, behind: behindReason, queueMode: queueMode === true, trusted })),
     await safely('labels', () => labelsCheck(info, { exemptHold })),
     await safely('ci', () => ciCheck({ gh, pr, head, diff, config, explicitEmpty: ciExplicitlyEmpty(root) })),
     await safely('scan-range', () => scanRangeCheck({ root, gh, pr, diff, info, explicit })),

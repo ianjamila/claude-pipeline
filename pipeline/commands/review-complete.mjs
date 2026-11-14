@@ -15,7 +15,7 @@ import { git, headSha, isAncestor, mergeBase, revParse } from '../lib/git.mjs';
 import { behindFreshEnough, lazyDiff } from '../lib/finalgate.mjs';
 import { QueueUnreadable, queueModeFor } from '../lib/merge-queue.mjs';
 import { createGitHub, guardGh } from '../lib/github.mjs';
-import { assessRisk, prBaseBranch, rateBranch, reviewLane } from '../lib/risk.mjs';
+import { assessRisk, hashBranch, prBaseBranch, rateBranch, reviewLane } from '../lib/risk.mjs';
 import { routeConfigFor } from '../lib/review-round.mjs';
 import { isSubstituteRound, loadState } from '../lib/state.mjs';
 import { readReviewGate } from '../lib/model-floor.mjs';
@@ -25,14 +25,14 @@ import { verifyOwnerGrants } from '../lib/owner-grants.mjs';
 import { docsExemptFrom } from '../lib/docs-exempt.mjs';
 import { REVIEW_COMPLETE_MARKER } from '../lib/review-marker.mjs';
 import { closingKeywordProblem, multiIssueClosingLines } from '../lib/closing-keywords.mjs';
-import { currentContentHash, refreshBaseRef, refreshTrustedDefault, reviewBaseRef, withReviewLock } from '../lib/review-context.mjs';
+import { currentContentHash, refreshBaseRef, reviewBaseRef, withReviewLock } from '../lib/review-context.mjs';
 import { publishTriage, readPublished, reviewContentHash } from '../lib/review-publish.mjs';
 
 export const meta = {
   summary: 'post the review-complete comment (and remove awaiting-review) once the review is valid for the current content',
   usage: [
     'pipeline review-complete --pr N [--repo DIR]   -> exit 0 {ok:true, posted|reused, comment:{id, url}, review, removed, recheck, recheckError?, warnings?}; exit 1 {ok:false, reason} when the review is not valid',
-    '  origin/<default_branch> (and the remote\'s own default branch when that is another one: the trusted fork point of the model and lanes) is fetched first (best effort: offline keeps the cached ref, and a coverage refusal then says it could not be refreshed), so a PR updated',
+    '  the trusted default branch (GitHub\'s default) as origin/<branch> is fetched first (best effort: offline keeps the cached ref, and a coverage refusal then says it could not be refreshed), so a PR updated',
     '  from its base branch and pulled is judged against the main that was merged in',
     '  after the validity checks it also refuses (exit 1) while a Claude-ruled follow-up has no issue or a fix made outside the file the finding names is not yet',
     '  confirmed by a later round, and (exit 1 {error:closing-keywords}) a PR body that lists several issues after one closing keyword ("Closes #1, #2" closes only #1),',
@@ -52,9 +52,9 @@ export const meta = {
     '  when a proven Fable round counts as current only because of the owner\'s allowance (model-floor reset --allow-id, an id the parser cannot read) or a hold below MIN_FABLE, the comment gets one line',
     '  "Standing Fable bypass: Fable round 3 counted via owner allowance <id>" (or "... via owner hold <id> (below <MIN_FABLE>)"), the output carries fableBypass:{note, rounds:[{round, via, id}]},',
     '  and the final gate\'s review check detail carries the same note',
-    '  a DRAFT whose head lacks commits of origin/<default_branch> is refused last, before anything is published or posted (labels stay): exit 1 {ok:false, reason:\'behind-base\', error:\'behind-base\', base, behindBy, detail (why the check refused it: the helper\'s reason), remedy},',
+    '  a DRAFT whose head lacks commits of the trusted default branch (GitHub\'s default) is refused last, before anything is published or posted (labels stay): exit 1 {ok:false, reason:\'behind-base\', error:\'behind-base\', base, behindBy, detail (why the check refused it: the helper\'s reason), remedy},',
     '  so the review skill catches it up BEFORE `gh pr ready` and CI runs once, on current main: the remedy is `pipeline update-branch --pr N`, `git pull --ff-only`, the next codex-review round (only main was merged in: baseOnly, Codex does not run,',
-    '  nothing is counted), then review-complete again. merge.behind_base: update = behind when origin/<default_branch> is not an ancestor of HEAD; disjoint = behind only when the merge would refuse it too (the same check as `merge --owner-go`; a `mergeable` GitHub has not computed yet, UNKNOWN, is not a conflict: if everything else passes, the draft posts with a warning).',
+    '  nothing is counted), then review-complete again. merge.behind_base: update = behind when the trusted default branch (GitHub\'s default) is not an ancestor of HEAD; disjoint = behind only when the merge would refuse it too (the same check as `merge --owner-go`; a `mergeable` GitHub has not computed yet, UNKNOWN, is not a conflict: if everything else passes, the draft posts with a warning).',
     '  A ready PR is never refused for this; the check is skipped with a `warnings` entry when the base ref could not be refreshed (offline), the base has a merge queue (or it cannot be read), or the ancestry cannot be read',
   ].join('\n'),
 };
@@ -161,19 +161,19 @@ export function reviewCompleteBody(record, docsExempt = null, fableNote = null) 
 
 const oneLine = (err) => String(err?.message ?? err).split('\n')[0].slice(0, 200);
 
-// A DRAFT that lacks commits of origin/<default_branch> is caught up BEFORE it is marked ready, so its required CI runs once, on current main (the
+// A DRAFT that lacks commits of the trusted default branch (GitHub's default) is caught up BEFORE it is marked ready, so its required CI runs once, on current main (the
 // merge dry run sees behind-base only after CI, and the catch-up then costs a second full run). A ready PR is never judged here: the merge flow handles it.
 // -> { refusal } (the output of the exit-1 refusal) | { warning } (the check could not be made: offline refresh, a merge queue, an unreadable queue or
 // ancestry; never a block) | {} (not a draft, or not behind). merge.behind_base: 'update' = behind when origin/<branch> is not an ancestor of HEAD;
 // 'disjoint' = behind only when the merge path would refuse it too (finalgate.behindFreshEnough, which reads the mode from the BASE commit's config).
-function draftBehindBase({ root, config, gh, pr, view, refresh }) {
+export function draftBehindBase({ root, config, gh, pr, view, refresh }) {
   if (view.isDraft !== true) return {};
-  const branch = config.default_branch;
+  const branch = hashBranch(root, config); // the trusted default branch (risk.mjs#trustedDefaultBranch), never the working-tree value a PR can edit
   if (!refresh.refreshed) return { warning: `behind-base check skipped: origin/${branch} could not be refreshed (${refresh.reason ?? 'fetch failed'})` };
   const o = { cwd: root };
   let baseSha;
   try {
-    baseSha = revParse(`origin/${branch}^{commit}`, o);
+    baseSha = revParse(`refs/remotes/origin/${branch}^{commit}`, o);
     if (isAncestor(baseSha, 'HEAD', o)) return {};
   } catch (err) {
     return { warning: `behind-base check skipped: could not compare HEAD with origin/${branch} (${oneLine(err)})` };
@@ -190,7 +190,7 @@ function draftBehindBase({ root, config, gh, pr, view, refresh }) {
   // checks (mode, overlapping files, toolchain paths) still refuse as usual. Only CONFLICTING is a real answer.
   const known = view.mergeable === 'MERGEABLE' || view.mergeable === 'CONFLICTING';
   const fresh = behindFreshEnough({
-    root, config, diff: lazyDiff(root, config, { sha: baseSha, branch }), baseSha,
+    root, config, diff: lazyDiff(root, config, { sha: baseSha, branch }, branch), baseSha, branch,
     info: { mergeStateStatus: 'CLEAN', mergeable: known ? view.mergeable : 'MERGEABLE' },
   });
   if (fresh.ok) {
@@ -238,10 +238,9 @@ export const run = guarded(async (argv, ctx) => {
           output: { ok: false, reason: `local HEAD ${local} is not the head of PR #${pr} on GitHub (${remote ?? 'unknown'}): push or pull first`, localHead: local, prHead: remote ?? null },
         };
       }
-      // The hash is measured from origin/<default_branch>; after `update-branch` + `git pull --ff-only` that ref is older than the main that
+      // The hash is measured from the trusted default branch's origin/<branch> (GitHub's default); after `update-branch` + `git pull --ff-only` that ref is older than the main that
       // was merged in, so refresh it first (best effort: offline keeps the cached ref and the round's own hash is what it is compared to).
       const refresh = refreshBaseRef(root, config);
-      refreshTrustedDefault(root, config, { except: config.default_branch }); // the trusted fork point (model, lanes) is measured from the remote's default branch, which can be another one
       const hash = currentContentHash(root, config);
       // The review is valid for the content as it is, or (review.docs_exempt_paths) the content is the reviewed one plus lines added to
       // listed documents. The same helper decides it in the final gate; everything below (grants, Fable, the lane) runs either way.
@@ -253,7 +252,7 @@ export const run = guarded(async (argv, ctx) => {
           const note = ex && !ex.off ? `; the docs-only exemption does not apply: ${ex.reason}` : '';
           // A stale origin/<branch> is the one cause a person cannot see: say that the ref could not be refreshed.
           const stale = !refresh.refreshed && refresh.usesRemoteRef && why.startsWith('no review round covers')
-            ? ` (origin/${config.default_branch} could not be refreshed: ${refresh.reason})` : '';
+            ? ` (origin/${hashBranch(root, config)} could not be refreshed: ${refresh.reason})` : '';
           return { exitCode: EXIT.FAILED, output: { ok: false, reason: `${why}${stale}${note}`, currentContentHash: hash } };
         }
         docsExempt = ex;
