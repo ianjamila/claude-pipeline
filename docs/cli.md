@@ -800,6 +800,11 @@ pipeline state outcome [--repo DIR]   -> roundOutcome + {clean, arbiterFailures,
   grantedRound {k, grantId, head, quote}: the owner's open extra-round grant for the next counted round and the checked-out HEAD (chat mode, an owner
   record younger than 24 h, not yet used) - it lifts reachedMax and effectiveMaxRounds by one; null otherwise. autoExtraOrdinal: the counted round the
   automatic extra round took, or null
+pipeline state fix-scope --round R [--head HEAD] [--repo DIR]
+  -> {ok, round, from, head, fixScope: {nonTestLines, newFiles, newExports, limit, flagged, reasons}, flagged, reasons, advisory, warnings}: what the fix commits since round R (R's reviewed head .. HEAD, or --head) add, read-only and
+     never stored. flagged = more non-test added lines than the smaller review.fix_round_max_lines of the working-tree and fork-point configs, or a new non-test SOURCE file (not a document / review.docs_exempt_paths file);
+     a file counts as a test only when the working-tree, fork-point and trusted configs ALL classify it so (a renamed file is new unless both paths are tests). New exports are advisory text only.
+     The review skill runs it before the push and asks the owner (own PR / plan first / push as is) when flagged; it is a prompt, never a gate. Exit 2 {error: no-round | not-descendant | bad-head}
 pipeline state mark-implemented --ids a,b [--repo DIR]
   -> exit 2 {error:no-code-change} unless the branch content differs from what the accepting round reviewed
      and a non-test file changed since (a test file counts for a testing finding or the finding's own file)
