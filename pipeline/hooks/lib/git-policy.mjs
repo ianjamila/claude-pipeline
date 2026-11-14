@@ -2836,6 +2836,15 @@ function evalString(str, startDir, ctx, level, child = false) {
     return after >= 1 ? cmds.indexOf(shapeTop.top[after - 1]) : -1; // (the exit is the construct's last command; a substitution of the command after it is listed after the exit)
   };
   const exitsAsGroup = (i) => exitOfGroup(i) >= 0;
+  // #481: the command `n` places after cmds[i] at the text's own level. The parser lists the commands of a `$( )` before the command that holds them, so cmds[i + 1] can be a substitution's
+  // inner command (`cd d || echo "$(pwd)"; git push`): the next command is read from the top-level list. (A command inside a substitution itself keeps the flat reading.)
+  let topIdx; // (command -> its index in the text's own level, built when first asked)
+  const nextAt = (i, n) => {
+    if (cmds[i].depth > 0) return cmds[i + n];
+    if (!topIdx) { topIdx = new Map(); for (const c of cmds) if (!(c.depth > 0)) topIdx.set(c, topIdx.size); }
+    shapeTop ??= { top: cmds.filter((c) => !(c.depth > 0)), evAt: cmds.shape ? shapeAt(cmds.shape) : null };
+    return shapeTop.top[topIdx.get(cmds[i]) + n];
+  };
   // Truncated means part of the line was never looked at, so nothing on it can be called harmless (`g''it push` after
   // 500 `true;` must not slip through on a word match).
   if (cmds.undecidable) return deny(UNDECIDABLE_HEREDOC);
@@ -2892,6 +2901,16 @@ function evalString(str, startDir, ctx, level, child = false) {
   // #478 R1-B1: the commands of a failure group `cd X || { …; exit 1; }` run only when the cd (or a git checkout / switch) FAILED, in the old directory on the old branch, so they are walked with the state unknown
   // (`to`: the index of the group's exit; `snap`: the state the cd / checkout left, put back for the commands after the group unless `doubt`: the cd / checkout itself may not have run)
   let failGroup = null;
+  const restoreAfterGroup = () => {
+    dir = failGroup.snap.dir;
+    // (#478 R2-F1: when the cd / checkout was itself uncertain, the snapshot is an optimistic state: forgotten, not put back; R2-B1: an entry first made in the group is not in the snapshot: unknown)
+    if (failGroup.doubt) forgetState();
+    else {
+      const was = new Map(failGroup.snap.names);
+      for (const [k, e] of ctx.branches) e.name = was.has(k) ? was.get(k) : null;
+    }
+    failGroup = null;
+  };
   let chdirBase; // (the list's own directory while one command runs in its wrapper's -C / --chdir directory)
   try {
   for (const [i, c] of cmds.entries()) {
@@ -2900,16 +2919,7 @@ function evalString(str, startDir, ctx, level, child = false) {
     if (failGroup && failGroup.snap === null) {
       failGroup.snap = { dir, names: [...ctx.branches.entries()].map(([k, e]) => [k, e.name]) };
       forgetState();
-    } else if (failGroup && i > failGroup.to) {
-      dir = failGroup.snap.dir;
-      // (#478 R2-F1: when the cd / checkout was itself uncertain, the snapshot is an optimistic state: forgotten, not put back; R2-B1: an entry first made in the group is not in the snapshot: unknown)
-      if (failGroup.doubt) forgetState();
-      else {
-        const was = new Map(failGroup.snap.names);
-        for (const [k, e] of ctx.branches) e.name = was.has(k) ? was.get(k) : null;
-      }
-      failGroup = null;
-    }
+    } else if (failGroup && i > failGroup.to) restoreAfterGroup();
     const argv = c.argv;
     if (subs) {
       // Why: a cd inside a subshell ($( ), ( ), backticks, <( )) moves that subshell only: when it ends, the line goes on in the directory it had when the subshell
@@ -2938,11 +2948,13 @@ function evalString(str, startDir, ctx, level, child = false) {
       // `cd d || exit`: when the cd fails nothing after it runs, so the commands that do run see the change
       // (#427, the same rule as the files guard's cd narrowing: only a plain `exit`, alone or with one number, leaves: not `return` (an error at top level), not an exit with a redirection or extra words, and no
       // redirection on the closer of its group, `{ exit 1; } < f`, which the parser lists as a command of no words right after it)
-      const orExits = cmds[i + 1]?.sep === '||' && plainExit(cmds[i + 1]) && cmds[i + 2]?.sep !== '|' && cmds[i + 2]?.sep !== '&'
-        && !(cmds[i + 2] !== undefined && cmds[i + 2].argv.length === 0 && (cmds[i + 2].redirects ?? []).length > 0)
+      const next = nextAt(i, 1);
+      const after = nextAt(i, 2);
+      const orExits = next?.sep === '||' && plainExit(next) && after?.sep !== '|' && after?.sep !== '&'
+        && !(after !== undefined && after.argv.length === 0 && (after.redirects ?? []).length > 0)
         || (changesState && exitsAsGroup(i));
-      if (changesState && !failGroup && exitsAsGroup(i)) failGroup = { to: exitOfGroup(i), snap: null, doubt: false };
-      if (changesState && (inFlow(from, i) || c.depth > 0 || c.sep === '&&' || c.sep === '||' || ranInSubshell(cmds, i) || (cmds[i + 1]?.sep === '||' && !orExits))) uncertain = true;
+      if (changesState && !failGroup && exitsAsGroup(i)) failGroup = { to: exitOfGroup(i), snap: null, doubt: false, from: i, byDir: DIR_CHANGERS.includes(nm) };
+      if (changesState && (inFlow(from, i) || c.depth > 0 || c.sep === '&&' || c.sep === '||' || ranInSubshell(cmds, i) || (next?.sep === '||' && !orExits))) uncertain = true;
       if (failGroup && failGroup.snap === null) failGroup.doubt = uncertain; // (the doubt about this cd / checkout, carried or new: it is consumed inside the group)
     }
     // (Phase 3b, Fable attacker pass: `env -C D gh pr merge …` / `sudo -D D …` run the command in D, which the merge check never saw from a
@@ -3059,6 +3071,9 @@ function evalString(str, startDir, ctx, level, child = false) {
       if (unsure !== null) return deny(`$${unsure} may be reassigned by the file ${name === '.' ? '.' : 'source'} runs, so its value at run time cannot be verified. Use it before sourcing, or write the value out.`);
     }
   }
+  // #482: a group whose exit ends the text is restored here too (ctx.branches is shared with the caller of a nested text: it must not keep every branch name forgotten)
+  // (#491 R1: only a group opened by a directory change, with no git state change inside it: after a checkout that may have failed, or a switch made where the directory is unknown, the caller's branch is not known)
+  if (failGroup?.snap && failGroup.byDir && !cmds.slice(failGroup.from + 1, failGroup.to + 1).some((g) => baseName(g.argv[0] ?? '') === 'git' && g.argv.some((w) => STATE_GIT.has(w)) && !g.argv.some((w) => w === '--show-current' || w === '--list' || w === '-l'))) restoreAfterGroup();
   return allowed();
   } finally {
     // what the list wrote is still true for the commands after the one that ran it
