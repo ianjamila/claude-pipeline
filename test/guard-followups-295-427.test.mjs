@@ -120,6 +120,13 @@ describe('#298: python -m json.tool is judged like the option tools (a run-time 
     ['a name the line does not set', `python3 -m json.tool ${S} "$X"`],
     ['a same-line name with a value of two words', `F='/tmp/in.json /tmp/o.json'; python3 -m json.tool ${S} $F`],
     ['a same-line name with one value, second operand', `F=/tmp/o.json; python3 -m json.tool ${S} $F`],
+    ['R1-B1: the module held in a name, then a substitution that prints two words', `M=json.tool; python3 -m $M $(printf '%s %s' /tmp/in.json ${S})`],
+    ['R1-B1: the same, the name quoted', `M=json.tool; python3 -m "$M" $(printf '%s %s' /tmp/in.json ${S})`],
+    ['R1-B1: the module in a name, a protected second operand', `M=json.tool; python3 -m "$M" /tmp/in.json ${S}`],
+  ]);
+  decide('allow', [
+    ['R1-B1: the module held in a name, one operand', `M=json.tool; python3 -m "$M" ${S}`],
+    ['R1-B1: the module held in a name, read from a pipe', `M=json.tool; cat ${S} | python3 -m $M`],
   ]);
 });
 

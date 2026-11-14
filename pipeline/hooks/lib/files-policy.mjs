@@ -2331,7 +2331,8 @@ function judgedWords(name, args, ctx) {
   if (!args.some((a) => RUNTIME_PART.test(a))) return { args, unknown: false };
   const touched = (n) => Object.hasOwn(ctx.vars ?? {}, n) || ctx.unknownVars?.has(n) || ctx.pickUnknown?.has(n) || ctx.srcChanged?.has(n) || ctx.srcTouched?.has(n) || ctx.unknownAll === true;
   // #298: `python -m json.tool IN [OUT]` writes its second operand, so how many operands the words make is what judges it: it is read like an option tool (no run-time word, the split reading of an expanded word)
-  const optionLike = OPTION_TOOLS.has(name) || (/^python3?$/.test(name) && args[0] === '-m' && args[1] === 'json.tool');
+  // (R1-B1: the module word is read as expanded: `M=json.tool; python3 -m "$M" $(…)` is the same call as the literal one)
+  const optionLike = OPTION_TOOLS.has(name) || (/^python3?$/.test(name) && args[0] === '-m' && args.length > 1 && (RUNTIME_PART.test(args[1]) ? expandRefs(args[1], ctx) : args[1]) === 'json.tool');
   const tool = optionLike || PROGRAM_TOOLS.has(name);
   let unknown = false;
   const words = [];
