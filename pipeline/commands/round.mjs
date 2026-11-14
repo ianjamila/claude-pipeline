@@ -162,6 +162,14 @@ async function holdAt(varName, ctx) {
   while (!existsSync(file) && Date.now() < end) await new Promise((resolve) => setTimeout(resolve, 50));
 }
 
+// Round R of the state when it is recorded at the range of the job tag (pr:round:base:head): "of this job" is the recorded base:head. A round that was
+// discarded and recorded again (or recorded another way) carries another range, and then the job's output and result are not about it. -> the round record or undefined.
+function roundOfJob(tag, state, pr, round) {
+  const recorded = state?.pr === pr ? state.rounds.find((r) => r.n === round) : undefined;
+  const parts = String(tag ?? '').split(':');
+  return recorded !== undefined && parts.length === 4 && parts[2] === recorded.fromHead && parts[3] === recorded.toHead ? recorded : undefined;
+}
+
 const fullSha = (ref, root) => revParse(`${ref}^{commit}`, { cwd: root });
 
 async function roundCodex(rest, ctx) {
@@ -187,10 +195,7 @@ async function roundCodex(rest, ctx) {
   if (recorded) {
     // The round is in the state: only a finished or running job of THIS round is picked up (a rerun after the waiter was lost); nothing is started.
     // "Of this round" is the recorded range: a job left by a round that was discarded and run again (or recorded another way) carries another base:head.
-    const recordedRound = before.rounds.find((r) => r.n === round);
-    const tagParts = String(existing.tag ?? '').split(':');
-    const sameRange = tagParts.length === 4 && tagParts[2] === recordedRound.fromHead && tagParts[3] === recordedRound.toHead;
-    if (!['running', 'done'].includes(existing.state) || !String(existing.tag ?? '').startsWith(prefix) || !sameRange) {
+    if (!['running', 'done'].includes(existing.state) || !String(existing.tag ?? '').startsWith(prefix) || roundOfJob(existing.tag, before, pr, round) === undefined) {
       throw identityMismatch(`round ${round} is already recorded in the review state and no job ${name} of this round (base:head as recorded) is there to pick up: nothing was run`);
     }
     for (const [flag, at] of [['base', 2], ['head', 3]]) {
@@ -284,9 +289,7 @@ async function finish({ root, ctx, pr, round, snap, jobInfo }) {
     // A failed job does not record a round: a recorded round R was recorded another way (the substitute path), so the state answers, not the failure.
     const recordedState = readState(root);
     // Only when it is recorded at THIS job's range (the tag's base:head): a round another writer recorded at another head meanwhile is not this job's result.
-    const tagParts = String(snap.tag ?? '').split(':');
-    const recordedRound = recordedState?.pr === pr ? recordedState.rounds.find((r) => r.n === round) : undefined;
-    if (recordedRound !== undefined && tagParts.length === 4 && tagParts[2] === recordedRound.fromHead && tagParts[3] === recordedRound.toHead) {
+    if (roundOfJob(snap.tag, recordedState, pr, round) !== undefined) {
       return finishFromState({ root, ctx, pr, round, state: recordedState, report: reportFromState(root, recordedState, round) });
     }
     if (json === null) {
@@ -301,6 +304,10 @@ async function finish({ root, ctx, pr, round, snap, jobInfo }) {
   // Exit 0. Phase 3: the round must be in this PR's state (fail closed); then report from the job's output, else from the state.
   const { state } = checkIdentity(root, pr, round, { mayBeRecorded: true });
   const inState = state?.rounds.some((r) => r.n === round) === true;
+  // The state may have changed during the wait: round R discarded and recorded again at another range is not this job's round.
+  if (inState && roundOfJob(snap.tag, state, pr, round) === undefined) {
+    throw identityMismatch(`round ${round} is recorded in the review state at another base:head than job ${jobInfo.name} (tag ${snap.tag}): its output and the recorded round are not the same round; nothing was reported`, { job: jobInfo, next: `state show --pr ${pr}` });
+  }
   let report;
   if (json !== null && json.ok === true && json.counts !== undefined) {
     if (!inState) throw identityMismatch(`the job reports round ${round} recorded, but the review state does not hold it: run \`state show --pr ${pr}\``, { job: jobInfo });

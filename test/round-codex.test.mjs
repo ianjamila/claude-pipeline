@@ -304,6 +304,31 @@ test('a failed job (head-moved for head A) while another writer recorded round R
   assert.equal(w.state().rounds[0].arbiter, undefined, 'arbiter needed did not run: the round has no arbiter input');
 });
 
+test('a job that exits 0 for head A while round R was discarded and recorded at head B during the wait: identity-mismatch, nothing reported, arbiter needed NOT called', { skip: process.platform === 'win32' }, async (t) => {
+  const w = roundWorld(t, { max: 3, yml: 'risk:\n  high_risk_paths: ["src/a.js"]\n' });
+  const emit = emitter(w);
+  const okJson = JSON.stringify({ ok: true, counts: { blocking: 0, suggestions: 1, worth_considering: 0 }, reviewer: 'judge', codexPath: 'x/round-1' });
+  startJob(w, tagOf(w, w.base, w.head), emit(0, okJson, 3000));
+  const hold = join(w.scratch, 'hold');
+  const run = startRound(w, ['--base', w.base, '--head', w.head], { PIPELINE_ROUND_HOLD_BEFORE_WAIT: hold });
+  await untilExists(`${hold}.reached`);
+  assertExit(w.codex(1, findingsOf([], [low()])), 0); // the job's round, recorded another way at head A ...
+  assertExit(w.cli(['state', 'discard-round', '--round', '1', '--pr', '7']), 0); // ... discarded (the job's directory stays) ...
+  w.repo.write('src/fix.js', 'export const fix = 1;\n');
+  const h2 = w.repo.commit('fix');
+  w.prHead(h2);
+  assertExit(w.codex(1, findingsOf([], [low()]), { from: w.base, to: h2 }), 0); // ... and recorded again at head B
+  writeFileSync(hold, 'go\n');
+  const r = await run.done;
+  assert.equal(r.code, 1, r.out);
+  assert.equal(r.json.error, 'identity-mismatch');
+  assert.match(r.json.next, /state show/);
+  assert.equal('codex' in r.json, false, 'the job output was not reported');
+  assert.equal('arbiter' in r.json, false);
+  assert.equal(w.state().rounds[0].arbiter, undefined, 'arbiter needed did not run: the round has no arbiter input');
+  assert.equal(w.state().rounds[0].toHead, h2);
+});
+
 test('a failed arbiter needed is ok:false, step arbiter-needed, the child\'s error and JSON as result, the child\'s exit code', (t) => {
   const w = roundWorld(t, { max: 3, yml: 'risk:\n  high_risk_paths: ["src/a.js"]\n' });
   const cc = join(w.scratch, 'claude-code-2.1.322');
