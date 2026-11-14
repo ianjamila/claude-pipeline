@@ -267,6 +267,7 @@ test('the virtual clock advances per call, and a clock past the deadline is refu
   const late = (() => { let n = 0; return () => (n++ === 0 ? 0 : EVAL_DEADLINE_MS + 1); })(); // (the budget reads it once for its deadline, then it is past it)
   const r = files('bash F1.sh', fakeFs(PROJ, chain(true, 3, 'w1 w2 w3 w4 w5 w6 w7 w8')), { now: late });
   assert.equal(r.decision, 'deny');
+  assert.match(r.reason, /took too long/, r.reason); // (the deadline's own reason)
   assert.doesNotMatch(r.reason, /too many readings/, r.reason);
 });
 test('three nested scripts that each assign four names twice and loop over eight words are refused at once, not at the deadline', () => {
