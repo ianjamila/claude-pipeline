@@ -74,6 +74,37 @@ test('summary: upserts the marker comment from the state and prints the agent-lo
   assert.match(body, /\*\*merged\*\*/);
 });
 
+test('summary: the agent-log line ends with the weekly Codex figure (7 days, every repo); codexUsage is in the JSON; the pending line carries it too', () => {
+  const repo = createTmpRepo();
+  repo.write('.claude/pipeline.yml', pipelineYml());
+  repo.write('.gitignore', '.review/\n');
+  repo.commit('init');
+  saveState(repo.dir, summaryState());
+  const ledger = join(mkdtempSync(join(tmpdir(), 'cp-usage-')), 'codex-usage.jsonl');
+  const ago = (days) => new Date(Date.now() - days * 24 * 3600 * 1000).toISOString();
+  const entry = (days, effort, over = {}) => JSON.stringify({ v: 1, ts: ago(days), repo: 'acme/other', pr: 3, round: 1, effort, model: 'm', ok: true, ...over });
+  const env = { PIPELINE_CODEX_USAGE_FILE: ledger };
+  const run = () => cli(['summary', '--pr', String(PR), '--outcome', 'merged'], { dir: repo.dir, fake: summaryGh(), env });
+
+  const none = run();
+  assertExit(none, 0);
+  assert.match(none.json.agentLogLine, /· merged$/, 'no ledger, no figure');
+  assert.deepEqual(none.json.codexUsage, { runs: 0, high: 0, xhigh: 0, failed: 0 });
+
+  writeFileSync(ledger, `${[entry(8, 'high'), entry(1, 'high'), entry(2, 'high', { ok: false }), entry(3, 'medium')].join('\n')}\nnot json\n`);
+  const some = run();
+  assertExit(some, 0);
+  assert.match(some.json.agentLogLine, / · merged · Codex 7d: 3 runs \(2 high\)$/, 'the 8-day-old run and the bad line are not counted; no xhigh text when none');
+  assert.deepEqual(some.json.codexUsage, { runs: 3, high: 2, xhigh: 0, failed: 1 });
+  assert.equal(some.json.pendingLogLine, some.json.agentLogLine.replace(' · merged · Codex', ' · merged — prod smoke pending · Codex'));
+
+  writeFileSync(ledger, `${[entry(1, 'high'), entry(1, 'xhigh'), entry(1, 'xhigh')].join('\n')}\n`);
+  const x = run();
+  assert.match(x.json.agentLogLine, / · merged · Codex 7d: 3 runs \(1 high, 2 xhigh\)$/);
+  assert.deepEqual(x.json.codexUsage, { runs: 3, high: 1, xhigh: 2, failed: 0 });
+  rmSync(join(ledger, '..'), { recursive: true, force: true });
+});
+
 test('summary: edits the existing summary comment in place (marker + same author) and needs a review state', () => {
   const repo = createTmpRepo();
   repo.write('.claude/pipeline.yml', pipelineYml());

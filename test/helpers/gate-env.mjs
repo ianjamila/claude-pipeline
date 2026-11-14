@@ -17,6 +17,9 @@ const bin = join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'pipeline'
 export const PR = 12;
 // The merge commands take a per-PR lock: the CLI runs get a private lock directory and machine id, never the developer's real ones.
 export const LOCK_DIR = mkdtempSync(join(tmpdir(), 'gate-env-locks-'));
+// The agent-log line ends with the weekly Codex figure from the account's usage ledger: these tests (and the in-process summary runs, which read
+// process.env) get an empty ledger of their own, never the developer's real one or one other test files fill.
+process.env.PIPELINE_CODEX_USAGE_FILE = join(LOCK_DIR, 'codex-usage.jsonl');
 export const AGENT_LOG = 'docs/agent-log.md';
 export const STEPS = ['install', 'typecheck', 'lint', 'unit', 'build'];
 export const MERGE_SHA = 'c'.repeat(40);

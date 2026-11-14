@@ -15,7 +15,7 @@
 import { existsSync, readFileSync, statSync, realpathSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { UNDECIDABLE_HEREDOC, plainExit, sourcePathSearch, commandName, simpleCommands, splitArgs, scriptFileOf, scriptFeedsOf, sqlShellEscapes, startupFilesOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, splicesOptions, spliceText, implicitBindsOf, ZSH_NAME_BINDERS, SHELL_SET_NAMES, withoutLiteralText, INDIRECT_EXPANSION, indirectExpansionOnLine, arithAssignedNames, envUnset } from './shell-parse.mjs';
+import { UNDECIDABLE_HEREDOC, plainExit, sourcePathSearch, commandName, simpleCommands, splitArgs, scriptFileOf, scriptFeedsOf, sqlShellEscapes, startupFilesOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, splicesOptions, spliceText, implicitBindsOf, ZSH_NAME_BINDERS, SHELL_SET_NAMES, withoutLiteralText, INDIRECT_EXPANSION, indirectExpansionOnLine, arithAssignedNames, envUnset, refusalAdvice } from './shell-parse.mjs';
 export { withoutLiteralText, INDIRECT_EXPANSION, SETS_BY_NAME };
 import { PM_RUN_ALIASES, PM_WRAPPERS, pmScriptOf, pmCannotRunScript, pmCall, pmMoverName, packageScripts, localBin, nameAtRunTimeIn, markPackageState, pkgOwnWrite, pkgMarkersFor, pmStartDirs, binIsProgram, binSite, binInterpreter, MAX_BIN_INTERPRETERS, lineNames, defaultLexists } from './package-scripts.mjs';
 import { catchAllReason, guardedCommandText, dataLessArgs } from './guarded-text.mjs';
@@ -2828,7 +2828,7 @@ function evalString(str, startDir, ctx, level, child = false) {
   // Truncated means part of the line was never looked at, so nothing on it can be called harmless (`g''it push` after
   // 500 `true;` must not slip through on a word match).
   if (cmds.undecidable) return deny(UNDECIDABLE_HEREDOC);
-  if (cmds.truncated) return deny('command too complex to verify (the parser gave up). Split it into simpler commands.');
+  if (cmds.truncated) return deny(cmds.refused ? `the command uses ${cmds.refused}, which the guard does not read. ${refusalAdvice(cmds.refused).replace(/^./, (c) => c.toUpperCase())}.` : 'command too complex to verify (the parser gave up). Split it into simpler commands.');
   if (cmds.dynamic && GUARDED_WORDS.test(str)) {
     return deny('the command that runs is only known at run time ($VAR / $(...) / piped into a shell) and the line mentions a guarded operation, so it cannot be verified. Rewrite: write the command out literally (`git push origin agent/x`, not `$G push` or `... | sh`); if the guarded words are only text (a commit message, a PR body), put that text in a file (`git commit -F msg.txt`, `gh pr create --body-file body.md`).');
   }

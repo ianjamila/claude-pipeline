@@ -124,10 +124,11 @@ describe('#298: python -m json.tool is judged like the option tools (a run-time 
     ['R1-B1: the module held in a name, then a substitution that prints two words', `M=json.tool; python3 -m $M $(printf '%s %s' /tmp/in.json ${S})`],
     ['R1-B1: the same, the name quoted', `M=json.tool; python3 -m "$M" $(printf '%s %s' /tmp/in.json ${S})`],
     ['R1-B1: the module in a name, a protected second operand', `M=json.tool; python3 -m "$M" /tmp/in.json ${S}`],
-  ]);
-  decide('allow', [
-    ['R1-B1: the module held in a name, one operand', `M=json.tool; python3 -m "$M" ${S}`],
-    ['R1-B1: the module held in a name, read from a pipe', `M=json.tool; cat ${S} | python3 -m $M`],
+    // (merge of #269) main's hook-file rule (#269 R8, owner decision 2026-11-12) lets an interpreter near a file that can declare hooks
+    // run only as the literal `python3 -m json.tool`, so the module held in a name stays denied there even with one operand or a pipe.
+    // The literal forms above stay allowed.
+    ['R1-B1 after #269: the module held in a name, one operand', `M=json.tool; python3 -m "$M" ${S}`],
+    ['R1-B1 after #269: the module held in a name, read from a pipe', `M=json.tool; cat ${S} | python3 -m $M`],
   ]);
 });
 
