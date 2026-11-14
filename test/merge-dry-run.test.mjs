@@ -30,7 +30,7 @@ const contents = (sha, text) => ({ match: `repos/acme/widgets/contents/\\.claude
 
 // What GitHub says about the PR for the dry run: the same reply as ghEntries gives, plus baseRefOid (only a readOnly gate asks for it).
 const prReply = (s, o = {}) => ({
-  state: 'OPEN', headRefOid: s.head, baseRefName: 'main', isDraft: false, labels: (o.labels ?? []).map((name) => ({ name })), mergeable: 'MERGEABLE',
+  state: 'OPEN', headRefOid: s.head, baseRefName: o.baseRefName ?? 'main', isDraft: false, labels: (o.labels ?? []).map((name) => ({ name })), mergeable: 'MERGEABLE',
   mergeStateStatus: o.merge ?? 'CLEAN', baseRefOid: o.baseRefOid ?? s.baseTip ?? 'b'.repeat(40),
 });
 const script = (s, o = {}) => [
@@ -415,6 +415,20 @@ test('dry run --owner-go, behind its base but disjoint: wouldMerge, `behind` set
   assert.deepEqual(s.mergeCalls(), []);
   noGitWrites(d);
   assert.equal(s.repo.git(['for-each-ref']), before);
+});
+
+test('dry run --owner-go, behind its base: the behindNote names the branch origin/HEAD names, not pipeline.yml\'s default_branch (R1-F4)', () => {
+  const s = scenario({ yml: disjointYml(), report: null, state: null });
+  const tip = mainMoves(s, 'other.txt');
+  s.repo.git(['update-ref', 'refs/remotes/origin/develop', tip]);
+  s.repo.git(['symbolic-ref', 'refs/remotes/origin/HEAD', 'refs/remotes/origin/develop']); // pipeline.yml still says main
+  // GitHub's default is develop too: a local default that is not GitHub's is refused (#430, #448), so the fixture must agree with it.
+  const repoView = { match: '^repo view', stdoutJson: { nameWithOwner: 'acme/widgets', defaultBranchRef: { name: 'develop' }, url: 'https://github.com/acme/widgets' } };
+  s.fake.setScript(script(s, { before: [repoView], baseRefOid: tip, baseRefName: 'develop', behindBy: 1, gh: { compareBase: tip, base: 'develop' } }));
+  const d = dry(s, ['--owner-go']);
+  assertExit(d.r, 0, `${d.r.stderr}${d.r.stdout}`);
+  assert.equal(d.r.json.wouldMerge, true, JSON.stringify(d.r.json.blockers));
+  assert.equal(d.r.json.ownerStep.behindNote, "behind develop by 1 commit(s); develop's 1 new file(s) touch none of this PR's files");
 });
 
 test('dry run --owner-go, up to date: behind is null and there is no behindNote', () => {

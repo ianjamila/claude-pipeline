@@ -94,6 +94,19 @@ test('recorder: replacing an invalid record writes a record the merge gate still
   assert.deepEqual(after.record.resumed, { at: new Date(NOW).toISOString(), host: 'pc-1', head: HEAD });
 });
 
+// R1-F3 (#407): the recorder's first read is ok, another writer corrupts the comment, and the writer's own re-read stamps the record resumed: that is reported too.
+test('recorder: a record that turns unreadable between the recorder\'s read and the writer\'s re-read is reported in recorder.warnings, once', () => {
+  const gh = memoryGh();
+  seed(gh, plain());
+  const real = gh.listComments;
+  let reads = 0;
+  gh.listComments = () => { reads += 1; return reads === 1 ? real() : real().map((c) => (c.body.startsWith(MARKERS.summary) ? { ...c, body: INVALID_BODY } : c)); };
+  const recorder = recorderFor(gh);
+  assert.ok(recorder.update({ step: 'merge' }), 'the write itself still happens');
+  const marked = recorder.warnings.filter((w) => /could not be read; started a new one, marked resumed/.test(w));
+  assert.equal(marked.length, 1, JSON.stringify(recorder.warnings));
+});
+
 // ---- (b) unsupported -> never overwritten --------------------------------------------------------------------------------------
 
 test('baseRecordFor: an unsupported (newer) record throws instead of falling through to a fresh one', () => {
@@ -290,4 +303,14 @@ test('writeRunRecord: a malformed resumed.head (not shape-checked on decode) can
     assert.equal(events.length, 1, JSON.stringify(head));
     assert.equal(resumedRunState(gh, PR).resumed, true, JSON.stringify(head));
   }
+});
+
+// #407: P summary / P comment --kind summary build their record from null, so baseRecordFor's warning never reaches them: the shared writer reports the mark it stamps.
+test('writeRunRecord: stamping resumed on an unreadable record returns baseRecordFor\'s warning (and an ordinary write returns none)', () => {
+  const gh = memoryGh([{ id: 7, body: INVALID_BODY, user: { login: 'me' } }]);
+  const posted = writeRunRecord(gh, PR, { record: plain(), firstRead: { status: 'invalid' }, host: 'pc-1', now: NOW });
+  assert.equal(posted.warnings.length, 1);
+  assert.match(posted.warnings[0], /could not be read; started a new one, marked resumed/);
+  assert.equal(baseRecordFor({ status: 'invalid' }, { ...ID, host: 'pc-1', now: NOW }).warnings[0], posted.warnings[0], 'the same wording');
+  assert.deepEqual(writeRunRecord(memoryGh(), PR, { record: plain() }).warnings, []);
 });

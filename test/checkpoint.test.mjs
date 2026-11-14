@@ -531,6 +531,29 @@ for (const [name, args] of [['P summary', ['summary', '--pr', String(PR), '--out
   });
 }
 
+// #407: the same marking is reported in the command's own output, in baseRecordFor's words (these two commands do not go through baseRecordFor).
+for (const [name, args] of [['P summary', ['summary', '--pr', String(PR), '--outcome', 'merged']], ['P comment --kind summary', ['comment', '--pr', String(PR), '--kind', 'summary', '--outcome', 'merged']]]) {
+  test(`${name}: an unreadable record marked resumed is reported as a warning in the output`, () => {
+    const s = staleWriterScenario();
+    const r = cli(args, { dir: s.repo.dir, fake: s.fake, env: s.env });
+    assertExit(r, 0);
+    const marked = r.json.warnings.filter((w) => /could not be read; started a new one, marked resumed/.test(w));
+    assert.equal(marked.length, 1, JSON.stringify(r.json.warnings));
+  });
+}
+
+// R1-F3 (#407): `P checkpoint` read the record as ok (baseRecordFor warns nothing), another writer corrupted it, and the writer's own re-read stamped the record resumed.
+test('P checkpoint: a record that turns unreadable after the command\'s read and is marked resumed by the writer is reported once in the output warnings', () => {
+  const s = scenario();
+  const comments = { match: 'repos/acme/widgets/issues/12/comments --paginate', stdoutJsonSeq: [[existingSummary({ record: baseRecord() })], [invalidSummary()]] };
+  s.fake.setScript(ghEntries({ prHead: s.head, extra: [comments, PATCH_77] }));
+  const r = checkpoint(s, ['--step', 'review']);
+  assertExit(r, 0);
+  const marked = r.json.warnings.filter((w) => /could not be read; started a new one, marked resumed/.test(w));
+  assert.equal(marked.length, 1, JSON.stringify(r.json.warnings));
+  assert.ok(recordWrites(s.fake).at(-1).record.resumed, 'the record written carries the resumed mark');
+});
+
 const RESUMED_EVENT = () => ({ id: 78, user: { login: 'me' }, body: renderEvent('run-resumed', `pr${PR}-aaaaaaaaaaaa`, 'This run was taken over from an earlier session.', RESUMED) });
 // the interleaving of R9-B1: the event is there, the record was then overwritten by a writer that had not seen the mark
 const withEventOnly = () => {
