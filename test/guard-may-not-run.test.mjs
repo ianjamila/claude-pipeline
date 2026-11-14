@@ -601,9 +601,9 @@ test('#352 R23-B1, R23-F1: a nested or quoted subscript in a named descriptor is
     refuses(`${w}>f push HEAD:main`, `${w}>/dev/null ${SHIP}:${MAIN}`, {}, GIT_ROOT);
     refuses(`git push origin ${w}>f (main)`, `git ${PUSH} origin ${w}>/dev/null`, {}, MAIN_DIR);
     refuses(`if [[ ]] ${w}>f push`, `if [[ -n x ]] ${w}>/dev/null ${SHIP}`, {}, GIT_ROOT);
-    refuses(`(R24-F2: a subscript that is no plain number or name refuses) exec ${w}>/dev/null; push`, `exec ${w}>/dev/null; ${SHIP}`, {}, GIT_ROOT);
+    refuses(`(R24-F2, R25-B1: a subscript that is no plain number refuses) exec ${w}>/dev/null; push`, `exec ${w}>/dev/null; ${SHIP}`, {}, GIT_ROOT);
   }
-  // (#352 R24-F2: the subscript is arithmetic (quotes removed), so it may assign any name: only a plain number or name is followed)
+  // (#352 R24-F2: the subscript is arithmetic (quotes removed), so it may assign any name: only a plain number is followed)
   for (const w of ['{a["x=5"]}', '{a[x=5]}', '{a[x+=1]}', "{a['0']}", '{a[$i]}', '{a[i++]}']) refuses(`exec ${w}>f; push`, `exec ${w}>/dev/null; ${SHIP}`, {}, GIT_ROOT);
   // (#352 R25-B1: a plain name's value is evaluated as arithmetic too: only a plain number is followed)
   refuses('R25-B1: exec {a[i]}>/dev/null; push', `exec {a[i]}>/dev/null; ${SHIP}`, {}, GIT_ROOT);
