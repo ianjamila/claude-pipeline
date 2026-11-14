@@ -2960,6 +2960,8 @@ class Parser {
 
   // A loop / function body / plain `{` group opens at this nesting level (closed by ctlClose, or when the level ends: see parseList).
   ctlOpen(kind, neg = false, seg = null) {
+    // (each level copies the list of enclosing levels below: past MAX_NEST levels the line is given up on, as nested $( ) is, so 50 000 `{ ` cannot take gigabytes)
+    if (this.ctx.up.length >= MAX_NEST) { this.ctx.stopped = true; this.ctx.truncated = true; this.i = this.src.length; }
     this.ctlStack.push(kind);
     this.ctlCond.push(kind === 'if' || kind === 'loop');
     // (#352 R10: every construct is a level of its own (up): its commands run under the operator of the construct, whatever `;` they are separated by inside it)
@@ -3118,7 +3120,8 @@ class Parser {
       if (!(seg.afterParen === true && words.every((w) => w.fdRedir === true))) this.ctx.ctlBroken = true;
       let j = i;
       while (j < words.length && assignOf(words[j])) j++;
-      const execCmd = j < words.length && words[j].qa < 0 && words[j].text === 'exec';
+      // (push security review of 5f7cdd12: only a pure `exec {fd}>f [{fd2}>g …]` runs nothing; `exec {fd}>f CMD` runs CMD in zsh and a command named {fd} in sh: refused below)
+      const execCmd = j < words.length && words[j].qa < 0 && words[j].text === 'exec' && words.slice(j + 1).every((w) => w.fdRedir === true);
       const gitish = j < words.length && words[j].qa < 0 && ['git', 'gh'].includes(base(words[j].text));
       if (words.some((w, k) => w.fdRedir === true && k >= i && !(execCmd && k > j) && (k < words.length - 1 || gitish))) this.ctx.truncated = true;
     }

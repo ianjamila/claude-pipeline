@@ -221,6 +221,20 @@ test('pathological nesting does not blow the stack or hang', () => {
   }
 });
 
+// (#352 R21 pre-check: every construct level copies the list of enclosing levels (ctx.up), so 50 000 nested `{ ` used ~4 GB; nesting past MAX_NEST constructs refuses the line, as `$(` does)
+test('#352: deeply nested constructs ({ }, if, loops) are refused past the nesting limit, in bounded memory', () => {
+  for (const s of ['{ '.repeat(20000), 'if true; then '.repeat(20000), 'for x in y; do '.repeat(20000), 'while true; do '.repeat(20000)]) {
+    const h0 = process.memoryUsage().heapUsed;
+    const { r: cmds, ms } = cpuTimed(() => simpleCommands(s));
+    assert.equal(cmds.truncated, true, s.slice(0, 20));
+    assert.ok(ms < 2000, `${s.slice(0, 20)}: ${Math.round(ms)} ms of CPU`);
+    assert.ok(process.memoryUsage().heapUsed - h0 < 200e6, `${s.slice(0, 20)}: bounded memory`);
+  }
+  // ordinary nesting is untouched
+  const ok = simpleCommands('{ '.repeat(20) + 'git status' + '; }'.repeat(20));
+  assert.equal(ok.truncated, false);
+});
+
 test('truncated is a non-enumerable property so deepEqual on the array is unaffected', () => {
   const cmds = simpleCommands('git status');
   assert.equal(cmds.truncated, false);

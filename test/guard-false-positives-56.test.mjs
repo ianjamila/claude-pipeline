@@ -559,6 +559,9 @@ test('#352 R20-F3: exec {k}\\<newline>>/dev/null rebinds k as exec {k}>/dev/null
   assert.equal(git('k=5; exec {k}>/dev/null; gh issue close $k', fsx, { issueLabels: labels }).decision, 'deny');
   assert.equal(git('k=5; exec {k}\\\n>/dev/null; gh issue close $k', fsx, { issueLabels: labels }).decision, 'deny');
   assert.equal(git('k=5; exec {k\\\n}>/dev/null; gh issue close $k', fsx, { issueLabels: labels }).decision, 'deny');
+  // (push security review of 5f7cdd12: a leading {k}>f word is skipped from argv, and still rebinds k)
+  assert.equal(git('k=5; {k}>/dev/null true; gh issue close $k', fsx, { issueLabels: labels }).decision, 'deny');
+  assert.equal(git('k=5; {k}>/dev/null; gh issue close $k', fsx, { issueLabels: labels }).decision, 'deny');
 });
 
 test('#56 replay of 96848c2: template text the shell never expands, and zsh flags that cannot assign, are no indirect expansion', () => {

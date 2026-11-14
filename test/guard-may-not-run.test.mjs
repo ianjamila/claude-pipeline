@@ -546,6 +546,20 @@ test('#352 R18-F1..F3: a word after a ]] that closes a [[ ]] command is a short-
   allows('twin: while [[ ]]; do push; done', `while [[ -n x ]]; do ${SHIP}; break; done`, {}, '/work/other2');
 });
 
+// (#352 push security review of 5f7cdd12: `exec {fd}>f CMD` is zsh / bash >= 4.1's exec of CMD with a new descriptor, and sh / bash 3.2's exec of a command named {fd}: the two readings run different
+// commands, so only a pure `exec {fd}>f [{fd2}>g …]` (it opens descriptors and runs nothing) keeps the exemption; any word after it refuses the line. Was allowed on main too.)
+test('#352 push security review: exec {fd}>f followed by a command is refused; a pure exec {fd}>f is not', () => {
+  refuses('exec {fd}>/dev/null push (main)', `exec {fd}>/dev/null ${SHIP}`, {}, MAIN_DIR);
+  refuses('exec {fd}>/dev/null {g}>/dev/null push (main)', `exec {fd}>/dev/null {g}>/dev/null ${SHIP}`, {}, MAIN_DIR);
+  refuses('X=1 exec {fd}>/dev/null push (main)', `X=1 exec {fd}>/dev/null ${SHIP}`, {}, MAIN_DIR);
+  refuses('cd other && exec {fd}>/dev/null push (main)', `cd /work/other2 && exec {fd}>/dev/null ${SHIP}`, {}, MAIN_DIR);
+  refuses('exec {fd}>/dev/null push HEAD:main (agent branch)', `exec {fd}>/dev/null ${SHIP}:${MAIN}`, {}, GIT_ROOT);
+  // a pure exec that only opens descriptors keeps its verdict
+  allows('twin: exec {fd}>/dev/null; push', `exec {fd}>/dev/null; ${SHIP}`, {}, GIT_ROOT);
+  allows('twin: exec {fd}>/dev/null {g}>/dev/null; push', `exec {fd}>/dev/null {g}>/dev/null; ${SHIP}`, {}, GIT_ROOT);
+  denies('twin: exec {fd}>/dev/null; push (main)', `exec {fd}>/dev/null; ${SHIP}`, {}, MAIN_DIR);
+});
+
 // (#352 R19: the R18 watch for a word after `]]` was tied to one segment and to the single next word: an inner && of the [[ ]] split the segment (B1), a reserved word right after `]]` hid the same-line body in
 // the argv of `[[` (F1), and a `{fd}` redirect prefix disarmed it (F2))
 test('#352 R19-B1, R19-F1, R19-F2: the ]] watch survives a && inside [[ ]], a same-line body after ]] then / ]] do is refused, a {fd} redirect does not disarm it', () => {
