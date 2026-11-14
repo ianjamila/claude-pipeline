@@ -224,7 +224,9 @@ test('a dirty working tree is reported in clean (and does not by itself block)',
 });
 
 test('injected gh and codex are used instead of the real ones', async () => {
-  const repo = repoWith('gate');
+  const repo = createTmpRepo();
+  repo.write('.claude/pipeline.yml', `${pipelineYml('gate')}default_branch: trunk\n`); // GitHub's default is "trunk": the config must name it too (#430)
+  repo.commit('init');
   const gh = {
     authStatus: () => ({ ok: true, message: '' }),
     viewer: () => 'stub',
@@ -380,4 +382,35 @@ test('a bypass warning never turns a blocked world into a mergeable one, and an 
   assert.equal(blocked.canMerge, false);
   writeFileSync(join(dir, 'fable.json'), '{ not json');
   assert.deepEqual((await runPreflight({ cwd: repo.dir, env: world([], { env: floorEnv(dir) }).env })).warnings, []);
+});
+
+// #430: the pipeline supports only GitHub's default branch as its main; a pipeline.yml naming another one is reported up front.
+test("default_branch differing from GitHub's default is reported and blocks canMerge with the fix text", async () => {
+  const repo = createTmpRepo();
+  repo.write('.claude/pipeline.yml', `${pipelineYml('github')}default_branch: develop\n`);
+  repo.commit('init');
+  const { env } = world();
+  const r = await runPreflight({ cwd: repo.dir, env });
+  assert.equal(r.config.ok, true, r.config.errors?.join('|'));
+  assert.equal(r.canMerge, false);
+  const reason = r.reasons.find((x) => /default_branch/.test(x));
+  assert.equal(reason, 'pipeline.yml names default_branch "develop" but GitHub\'s default branch is "main": the pipeline supports only GitHub\'s default branch as its main — set default_branch: main, or make develop the default branch on GitHub');
+});
+
+test('default_branch equal to GitHub\'s default adds no reason (the healthy world stays canMerge)', async () => {
+  const repo = createTmpRepo();
+  repo.write('.claude/pipeline.yml', `${pipelineYml('github')}default_branch: main\n`);
+  repo.commit('init');
+  const r = await runPreflight({ cwd: repo.dir, env: world().env });
+  assert.equal(r.canMerge, true);
+  assert.deepEqual(r.reasons, []);
+});
+
+test('default_branch check: a config that did not load (null cfg) skips it, with no throw and no default_branch reason', async () => {
+  const repo = createTmpRepo();
+  repo.write('.claude/pipeline.yml', 'version: 1\nproject: [not a string\n');
+  repo.commit('init');
+  const r = await runPreflight({ cwd: repo.dir, env: world().env });
+  assert.equal(r.config.ok, false);
+  assert.equal(r.reasons.some((x) => /default_branch/.test(x)), false, r.reasons.join('|'));
 });

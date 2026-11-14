@@ -20,7 +20,6 @@ import { blockingHits, collectHardStops, ownerMergeHits } from './hardstops.mjs'
 import { checkIntegrity } from './integrity.mjs';
 import { runPreflight } from './preflight.mjs';
 import { hashBranch, trustedDefaultBranch } from './risk.mjs';
-import { refreshTrustedDefault } from './review-context.mjs';
 import { toPosix } from './paths.mjs';
 import { isDocPath } from './doc-paths.mjs';
 import { loadState } from './state.mjs';
@@ -191,10 +190,10 @@ function assertBaseObject(explicit, o) {
 
 // `queueMode`: GitHub merges through its merge queue, which tests the PR on top of the base itself, so being behind is no problem.
 // The ONE default-branch answer of a gate run (#448): the trusted default branch (risk.mjs#trustedDefaultBranch, never the working-tree value a PR can edit), resolved once and
-// passed to every helper, plus GitHub's own answer for the cross-check in pr-open. `fetch` (a real gate, never a dry run): one best-effort fetch of the trusted branch's ref first, so
-// the hashes below measure from a current ref. -> { tdb, branch, ghDefault: string | null }
-function resolveTrustedBranch({ root, config, gh, fetch }) {
-  if (fetch) refreshTrustedDefault(root, config);
+// passed to every helper, plus GitHub's own answer for the cross-check in pr-open. No fetch here, for a real gate or a dry run: the hashes and the diff are measured from the ref as it is
+// (#417: a real gate that fetched first would scan a different range than the dry run that previews it). The only fetch of a gate is the deferred step's, in baseProofSettings, of this same branch.
+// -> { tdb, branch, ghDefault: string | null }
+function resolveTrustedBranch({ root, config, gh }) {
   const tdb = trustedDefaultBranch(root, config);
   let ghDefault = null;
   try {
@@ -370,24 +369,25 @@ const CI_PROOF_STATES = new Set(['pass', 'pending', 'failure', 'missing']);
 // the base first; any failure to fetch, read or validate it is { ok: false, reason }, which the caller turns into ci-proof-missing.
 function baseProofSettings({ root, config, branch = hashBranch(root, config) }) {
   const o = { cwd: root };
-  const ref = `refs/remotes/origin/${branch}`;
+  const ref = `refs/remotes/origin/${branch}`; // what git reads (fully qualified: a local branch or tag named origin/<b> cannot shadow it)
+  const shown = `origin/${branch}`; // what the reasons say
   try {
     git(['fetch', '--no-tags', 'origin', `+refs/heads/${branch}:refs/remotes/origin/${branch}`], { ...o, timeoutMs: NETWORK_TIMEOUT_MS });
   } catch (err) {
-    return { ok: false, reason: `could not fetch ${ref}: ${firstLine(err)}` };
+    return { ok: false, reason: `could not fetch ${shown}: ${firstLine(err)}` };
   }
   try {
     const text = showFile(ref, '.claude/pipeline.yml', o);
-    if (text === null) return { ok: false, reason: `${ref} has no .claude/pipeline.yml` };
+    if (text === null) return { ok: false, reason: `${shown} has no .claude/pipeline.yml` };
     const parsed = validateConfig(parseYaml(text));
-    if (!parsed.ok) return { ok: false, reason: `${ref}'s .claude/pipeline.yml is not a valid config: ${parsed.errors.slice(0, 2).join('; ')}` };
+    if (!parsed.ok) return { ok: false, reason: `${shown}'s .claude/pipeline.yml is not a valid config: ${parsed.errors.slice(0, 2).join('; ')}` };
     const v = parsed.config.verify;
     return {
-      ok: true, ref, branch, sha: revParse(`${ref}^{commit}`, o),
+      ok: true, ref, shown, branch, sha: revParse(`${ref}^{commit}`, o),
       deferrable: v.deferrable_steps ?? [], proof: v.ci_proof ?? {}, inputs: v.ci_proof_inputs ?? [],
     };
   } catch (err) {
-    return { ok: false, reason: `could not read the proof settings from ${ref}: ${firstLine(err)}` };
+    return { ok: false, reason: `could not read the proof settings from ${shown}: ${firstLine(err)}` };
   }
 }
 
@@ -443,9 +443,10 @@ async function proveDeferredStep({ step, ctx }) {
   try {
     const settings = ctx.settings();
     if (!settings.ok) return missing(settings.reason);
-    if (!settings.deferrable.includes(step)) return missing(`${settings.ref} does not list ${step} in verify.deferrable_steps`);
+    const shown = settings.shown ?? settings.ref;
+    if (!settings.deferrable.includes(step)) return missing(`${shown} does not list ${step} in verify.deferrable_steps`);
     const spec = Object.hasOwn(settings.proof, step) ? settings.proof[step] : undefined;
-    if (!isObject(spec)) return missing(`${settings.ref} has no verify.ci_proof entry for ${step}`);
+    if (!isObject(spec)) return missing(`${shown} has no verify.ci_proof entry for ${step}`);
     const hit = ctx.protectedHit();
     if (hit !== null) return missing(`this PR changes ${hit}, an input of the CI proof, so only a local run can vouch for ${step}`);
     const res = await ctx.ciProof({
@@ -821,7 +822,7 @@ export async function evaluateGate({ root, config, pr, gh, env, sleep = defaultS
   const o = { cwd: root };
   const head = headSha(o);
   const info = await readPrSettled({ gh, pr, fields: readOnly ? [...PR_FIELDS, 'baseRefOid'] : [...PR_FIELDS], sleep, pauseMs: mergeablePause(env) });
-  const trusted = resolveTrustedBranch({ root, config, gh, fetch: !readOnly });
+  const trusted = resolveTrustedBranch({ root, config, gh });
   const { branch } = trusted;
   const diff = lazyDiff(root, config, null, branch);
 
@@ -1087,7 +1088,7 @@ export async function reviewCompletionCheck({ root, config, pr, gh, hash, sleep 
 export async function evaluateOwnerGo({ root, config, pr, gh, env, sleep = defaultSleep, exemptHold = false, queueMode }) {
   const head = headSha({ cwd: root });
   const info = await readPrSettled({ gh, pr, fields: [...OWNER_GO_FIELDS], sleep, pauseMs: mergeablePause(env) });
-  const trusted = resolveTrustedBranch({ root, config, gh, fetch: false }); // no fetch here: the scan is bound to GitHub's base commit, never a local ref
+  const trusted = resolveTrustedBranch({ root, config, gh }); // the scan is bound to GitHub's base commit, never a local ref
   // The range is GitHub's: the PR's base commit and head, as read now. headRefOid must be the local HEAD (pr-open), baseRefOid a local object.
   const explicit = { sha: info?.baseRefOid, branch: typeof info?.baseRefName === 'string' && info.baseRefName !== '' ? info.baseRefName : trusted.branch };
   const baseSha = typeof explicit.sha === 'string' && FULL_SHA.test(explicit.sha) ? explicit.sha : null;
