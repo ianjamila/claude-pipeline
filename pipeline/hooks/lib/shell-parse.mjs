@@ -877,7 +877,7 @@ export function implicitBindsOf(c) {
   if (el) out.push(el[1]);
   for (const a of argv) { const fd = FD_NAME_WORD.exec(a); if (fd) out.push(fd[1]); }
   // (#352 R21-F1: a LEADING `{k}>f` word is a redirect with no command word and is in no argv: read the names from the command's text too, line continuations removed (a match in a quote only makes this stricter))
-  for (const m of String(c.raw ?? '').replace(/\\\r?\n/g, '').matchAll(/(?<!\$)\{([A-Za-z_]\w*)(?:\[[^\]\n]*\])?\}[^\S\n]*[<>]/g)) out.push(m[1]);
+  for (const m of String(c.raw ?? '').replace(/\\\r?\n/g, '').matchAll(/(?<!\$)\{([A-Za-z_]\w*)(?:\}[^\S\n]*[<>]|\[)/g)) out.push(m[1]); // (R23-F3: any `{name[` reports the name, its subscript unread: linear, and fail closed for a nested or quoted one)
   if (/^\s*coproc\b/.test(String(c.raw ?? ''))) {
     out.push('COPROC', 'COPROC_PID');
     if (/^[A-Za-z_]\w*$/.test(argv[0] ?? '')) out.push(argv[0], `${argv[0]}_PID`);

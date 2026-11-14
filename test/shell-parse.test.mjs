@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import { cpuTimed } from './helpers/timing.mjs';
 import assert from 'node:assert/strict';
-import { splitArgs, simpleCommands, commandName, allRedirects, scriptFileOf } from '../pipeline/hooks/lib/shell-parse.mjs';
+import { splitArgs, simpleCommands, commandName, allRedirects, scriptFileOf, implicitBindsOf } from '../pipeline/hooks/lib/shell-parse.mjs';
 
 const argvs = (s, o) => simpleCommands(s, o).map((c) => c.argv.join(' '));
 const sorted = (a) => [...a].sort();
@@ -233,6 +233,19 @@ test('#352: deeply nested constructs ({ }, if, loops) are refused past the nesti
   // ordinary nesting is untouched
   const ok = simpleCommands('{ '.repeat(20) + 'git status' + '; }'.repeat(20));
   assert.equal(ok.truncated, false);
+});
+
+// (#352 R23-F3: the named-descriptor scan of implicitBindsOf read a subscript up to its `]` from every `{name[`: quadratic on a run of `{a[` with no `]`, and a hook that times out allows. Any `{name[` now
+// reports the name (fail closed, linear), which also covers a nested or quoted subscript)
+test('#352 R23-F3: the named-descriptor name scan is linear and reports any subscripted name', () => {
+  const raw = ': ' + '{a['.repeat(50000) + '; true';
+  const { r, ms } = cpuTimed(() => implicitBindsOf({ argv: [':'], raw }));
+  assert.ok(ms < 300, `${Math.round(ms)} ms of CPU`);
+  assert.ok(r.includes('a'));
+  for (const [raw2, name] of [['{F[a[0]]}>/dev/null', 'F'], ["{a['0']}>/dev/null", 'a'], ['ls {k[0]}>/dev/null', 'k'], ['exec {k}>/dev/null', 'k'], ['{k} >/dev/null', 'k']]) {
+    assert.ok(implicitBindsOf({ argv: [], raw: raw2 }).includes(name), raw2);
+  }
+  assert.ok(!implicitBindsOf({ argv: ['echo'], raw: 'echo ${k} > f' }).includes('k'));
 });
 
 test('truncated is a non-enumerable property so deepEqual on the array is unaffected', () => {
