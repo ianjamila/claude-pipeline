@@ -114,6 +114,16 @@ export const DEFAULTS = deepFreeze({
     // mode: auto = use it, off = park as before. min_wait_minutes: 0 never waits for Codex; above 0, a reset that near is waited for instead
     // (no substitute, the output says waitUntil). max_packet_mb: the evidence a substitute needs may not pass this size.
     substitute: { mode: 'auto', min_wait_minutes: 0, max_packet_mb: 8 },
+    // Up to 10 { name, paths, text } (name /^[a-z0-9-]{1,40}$/, paths = non-empty globs, text <= 4000 chars): the repo's own threat model for
+    // those paths, read from the TRUSTED default-branch config and put in the Fable arbiter's input, and in the Codex prompt on a Fable-lane round only
+    // (list a modelled path in risk.high_risk_paths or review.arbiter_always_paths to have it apply to every PR touching it). A security finding
+    // outside a model is FOLLOW-UP, not merge-blocking. Empty = off (today's behaviour).
+    threat_models: [],
+    // null (off) or 1..10: counted review rounds past this ordinal may use the narrow fix-verify brief even on sensitive paths (never
+    // on a hard-stop hit other than an ignored P-path/R4-config, a size driver, or a flagged fix scope). Both configs must set it.
+    fix_verify_after_round: null,
+    // Non-test added lines a fix round may have before the late lane flags it (flagged => full brief). A new non-test source file flags it too.
+    fix_round_max_lines: 150,
   },
   agent_log: 'docs/agent-log.md',
 });
@@ -195,9 +205,10 @@ const KEYS = {
   hard_stops: ['paths', 'patterns', 'auth_calls', 'disable_rules', 'report_only_rules', 'report_only_paths'],
   pattern: ['name', 'regex', 'paths'],
   integrity: ['test_globs'],
-  review: ['codex_model', 'effort', 'max_rounds', 'light_lane_max_lines', 'size_only_medium_reviewer', 'arbiter_always_paths', 'docs_exempt_paths', 'substitute', 'codex_round_budget', 'codex_budget'],
+  review: ['codex_model', 'effort', 'max_rounds', 'light_lane_max_lines', 'size_only_medium_reviewer', 'arbiter_always_paths', 'docs_exempt_paths', 'substitute', 'codex_round_budget', 'codex_budget', 'threat_models', 'fix_verify_after_round', 'fix_round_max_lines'],
   review_codex_budget: ['soft', 'hard'],
   review_substitute: ['mode', 'min_wait_minutes', 'max_packet_mb'],
+  threat_model: ['name', 'paths', 'text'],
   smoke: ['path', 'status', 'contains', 'location_contains'],
 };
 
@@ -608,6 +619,36 @@ function checkPatterns(patterns, errors) {
   });
 }
 
+// review.threat_models: at most MAX_THREAT_MODELS mappings { name, paths, text }, names unique.
+export const MAX_THREAT_MODELS = 10;
+export const MAX_THREAT_MODEL_TEXT = 4000;
+const THREAT_MODEL_NAME = /^[a-z0-9-]{1,40}$/;
+function checkThreatModels(models, errors) {
+  if (!Array.isArray(models)) return errors.push('review.threat_models must be an array');
+  if (models.length > MAX_THREAT_MODELS) errors.push(`review.threat_models has ${models.length} entries; at most ${MAX_THREAT_MODELS}`);
+  const seen = new Set();
+  models.forEach((item, i) => {
+    const at = `review.threat_models[${i}]`;
+    if (!isObj(item)) return errors.push(`${at} must be a mapping with name, paths and text`);
+    unknownKeys(item, KEYS.threat_model, `${at}.`, errors);
+    if (typeof item.name !== 'string' || !THREAT_MODEL_NAME.test(item.name)) errors.push(`${at}.name must match ${THREAT_MODEL_NAME}`);
+    else if (seen.has(item.name)) errors.push(`${at}.name (${JSON.stringify(item.name)}) is listed twice`);
+    else seen.add(item.name);
+    if (!isStrArray(item.paths) || item.paths.length === 0) errors.push(`${at}.paths must be a non-empty array of glob strings`);
+    else {
+      item.paths.forEach((g, j) => {
+        try {
+          globToRegExp(g);
+        } catch (err) {
+          errors.push(`${at}.paths[${j}] (${JSON.stringify(g)}) is not a usable glob (${err.message})`);
+        }
+      });
+    }
+    if (!isStr(item.text)) errors.push(`${at}.text is required (a non-empty string)`);
+    else if (item.text.length > MAX_THREAT_MODEL_TEXT) errors.push(`${at}.text is ${item.text.length} characters; at most ${MAX_THREAT_MODEL_TEXT}`);
+  });
+}
+
 function checkSmokeChecks(checks, errors) {
   if (!Array.isArray(checks)) return errors.push('smoke_checks must be an array');
   checks.forEach((item, i) => {
@@ -711,6 +752,9 @@ export function validateConfig(obj) {
     if (!inRange(review.max_rounds, 1, 5)) errors.push('review.max_rounds must be an integer 1..5');
     checkPosInt(review.light_lane_max_lines, 'review.light_lane_max_lines', errors);
     checkStrArray(review.arbiter_always_paths, 'review.arbiter_always_paths', errors);
+    checkThreatModels(review.threat_models, errors);
+    if (review.fix_verify_after_round !== null && !inRange(review.fix_verify_after_round, 1, 10)) errors.push('review.fix_verify_after_round must be null or an integer 1..10');
+    checkPosInt(review.fix_round_max_lines, 'review.fix_round_max_lines', errors);
     if (!SIZE_ONLY_REVIEWERS.includes(review.size_only_medium_reviewer)) errors.push(`review.size_only_medium_reviewer must be one of ${SIZE_ONLY_REVIEWERS.join('|')}`);
     if (!isObj(review.effort)) errors.push('review.effort must be a mapping');
     else {

@@ -143,6 +143,17 @@ export function isSensitivePath(file, config) {
   return pathsOf(file).some((p) => matches(p, highRisk) || matches(p, always));
 }
 
+// review.threat_models: the models whose `paths` match any old OR new path of a changed file (diffFiles entries), in config order, each once.
+// Pure and total: no config, no models or a malformed entry (validateConfig refuses those) means no model, which is today's behaviour. A bad
+// `files` is a TypeError (a forgotten await must not quietly mean "no threat model").
+export function threatModelsFor(files, config) {
+  if (!Array.isArray(files)) throw new TypeError('threatModelsFor: files must be an array');
+  const list = config?.review?.threat_models;
+  if (!Array.isArray(list)) return [];
+  return list.filter((m) => m && typeof m.name === 'string' && Array.isArray(m.paths) && m.paths.every((g) => typeof g === 'string')
+    && files.some((f) => pathsOf(f).some((p) => matches(p, m.paths))));
+}
+
 // Which reviewer follows Codex. `fable`: one Fable pass per round that rules on every Codex item AND reviews the diff itself
 // (agents/arbiter.md), for a medium or high PR or one touching a sensitive path (risk.high_risk_paths or
 // review.arbiter_always_paths, matched like high_risk_paths). `judge`: the Sonnet judge, for everything else.
