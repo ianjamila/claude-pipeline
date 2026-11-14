@@ -48,6 +48,7 @@ export const meta = {
     '  same check as the final gate\'s review check): exit 1 {ok:false, reason: "round n: owner grant cannot be verified on this machine ..."} otherwise',
     '  a proven Fable round recorded with a Fable older than MIN_FABLE (or the lower hold of model-floor reset --hold) that no later whole-PR pass at or above it replaced is refused: exit 1 {ok:false, error:fable-refresh, reason, staleFableRounds:[{round, models}]},',
     '  the reason names the rounds and models and says `run `pipeline state fable-refresh --pr N``; the final gate\'s review check refuses the same PR the same way',
+    '  when GitHub names no base branch and the default branch cannot be anchored on the remote (an origin remote that answered neither origin/HEAD nor ls-remote: the working tree\'s default_branch is the PR\'s to edit), it is refused too: exit 1 {ok:false, reason: "GitHub did not name the PR\'s base branch, and ..."}',
     '  when a proven Fable round counts as current only because of the owner\'s allowance (model-floor reset --allow-id, an id the parser cannot read) or a hold below MIN_FABLE, the comment gets one line',
     '  "Standing Fable bypass: Fable round 3 counted via owner allowance <id>" (or "... via owner hold <id> (below <MIN_FABLE>)"), the output carries fableBypass:{note, rounds:[{round, via, id}]},',
     '  and the final gate\'s review check detail carries the same note',
