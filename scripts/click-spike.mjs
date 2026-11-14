@@ -8,7 +8,7 @@
 // <out>/<case>.jsonl (default test/fixtures/click/<build>/). Last, it checks the discriminator the recorder relies on and exits 1
 // when any case no longer shows it: then DO NOT add the build to CLICK_BUILDS (clicks stay refused on it; typing still works).
 // Costs a few Haiku calls. macOS or Linux (util-linux `script`); needs a logged-in `claude`.
-// Run it from your OWN terminal, not inside a Claude Code session: Claude Code will not start nested, and the script does not unset CLAUDECODE or CLAUDECODE_* for
+// Run it from your OWN terminal, not inside a Claude Code session: Claude Code will not start nested, and the script does not unset CLAUDECODE or CLAUDE_CODE_* for
 // the child (only the owner may unset CLAUDECODE); started inside a session it prints that and exits 2.
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
