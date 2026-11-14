@@ -191,7 +191,8 @@ function assertBaseObject(explicit, o) {
 // `queueMode`: GitHub merges through its merge queue, which tests the PR on top of the base itself, so being behind is no problem.
 // The ONE default-branch answer of a gate run (#448): the trusted default branch (risk.mjs#trustedDefaultBranch, never the working-tree value a PR can edit), resolved once and
 // passed to every helper, plus GitHub's own answer for the cross-check in pr-open. No fetch here, for a real gate or a dry run: the hashes and the diff are measured from the ref as it is
-// (#417: a real gate that fetched first would scan a different range than the dry run that previews it). The only fetch of a gate is the deferred step's, in baseProofSettings, of this same branch.
+// (#417: a real gate that fetched first would scan a different range than the dry run that previews it). The branch NAME comes from origin/HEAD or `git ls-remote --symref origin HEAD`, which a
+// fetch of the branch does not change, so a fetch first would add nothing to the one-answer-per-run guarantee. The only fetch of a gate is the deferred step's, in baseProofSettings, of this same branch.
 // -> { tdb, branch, ghDefault: string | null }
 function resolveTrustedBranch({ root, config, gh }) {
   const tdb = trustedDefaultBranch(root, config);

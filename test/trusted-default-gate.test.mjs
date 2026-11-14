@@ -10,6 +10,9 @@ import { ghEntries, named, scenario, ymlFor } from './helpers/gate-env.mjs';
 import { ymlWith } from './helpers/ci-proof-env.mjs';
 import { ciEntries } from './helpers/ci-proof-merge-env.mjs';
 import { addOrigin, breakOrigin } from './helpers/origin.mjs';
+import { createTmpRepo } from './helpers/tmprepo.mjs';
+import { createQueueRoute } from '../pipeline/lib/queue-route.mjs';
+import { DEFAULTS } from '../pipeline/lib/config.mjs';
 
 // A gate scenario with a bare origin (origin/HEAD -> main unless `head: false`) holding main. `yml` is committed on the base like the rest of the scenario.
 function world(t, { yml, head = true, gh, ...rest } = {}) {
@@ -133,4 +136,19 @@ test('merge reads the gate file\'s trustedBranch for its own hash: a gate file n
   assert.notEqual(m.code, 0, m.stdout);
   assert.match(m.stdout + m.stderr, /the patch changed since the gate ran \(content hash differs\)/);
   assert.equal(s.mergeCalls().length, 0, 'nothing was merged');
+});
+
+test("queue route: the merge queue's branch rules are asked for the trusted default branch, not a working-tree default_branch edit", (t) => {
+  const repo = createTmpRepo();
+  t.after(() => repo.cleanup());
+  repo.write('a.txt', 'x\n');
+  repo.commit('init');
+  addOrigin(t, repo); // origin/HEAD -> main
+  const asked = [];
+  const gh = { repo: () => ({ slug: 'acme/widgets' }), repoId: () => 42, branchRules: (b) => { asked.push(b); return []; } };
+  createQueueRoute({
+    gh, root: repo.dir, config: { merge: { ...DEFAULTS.merge }, default_branch: 'evil' }, pr: 12, head: 'a'.repeat(40), route: 'owner-go', env: {},
+    refuse: () => ({}), approval: {}, recheck: async () => ({ ok: true }),
+  });
+  assert.deepEqual(asked, ['main']);
 });
