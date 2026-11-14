@@ -4582,7 +4582,9 @@ function evaluateBashForFilesFrame(command, opts) {
       // R1-B1 (Codex round 1): only `exit` counts. A top-level `return` is an error and the shell goes on (it leaves only inside a function or a sourced file, and a function is no shape that is narrowed at all).
       // R1-B2: a redirection on the exit, or on the group's closer (`} < f`, read as a command of no words that holds it), may fail before the exit runs, and then the shell goes on: no narrowing.
       // (a redirection on a command before the exit, `{ echo no >&2; exit 1; }`, only fails that command)
+      // R1-F1: `exit` alone or with ONE literal number; `exit 1 2` is refused ("too many arguments") and the shell goes on, and a run-time word (`exit $X`) may split into two
       if (!staticName(e) || e.argv[0] !== 'exit' || (e.redirects ?? []).length > 0) return -1;
+      if (e.argv.length > 2 || (e.argv.length === 2 && !/^\d+$/.test(e.argv[1]))) return -1;
       if (last !== k + 1 && top[last + 1] !== undefined && top[last + 1].argv.length === 0 && (top[last + 1].redirects ?? []).length > 0) return -1;
       const y = top[last + 1];
       return y === undefined || y.sep === ';' || y.sep === '&&' ? last + 1 : -1;

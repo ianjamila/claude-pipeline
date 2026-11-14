@@ -51,6 +51,21 @@ describe('#410: a cd whose only || alternative leaves the shell surely succeeded
     ['cd X || { echo e; exit 1 < /missing; } (a redirection on the exit inside the group)', `${P} || { echo e; exit 1 < /missing; }; find . -delete`],
     ['cd X || { exit 1; } 2>/dev/null (a redirection after the closer)', `${P} || { exit 1; } 2>/dev/null; find . -delete`],
   ]);
+  decide('deny', [
+    // R1-F1 (#425 round 1): an exit with extra arguments is refused ("too many arguments") and the shell goes on; a run-time word may split into two
+    ['cd /missing || exit 1 2; find . -delete', 'cd /missing || exit 1 2; find . -delete'],
+    ['cd X || exit 1 2 (two words after exit)', `${P} || exit 1 2\nfind . -delete`],
+    ['cd X || exit 1 2 && write', `${P} || exit 1 2 && find . -delete`],
+    ['cd X || { echo no; exit 1 2; } (the group form)', `${P} || { echo no; exit 1 2; }; find . -delete`],
+    ['cd X || exit $X (a run-time word may split)', `${P} || exit $X; find . -delete`],
+    ['cd X || exit "$X" 1', `${P} || exit "$X" 1; find . -delete`],
+    ['cd X || exit abc (not a number: refused)', `${P} || exit abc; find . -delete`],
+  ]);
+  decide('allow', [
+    ['cd X || exit 1 (still narrowed)', `${P} || exit 1; find . -delete`],
+    ['cd X || exit (still narrowed)', `${P} || exit; find . -delete`],
+    ['cd X || { echo no; exit 2; } (still narrowed)', `${P} || { echo no; exit 2; }; find . -delete`],
+  ]);
   decide('allow', [
     // (the everyday shapes keep narrowing: a redirection on the echo is not one on the exit or the group)
     ['cd ~/Claude/proj || exit 1; npm test (the report\'s everyday shape)', 'cd ~/Claude/proj || exit 1; npm test'],
