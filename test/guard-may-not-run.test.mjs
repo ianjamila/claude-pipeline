@@ -523,6 +523,14 @@ test('#352 R18-F1..F3: a word after a ]] that closes a [[ ]] command is a short-
   refuses('R18-F3: if { true } && [[ -n x ]] push', `if { true } && [[ -n x ]] ${SHIP}`);
   refuses('R18-F3: while { true } && [[ -n x ]] push', `while { true } && [[ -n x ]] ${SHIP}`);
   refuses('R18-F3: until { true } && [[ -n x ]] push', `until { true } && [[ -n x ]] ${SHIP}`);
+  denies('#352 R19-F2b: X=1 {fd}>/dev/null push (main)', `X=1 {fd}>/dev/null ${SHIP}`, {}, MAIN_DIR);
+  denies('#352 R19-F2b: command {fd}>/dev/null push (main)', `command {fd}>/dev/null ${SHIP}`, {}, MAIN_DIR);
+  denies('#352 R19-F2b: git {fd}>/dev/null push (main)', `git {fd}>/dev/null ${PUSH} origin HEAD`, {}, MAIN_DIR);
+  denies('#352 R19-F2b: {fd}>/dev/null X=1 push (main)', `{fd}>/dev/null X=1 ${SHIP}`, {}, MAIN_DIR);
+  allows('twin: cd other && X=1 {fd}>/dev/null push', `cd /work/other2 && X=1 {fd}>/dev/null ${SHIP}`, {}, MAIN_DIR);
+  allows('twin: cd other && command {fd}>/dev/null push', `cd /work/other2 && command {fd}>/dev/null ${SHIP}`, {}, MAIN_DIR);
+  allows('twin: cd other && git {fd}>/dev/null push', `cd /work/other2 && git {fd}>/dev/null ${PUSH} origin HEAD`, {}, MAIN_DIR);
+  allows('twin: cd other && {fd}>/dev/null X=1 push', `cd /work/other2 && {fd}>/dev/null X=1 ${SHIP}`, {}, MAIN_DIR);
   // lines that use [[ ]] as an ordinary command keep their verdict
   allows('twin: [[ ]] && push', `[[ -n x ]] && ${SHIP}`, {}, '/work/other2');
   allows('twin: [[ ]] || exit; push', `[[ -n x ]] || exit; ${SHIP}`, {}, '/work/other2');
