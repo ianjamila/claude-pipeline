@@ -111,7 +111,8 @@ export const DEFAULTS = deepFreeze({
     // (no substitute, the output says waitUntil). max_packet_mb: the evidence a substitute needs may not pass this size.
     substitute: { mode: 'auto', min_wait_minutes: 0, max_packet_mb: 8 },
     // Up to 10 { name, paths, text } (name /^[a-z0-9-]{1,40}$/, paths = non-empty globs, text <= 4000 chars): the repo's own threat model for
-    // those paths, read from the TRUSTED default-branch config and put in the Fable arbiter's input and the Codex prompt. A security finding
+    // those paths, read from the TRUSTED default-branch config and put in the Fable arbiter's input, and in the Codex prompt on a Fable-lane round only
+    // (list a modelled path in risk.high_risk_paths or review.arbiter_always_paths to have it apply to every PR touching it). A security finding
     // outside a model is FOLLOW-UP, not merge-blocking. Empty = off (today's behaviour).
     threat_models: [],
     // null (off) or 1..10: counted review rounds past this ordinal may use the narrow fix-verify brief even on sensitive paths (never

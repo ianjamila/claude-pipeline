@@ -169,6 +169,14 @@ test('the docs-only review exemption is documented where owners and agents look:
   assert.match(cli, /verify\/CI coverage of the docs head is NOT exempted/);
 });
 
+test('R2-F2 review.threat_models: the template and the config defaults say the Codex prompt carries the model on a Fable-lane round only, and that a modelled path should be a sensitive path', () => {
+  const yml = read('pipeline/templates/pipeline.yml');
+  assert.match(yml, /Codex prompt[^\n]*\n?[^\n]*on a Fable-lane round only/);
+  assert.match(yml, /risk\.high_risk_paths or review\.arbiter_always_paths/);
+  const cfg = read('pipeline/lib/config.mjs');
+  assert.match(cfg, /Codex prompt[^\n]*\n?[^\n]*on a Fable-lane round only/);
+});
+
 test('the review skill says one closing keyword per issue (GitHub links only the first number of `Closes #1, #2`)', () => {
   const skill = read('skills/review/SKILL.md');
   assert.match(skill, /one keyword per issue, `Closes #1\. Closes #2\.`/);
