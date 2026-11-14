@@ -800,6 +800,11 @@ pipeline state outcome [--repo DIR]   -> roundOutcome + {clean, arbiterFailures,
   grantedRound {k, grantId, head, quote}: the owner's open extra-round grant for the next counted round and the checked-out HEAD (chat mode, an owner
   record younger than 24 h, not yet used) - it lifts reachedMax and effectiveMaxRounds by one; null otherwise. autoExtraOrdinal: the counted round the
   automatic extra round took, or null
+pipeline state fix-scope --round R [--head HEAD] [--repo DIR]
+  -> {ok, round, from, head, fixScope: {nonTestLines, newFiles, newExports, limit, flagged, reasons}, flagged, reasons, advisory, warnings}: what the fix commits since round R (R's reviewed head .. HEAD, or --head) add, read-only and
+     never stored. flagged = more non-test added lines than the smaller review.fix_round_max_lines of the working-tree and fork-point configs, or a new non-test SOURCE file (not a document / review.docs_exempt_paths file);
+     a file counts as a test only when the working-tree, fork-point and trusted configs ALL classify it so (a renamed file is new unless both paths are tests). New exports are advisory text only.
+     The review skill runs it before the push and asks the owner (own PR / plan first / push as is) when flagged; it is a prompt, never a gate. Exit 2 {error: no-round | not-descendant | bad-head}
 pipeline state mark-implemented --ids a,b [--repo DIR]
   -> exit 2 {error:no-code-change} unless the branch content differs from what the accepting round reviewed
      and a non-test file changed since (a test file counts for a testing finding or the finding's own file)
@@ -913,7 +918,11 @@ pipeline triage light-lane --round R [--repo DIR]
 pipeline triage ruling-request --pr N --ids ID[,ID…] [--ask] [--repo DIR]
   -> {ok, line}: the LAST line of the reply that asks the owner to rule, `⚖️ Owner ruling needed #N: ID, ID · content <digest12> · repo owner/name`; the digest covers the text of exactly those items in the current review state (exit 1 for an unknown id, a --pr that is not the review state's, or a repository off github.com)
   -> --ask (click-to-approve #261, owner_approval: chat): also {ask: {askId, questions}}: a choice question (Not now | Accept all | Follow-up all | Reject all) whose text is the item summaries and then exactly that line, written as an ask file (one-time use, expires after 24 h, superseded by a newer ask for the same PR); the review skill passes it to AskUserQuestion verbatim and the owner-go hook records a human click as the same ruling a typed `ID: accept|follow-up|reject` per asked id records; otherwise ask: null and askSkipped (owner_approval is not chat | owner_go.click is off | dialog hooks not approved: the owner runs `pipeline owner-go approve-dialog-hooks` once | the ask could not be issued)
-pipeline triage round-request --pr N [--ask] [--past] [--repo DIR]
+pipeline triage round-request --pr N [--ask] [--past] [--after-process-review] [--repo DIR]
+  -> the TRIP-WIRE (a prompt, not a gate; ON by default, review.trip_wire_extra_rounds / review.trip_wire_not_falling, the smaller of the working-tree and fork-point values): when the PR has reviewed max_rounds + extra counted rounds, or at least not_falling past-limit rounds
+     accepted (more than 0 and) at least as many new items as the round before, the ask does not print a line: exit 1 {ok:false, error:"trip-wire", tripWire: {tripped, reviewed, max, acceptsByRound, reasons}, processReview: {headline, summary}}. Park the PR with the headline
+     (`pipeline comment --kind blocked --reason <headline>`, run-record outcome blocked, detail process-review), paste the summary and ask the owner. Only after the owner chooses one more round, run it again with --after-process-review: the usual answer and line, plus tripWire and processReview.
+     Not tripped: no tripWire field, the answer is unchanged.
   -> {ok, line, k, n, head, rounds, cost, open, notClean, recommend, why, discard, summary, warnings}: the LAST line of the reply that asks the owner for ONE more review round past review.max_rounds, `🔁 Extra review round needed #N: round K · head <head12> · repo owner/name`
      (k = the counted round it would be: reviewed rounds + 1, base-only and resolution-only rounds not counted; n = the round number to pass to codex-review --round; head = the checked-out HEAD)
   -> everything but line, k, n and head is display only and decides nothing: rounds {reviewed, max, autoExtraUsed, ownerGranted, next}; cost {bookedUsd, reviewUsd, fableUsd, perRoundUsd, lastRound, lastRoundUsd} (the last two from cost.byRound, `cost --round R`: the newest counted round with a booking, else null) from the PR's run record (read-only; null with a warning when it cannot be read);

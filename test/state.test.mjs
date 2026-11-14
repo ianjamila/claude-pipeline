@@ -17,6 +17,8 @@ import {
   STATE_VERSION_DEFERRAL,
   STATE_VERSION_SUBSTITUTE,
   STATE_VERSION_OUT_OF_MODEL,
+  STATE_VERSION_POST_MAX,
+  stateNeedsPostMaxVersion,
   maxRiskOf,
   stateNeedsOutOfModelVersion,
   withStateVersion,
@@ -512,7 +514,7 @@ test('state version 4 is what is SAVED and PUBLISHED: saveState and encodeForCom
     assert.equal(loadState(dir).version, 4);
     assert.equal(decodeFromComment(encodeForComment(stale)).version, 4);
     saveState(dir, { ...s, version: SUPPORTED_STATE_VERSION + 1 });
-    assert.throws(() => loadState(dir), /version 6.*supports.*5/);
+    assert.throws(() => loadState(dir), /version 7.*supports.*6/);
     assert.equal(decodeFromComment(encodeForComment({ ...s, version: SUPPORTED_STATE_VERSION + 1 })), null);
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -570,7 +572,7 @@ test('N1/F4: stateNeedsOutOfModelVersion is true only when a final carries outOf
   assert.equal(stateNeedsOutOfModelVersion(marked), true);
   const bumped = withStateVersion(marked, STATE_VERSION_OUT_OF_MODEL);
   assert.equal(bumped.version, STATE_VERSION_OUT_OF_MODEL);
-  assert.equal(SUPPORTED_STATE_VERSION, STATE_VERSION_OUT_OF_MODEL);
+  assert.equal(SUPPORTED_STATE_VERSION, STATE_VERSION_POST_MAX);
   assert.ok(STATE_VERSION_OUT_OF_MODEL > STATE_VERSION_SUBSTITUTE, 'above the substitute version an installation from before this change supports');
   assert.equal(stateNeedsOutOfModelVersion({ rounds: [{ items: [{ final: { outOfModel: '' } }] }] }), false, 'an empty marker is no marker');
   assert.equal(stateNeedsOutOfModelVersion(null), false);
@@ -614,6 +616,35 @@ test('N1: an old reader (the pre-#374 loadState rule: refuse a version above 4, 
     saveState(dir, { ...marked, version: SUPPORTED_STATE_VERSION + 1 });
     assert.throws(() => loadState(dir), /newer pipeline wrote it/);
     assert.equal(decodeFromComment(encodeForComment({ ...marked, version: SUPPORTED_STATE_VERSION + 1 })), null);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('F4 (PR B): the state version is bumped to 6 ONLY when a final carries postMax; a plain state and an out-of-model one keep their versions and round-trip unchanged', () => {
+  const plain = sampleState();
+  assert.equal(stateNeedsPostMaxVersion(plain), false);
+  assert.equal(plain.version, 1);
+  const postMax = { from: 'ACCEPT', by: 'arbiter', ordinal: 5, max: 3 };
+  const marked = updateItems(plain, 1, [it('R1-S1', { bucket: 'SUGGESTION', final: { decision: 'FOLLOW-UP', by: 'arbiter', needsHuman: false, reason: 'r', postMax } })]);
+  assert.equal(stateNeedsPostMaxVersion(marked), true);
+  assert.equal(marked.version, STATE_VERSION_POST_MAX, 'updateItems writes the version the state needs');
+  const oom = updateItems(plain, 1, [it('R1-S1', { bucket: 'SUGGESTION', final: { decision: 'FOLLOW-UP', by: 'arbiter', needsHuman: false, reason: 'r', outOfModel: 'guards' } })]);
+  assert.equal(oom.version, STATE_VERSION_OUT_OF_MODEL, 'an out-of-model state stays at 5');
+  assert.equal(stateNeedsPostMaxVersion({ rounds: [{ items: [{ final: { postMax: null } }] }] }), false);
+  assert.equal(stateNeedsPostMaxVersion(null), false);
+  // an old reader (the version-5 rule of the installed #374 PR A CLI) refuses the new state instead of reading the unfiled FOLLOW-UP as complete
+  const refusesAt5 = (state) => Number.isFinite(state.version) && state.version > 5;
+  assert.equal(refusesAt5(marked), true);
+  assert.equal(refusesAt5(oom), false);
+  assert.equal(refusesAt5(plain), false);
+  const dir = tmp();
+  try {
+    saveState(dir, plain);
+    assert.deepEqual(loadState(dir), plain, 'a plain state round-trips unchanged');
+    saveState(dir, { ...marked, version: 1 });
+    assert.equal(loadState(dir).version, STATE_VERSION_POST_MAX, 'a stale writer is lifted back');
+    assert.equal(decodeFromComment(encodeForComment({ ...marked, version: 1 })).version, STATE_VERSION_POST_MAX);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

@@ -232,6 +232,24 @@ test('review.fix_verify_after_round: null or an integer 1..10; review.fix_round_
   for (const v of [0, -1, 1.5, '150', null]) assert.ok(has(set('fix_round_max_lines', v), 'review.fix_round_max_lines must be a positive integer'), String(v));
 });
 
+test('review.post_max_suggestions / trip_wire_extra_rounds / trip_wire_not_falling: defaults', () => {
+  const r = validateConfig(minimal());
+  assert.equal(r.config.review.post_max_suggestions, 'review');
+  assert.equal(r.config.review.trip_wire_extra_rounds, 3);
+  assert.equal(r.config.review.trip_wire_not_falling, 2);
+  assert.equal(DEFAULTS.review.post_max_suggestions, 'review');
+});
+
+test('review.post_max_suggestions: follow-up|review; trip_wire_extra_rounds 1..10; trip_wire_not_falling 1..5', () => {
+  const set = (k, v) => validateConfig({ ...minimal(), review: { [k]: v } });
+  for (const v of ['follow-up', 'review']) assert.equal(set('post_max_suggestions', v).ok, true, v);
+  for (const v of ['off', '', 1, null, true]) assert.ok(has(set('post_max_suggestions', v), 'review.post_max_suggestions must be one of follow-up|review'), String(v));
+  for (const v of [1, 3, 10]) assert.equal(set('trip_wire_extra_rounds', v).ok, true, String(v));
+  for (const v of [0, 11, 2.5, '3', null]) assert.ok(has(set('trip_wire_extra_rounds', v), 'review.trip_wire_extra_rounds must be an integer 1..10'), String(v));
+  for (const v of [1, 2, 5]) assert.equal(set('trip_wire_not_falling', v).ok, true, String(v));
+  for (const v of [0, 6, 1.5, '2', null]) assert.ok(has(set('trip_wire_not_falling', v), 'review.trip_wire_not_falling must be an integer 1..5'), String(v));
+});
+
 test('production without smoke is rejected; production: null is ok', () => {
   const r = validateConfig({
     ...minimal(),

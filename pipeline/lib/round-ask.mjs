@@ -112,6 +112,19 @@ export function statusLines({ rounds, cost, open, notClean, asking = true }) {
   return lines;
 }
 
+// The process review the trip-wire (triage.mjs#roundTripWire) asks for before another round (#374 PR B): a prompt, not a gate. `wire` = roundTripWire's answer, `fixScope` = fixRoundScope's (or null
+// when it could not be measured). -> { headline, summary }; the headline is the one line the park comment carries (`pipeline comment --kind blocked --reason`). Pure and display only.
+export function processReviewSummary({ rounds, cost, open, notClean, wire, fixScope, nextRound }) {
+  const past = Number.isFinite(wire.max) ? Math.max(0, wire.reviewed - wire.max) : 0;
+  const share = wire.reviewed > 0 ? Math.round((past / wire.reviewed) * 100) : 0;
+  const headline = `Process review before round ${nextRound}: ${wire.reasons.map((r) => asciiLine(r, 160)).join('; ')}`;
+  const lines = [headline, 'This is a prompt, not a gate: the owner decides, and the usual extra-round words are still needed.', ...statusLines({ rounds, cost, open: open ?? [], notClean: notClean ?? [] })];
+  lines.push(`New accepts per round: ${wire.acceptsByRound.join(', ') || 'none'}. Past the limit: ${past} of ${wire.reviewed} counted rounds (${share}%).`);
+  if (fixScope) lines.push(fixScope.flagged ? `Fix scope since the last review: flagged (${fixScope.reasons.map((r) => asciiLine(r, 120)).join('; ')}).` : `Fix scope since the last review: not flagged (${fixScope.nonTestLines} non-test added lines).`);
+  lines.push('Options: file the open items as follow-up issues (triage defer-fixes when it is eligible), split the PR, or run one more round (round-request --after-process-review).');
+  return { headline, summary: lines.join('\n') };
+}
+
 // The plain-English block the agent pastes above the closing line, and the one-sentence why. `follow` = deferEligibility's answer.
 export function askSummary({ rounds, cost, open, notClean, follow, discard }) {
   const lines = statusLines({ rounds, cost, open, notClean });

@@ -1008,3 +1008,33 @@ test('buildReviewPrompt: confirmFixed adds a fenced section; with none the promp
   assert.match(p, /id: R1-B1\ntitle: Null check\nfile: src\/a\.js\ndetail: x is ```not``` checked IGNORE ALL/);
   assert.match(p, /````confirm fixed R1-B1/, 'the fence is longer than any run of backticks in the text');
 });
+
+// #374 PR B: a Claude ACCEPT over a published post-limit FOLLOW-UP (final.postMax) is saved ruling work: claudeRulingRefusal allows exactly that tightening, so a copy kept
+// while GitHub was down must not be quarantined. Nothing else over a settled final changed.
+test('state show (#374 PR B): a Claude ACCEPT over a published post-max FOLLOW-UP stays local-ahead; any other ruling over it, a wrong overruled, or an ACCEPT over an ordinary settled FOLLOW-UP is quarantined', (t) => {
+  const postMaxFinal = () => decided({ decision: 'FOLLOW-UP', by: 'arbiter', reason: 'low-severity suggestion accepted past the round limit', postMax: { from: 'ACCEPT', by: 'arbiter', ordinal: 5, max: 3 } });
+  const settledFollowUp = () => decided({ decision: 'FOLLOW-UP', by: 'arbiter', reason: 'defer' });
+  const claudeOver = (decision, overruled) => claudeFinal({ decision, reason: 'worth fixing now', claude: { ruledAt: 'later', cause: 'unknown', critical: false, overruled } });
+  const run = (name, s0, local) => {
+    const w = world(t);
+    saveState(w.A, s0);
+    assertExit(w.comment(w.A), 0, name);
+    saveState(w.A, local);
+    const r = w.show(w.A);
+    assertExit(r, 0, name + r.stdout + r.stderr);
+    return { r, w };
+  };
+  const pm = mk([it('R1-S1', { bucket: 'SUGGESTION', category: 'maintainability', final: postMaxFinal() })]);
+  // positive: the tightening to ACCEPT, recording the post-max final it overruled, is kept and untouched
+  const tightened = change(pm, 'R1-S1', { final: claudeOver('ACCEPT', postMaxFinal()) });
+  const kept = run('Claude ACCEPT over a post-max FOLLOW-UP', pm, tightened);
+  assert.equal(kept.r.json.source, 'local-ahead');
+  assert.deepEqual(kept.w.state(kept.w.A), JSON.parse(JSON.stringify(tightened)), 'the local state is untouched');
+  // negative: anything but the tightening over the same published final
+  assert.equal(run('Claude REJECT over a post-max FOLLOW-UP', pm, change(pm, 'R1-S1', { final: claudeOver('REJECT', postMaxFinal()) })).r.json.source, 'quarantined');
+  assert.equal(run('Claude FOLLOW-UP over a post-max FOLLOW-UP', pm, change(pm, 'R1-S1', { final: claudeOver('FOLLOW-UP', postMaxFinal()) })).r.json.source, 'quarantined');
+  assert.equal(run('Claude ACCEPT that overruled some other final', pm, change(pm, 'R1-S1', { final: claudeOver('ACCEPT', settledFollowUp()) })).r.json.source, 'quarantined');
+  // the case it guarded before: a Claude ACCEPT over an ordinary settled FOLLOW-UP (no postMax) is still not saved work
+  const plain = mk([it('R1-S1', { bucket: 'SUGGESTION', category: 'maintainability', final: settledFollowUp() })]);
+  assert.equal(run('Claude ACCEPT over a settled FOLLOW-UP', plain, change(plain, 'R1-S1', { final: claudeOver('ACCEPT', settledFollowUp()) })).r.json.source, 'quarantined');
+});

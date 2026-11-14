@@ -6,7 +6,9 @@ import { mkdirSync, existsSync, renameSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { Fail, guarded, requireConfig, resolveRepo } from '../lib/cmd-common.mjs';
 import { GhError } from '../lib/proc.mjs';
-import { GitError, effectiveReviewBase, git, headSha, isAncestor, mergeBase, revParse } from '../lib/git.mjs';
+import { GitError, diffFiles, effectiveReviewBase, git, headSha, isAncestor, mergeBase, revParse } from '../lib/git.mjs';
+import { baseConfigAt } from '../lib/config.mjs';
+import { fixRoundScope } from '../lib/fix-verify.mjs';
 import { claimGrantMarkers, grantIdOf, ownerGrantedRounds, ownerPastRoundHistory, ownerPastRoundRecords, verifyOwnerGrant } from '../hooks/lib/owner-go.mjs';
 import { pastRoundsNeedingApproval } from '../lib/owner-grants.mjs';
 import { createGitHub, guardGh } from '../lib/github.mjs';
@@ -17,7 +19,7 @@ import { wholePrOwed } from '../lib/review-route.mjs';
 import { roundStats } from '../lib/round-stats.mjs';
 import { hashBranch, prBaseBranch } from '../lib/risk.mjs';
 import { addRound, loadState, saveState, updateItems } from '../lib/state.mjs';
-import { arbiterFailures, countsTowardCap, finalIsReopenable, isOwnerRuled, isProtectedFinal, reviewedRoundCount, roundOutcome, staleFableRounds, staleSubstituteFableRounds } from '../lib/triage.mjs';
+import { arbiterFailures, countsTowardCap, finalIsReopenable, isOwnerRuled, isPostMaxFinal, isProtectedFinal, reviewedRoundCount, roundOutcome, staleFableRounds, staleSubstituteFableRounds } from '../lib/triage.mjs';
 import { pastRoundHistoryProblem, publishTriage, readBaseline, readPublished, reviewContentHash, writeBaseline } from '../lib/review-publish.mjs';
 import {
   allItems, canonicalJson, currentContentHash, decidedItemsKey, findItem, findRound, followupsPending, newStaleDir, quarantineReviewDir, refreshBaseRef, requireState, reviewBaseRef,
@@ -48,6 +50,11 @@ export const meta = {
     '  grantedRound {k, grantId, head, quote}: the owner\'s open extra-round grant for the next counted round and the checked-out HEAD (chat mode, an owner',
     '  record younger than 24 h, not yet used) - it lifts reachedMax and effectiveMaxRounds by one; null otherwise. autoExtraOrdinal: the counted round the',
     '  automatic extra round took, or null',
+    'pipeline state fix-scope --round R [--head HEAD] [--repo DIR]',
+    '  -> {ok, round, from, head, fixScope: {nonTestLines, newFiles, newExports, limit, flagged, reasons}, flagged, reasons, advisory, warnings}: what the fix commits since round R (R\'s reviewed head .. HEAD, or --head) add, read-only and',
+    '     never stored. flagged = more non-test added lines than the smaller review.fix_round_max_lines of the working-tree and fork-point configs, or a new non-test SOURCE file (not a document / review.docs_exempt_paths file);',
+    '     a file counts as a test only when the working-tree, fork-point and trusted configs ALL classify it so (a renamed file is new unless both paths are tests). New exports are advisory text only.',
+    '     The review skill runs it before the push and asks the owner (own PR / plan first / push as is) when flagged; it is a prompt, never a gate. Exit 2 {error: no-round | not-descendant | bad-head}',
     'pipeline state mark-implemented --ids a,b [--repo DIR]',
     '  -> exit 2 {error:no-code-change} unless the branch content differs from what the accepting round reviewed',
     '     and a non-test file changed since (a test file counts for a testing finding or the finding\'s own file)',
@@ -137,7 +144,8 @@ function savedRulingIsAhead(i, before) {
   // The writers never reopen a settled final (triage.mjs secondReviewRefusal / claudeRulingRefusal), so neither a verdict nor a ruling over one is saved work.
   if (canonicalJson(i.final) === canonicalJson(before.final)) return verdictAdded && finalIsReopenable(before);
   if (continuesPublished(i, before)) return true;
-  if (!isProtectedFinal(i) || isProtectedFinal(before) || isOwnerRuled(before) || !finalIsReopenable(before)) return false;
+  // (a Claude ACCEPT over a post-limit FOLLOW-UP is reopening it on purpose: claudeRulingRefusal allows exactly that)
+  if (!isProtectedFinal(i) || isProtectedFinal(before) || isOwnerRuled(before) || !(finalIsReopenable(before) || (i.final.decision === 'ACCEPT' && isPostMaxFinal(before)))) return false;
   const overruled = i.final.claude?.overruled;
   if (overruled !== undefined && canonicalJson(overruled) !== canonicalJson(before.final)) return false;
   return i.final.forcedBy === undefined || verdictAdded;
@@ -400,6 +408,45 @@ async function discardRound(rest, ctx) {
       output: { ok: true, discarded: n, quarantinedTo: path.relative(root, stale).split(path.sep).join('/'), stateRound: inState },
     };
   }, pr);
+}
+
+// ---- fix-scope -------------------------------------------------------------------------------
+
+// What the fix commits made since round R's reviewed head add (lib/fix-verify.mjs#fixRoundScope, the measure chooseBrief takes live): read-only, nothing is stored (a stored copy could go stale
+// under the next commit). The limit is the smallest of the working-tree, fork-point and trusted configs; a config that cannot be read counts as the defaults (never as "no limit").
+async function fixScope(rest, ctx) {
+  const { values } = parseCommandArgs(rest, { round: { type: 'string' }, head: { type: 'string' }, repo: { type: 'string' } }, { allowPositionals: false });
+  const n = intOption(values, 'round', { required: true, min: 1 });
+  const root = resolveRepo(values, ctx);
+  const { config } = await requireConfig(root);
+  const state = requireState(root);
+  const round = (state.rounds ?? []).find((r) => r.n === n);
+  if (round === undefined) throw new Fail(EXIT.USAGE, { ok: false, error: 'no-round', message: `round ${n} is not in the review state` });
+  const o = { cwd: root };
+  let head;
+  try {
+    head = values.head === undefined ? headSha(o) : revParse(values.head, o);
+  } catch (err) {
+    if (!(err instanceof GitError)) throw err;
+    throw new Fail(EXIT.USAGE, { ok: false, error: 'bad-head', message: `--head ${values.head} is not a commit of this repository` });
+  }
+  if (!isAncestor(round.toHead, head, o)) {
+    throw new Fail(EXIT.USAGE, { ok: false, error: 'not-descendant', message: `HEAD ${head.slice(0, 12)} does not contain round ${n}'s reviewed head ${String(round.toHead).slice(0, 12)}: the fix commits are the ones after it` });
+  }
+  const warnings = [];
+  const configs = [config];
+  for (const [label, sha] of [['fork-point', round.forkPoint], ['trusted', round.trustedConfigSha]]) {
+    if (label === 'trusted' && typeof sha !== 'string') continue; // pinned unavailable / a legacy round: the other two decide
+    const read = baseConfigAt(sha, root);
+    if (read.ok) configs.push(read.config);
+    else {
+      configs.push({}); // the defaults: stricter than no limit, and the default test globs classify fewer files as tests
+      warnings.push(`the ${label} config could not be read (${read.reason}): its limits and test globs are taken as the defaults`);
+    }
+  }
+  const scope = fixRoundScope({ files: diffFiles(round.toHead, head, o), configs });
+  const advisory = scope.newExports > 2 ? [`${scope.newExports} new exports: check that each is needed by an accepted item (advisory, does not flag by itself)`] : [];
+  return { exitCode: EXIT.OK, output: { ok: true, round: n, from: round.toHead, head, fixScope: scope, flagged: scope.flagged, reasons: scope.reasons, advisory, warnings } };
 }
 
 // ---- outcome --------------------------------------------------------------------------------
@@ -827,7 +874,7 @@ async function pastRoundGrant(rest, ctx) {
 }
 
 const SUBCOMMANDS = {
-  show, 'discard-round': discardRound, outcome, 'mark-implemented': markImplemented, 'fable-refresh': fableRefresh, 'record-followup': recordFollowup, 'set-outcome': setOutcome, 'past-round-grant': pastRoundGrant,
+  show, 'discard-round': discardRound, 'fix-scope': fixScope, outcome, 'mark-implemented': markImplemented, 'fable-refresh': fableRefresh, 'record-followup': recordFollowup, 'set-outcome': setOutcome, 'past-round-grant': pastRoundGrant,
 };
 
 export const run = guarded(async (argv, ctx) => {

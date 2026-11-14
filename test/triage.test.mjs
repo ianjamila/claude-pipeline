@@ -32,6 +32,15 @@ import {
   FABLE_FINDINGS_MAX,
   rulingContentDigest,
   substituteAgentFor,
+  applyPostMaxDefault,
+  postMaxPolicy,
+  isPostMaxFinal,
+  roundTripWire,
+  claudeRulingRefusal,
+  applyClaudeRuling,
+  reviewEligibilityProblems,
+  rulingsInventory,
+  rulingsDigest,
 } from '../pipeline/lib/triage.mjs';
 import { assignIds } from '../pipeline/lib/codex.mjs';
 
@@ -1627,4 +1636,200 @@ test('roundCapProblem owner grant: an open grant allows exactly the next counted
   // used: round 4 holds the grant, so round 5 is refused (a grant never carries to a later ordinal)
   const used = stateOf([...upTo(3, [fixed(3)]), grantedRound(4)]);
   assert.match(roundCapProblem(used, 5, { head: H40, grants: grantFor(4) }), /and its one extra round, or an owner-granted round/);
+});
+
+// ---- #374 PR B: past the limit, a low-severity ACCEPT becomes a FOLLOW-UP (applyPostMaxDefault) -------------------------------------------------------
+
+const lowAccept = (over = {}) => item({ bucket: 'SUGGESTION', category: 'maintainability', final: settled('ACCEPT', 'arbiter'), ...over });
+// The severity context a caller builds (fix-verify.mjs#postMaxSettings): the review state, the round's number, the working-tree config, the reviewed diff's files and the trusted config.
+const PM_FILES = ['src/a.js', 'src/b.js', 'src/payroll/pay.js'].map((p) => ({ oldPath: p, newPath: p, path: p }));
+const PM_CONFIG = { risk: { high_risk_paths: ['src/payroll/**'] }, review: { arbiter_always_paths: [] } };
+const pmSeverity = (items, over = {}) => ({ state: { rounds: [round(5, items)], maxRounds: 3 }, round: 5, config: PM_CONFIG, files: PM_FILES, baseConfig: PM_CONFIG, ...over });
+// `severity: null` = a caller that gave none; an object overrides parts of the default context.
+const pm = (items, { severity, ...over } = {}) => applyPostMaxDefault(items, { policy: 'follow-up', ordinal: 5, max: 3, ...(severity === null ? {} : { severity: pmSeverity(items, severity) }), ...over });
+
+test('applyPostMaxDefault: within the limit, and the first round past it (max + 1: the automatic extra round), nothing changes', () => {
+  const a = lowAccept();
+  for (const ordinal of [1, 3, 4]) assert.deepEqual(pm([a], { ordinal }), [a], `ordinal ${ordinal}`);
+  assert.deepEqual(pm([a], { ordinal: 5, policy: 'review' }), [a], 'policy review is off');
+});
+
+test('applyPostMaxDefault: past max + 1 a low-severity SUGGESTION / WORTH_CONSIDERING ACCEPT by the judge or arbiter becomes a FOLLOW-UP that remembers what it was', () => {
+  const [s1, w1, j1] = pm([lowAccept(), lowAccept({ bucket: 'WORTH_CONSIDERING', category: 'design' }), lowAccept({ final: settled('ACCEPT', 'judge') })]);
+  for (const x of [s1, w1, j1]) {
+    assert.deepEqual([x.final.decision, x.final.needsHuman, x.final.by], ['FOLLOW-UP', false, x.final.by]);
+    assert.match(x.final.reason, /^past review\.max_rounds \(round 5, limit 3\): because$/);
+  }
+  assert.deepEqual(s1.final.postMax, { from: 'ACCEPT', by: 'arbiter', ordinal: 5, max: 3 });
+  assert.equal(j1.final.postMax.by, 'judge');
+  assert.equal(isPostMaxFinal(s1), true);
+  for (const category of ['performance', 'maintainability', 'testing', 'design', 'docs', 'other']) assert.equal(pm([lowAccept({ category })])[0].final.decision, 'FOLLOW-UP', category);
+});
+
+test('applyPostMaxDefault: bugs, security, BLOCKING, human-owed, tests, cache, Claude, owner, forced and implemented items stay as they are', () => {
+  const stay = [
+    lowAccept({ category: 'logic' }), lowAccept({ category: 'bug' }), lowAccept({ category: 'security' }), lowAccept({ category: 'auth' }),
+    lowAccept({ bucket: 'BLOCKING' }),
+    lowAccept({ final: { ...settled('ACCEPT', 'arbiter'), needsHuman: true } }),
+    lowAccept({ final: settled('ACCEPT', 'test') }), lowAccept({ final: settled('ACCEPT', 'cache') }), lowAccept({ final: settled('ACCEPT', 'claude') }),
+    lowAccept({ final: settled('ACCEPT', 'owner', { ownerQuote: 'do it' }) }),
+    lowAccept({ final: settled('ACCEPT', 'arbiter', { forcedBy: 'second-review' }) }),
+    lowAccept({ implemented: true }),
+    lowAccept({ final: settled('FOLLOW-UP', 'arbiter') }), lowAccept({ final: settled('REJECT', 'arbiter') }), lowAccept({ final: null }),
+  ];
+  assert.deepEqual(pm(stay), stay);
+});
+
+test('applyPostMaxDefault: pure (inputs untouched), and only a settled postMax FOLLOW-UP is isPostMaxFinal', () => {
+  const a = lowAccept();
+  const before = structuredClone(a);
+  const [out] = pm([a]);
+  assert.deepEqual(a, before);
+  assert.notEqual(out, a);
+  assert.equal(isPostMaxFinal(a), false);
+  assert.equal(isPostMaxFinal({ ...out, final: { ...out.final, needsHuman: true } }), false);
+  assert.equal(isPostMaxFinal({ ...out, final: { ...out.final, by: 'claude' } }), false);
+});
+
+test('applyPostMaxDefault: an owner grant after the automatic extra round (ordinal max + 2) IS coerced; the extra round itself (max + 1) is not', () => {
+  const rounds = [1, 2, 3].map((n) => round(n, [])).concat([round(4, [], 'h', { admission: 'auto-extra' }), round(5, [], 'h', { admission: 'owner' })]);
+  assert.equal(autoExtraOrdinal({ rounds, maxRounds: 3 }), 4);
+  assert.equal(pm([lowAccept()], { ordinal: 4 })[0].final.decision, 'ACCEPT', 'max + 1');
+  assert.equal(pm([lowAccept()], { ordinal: 5 })[0].final.decision, 'FOLLOW-UP', 'max + 2');
+});
+
+test('applyPostMaxDefault: the repo severity predicate decides: a file with an accepted BLOCKING or security item, a sensitive path (either config) and an out-of-diff location each stay ACCEPT', () => {
+  const stays = (items, over) => items.every((i, k) => pm(items, over)[k].final.decision === 'ACCEPT');
+  // src/a.js also holds an accepted BLOCKING (and a security SUGGESTION): the low SUGGESTION beside them is not coerced, one on another file is.
+  const low = lowAccept({ file: 'src/a.js' });
+  const blocking = item({ bucket: 'BLOCKING', category: 'logic', final: settled('ACCEPT', 'arbiter'), file: 'src/a.js' });
+  const sec = lowAccept({ category: 'security', file: 'src/b.js' });
+  const other = lowAccept({ file: 'src/b.js', category: 'docs' });
+  const [a1, , b1, b2] = pm([low, blocking, sec, other]);
+  assert.equal(a1.final.decision, 'ACCEPT', 'file of an accepted BLOCKING item');
+  assert.equal(b2.final.decision, 'ACCEPT', 'file of an accepted security item');
+  assert.equal(b1.final.decision, 'ACCEPT');
+  assert.equal(pm([lowAccept({ file: 'src/b.js' })])[0].final.decision, 'FOLLOW-UP', 'the same file with nothing accepted beside it is coerced');
+  // sensitive: the working-tree list, and the trusted one when the PR emptied its own
+  const pay = lowAccept({ file: 'src/payroll/pay.js' });
+  assert.equal(stays([pay], {}), true, 'working-tree sensitive path');
+  assert.equal(stays([pay], { severity: { config: { risk: { high_risk_paths: [] } } } }), true, 'trusted-only sensitive path');
+  // location: outside the diff, unresolved, ambiguous
+  for (const file of ['src/elsewhere.js', '', '../x.js', undefined]) assert.equal(stays([lowAccept({ file })], {}), true, String(file));
+  assert.equal(stays([lowAccept({ file: 'src/a.js' })], { severity: { files: [...PM_FILES, ...PM_FILES] } }), true, 'ambiguous');
+});
+
+test('applyPostMaxDefault: no severity context, an unreadable diff, or an unreadable config keeps the ACCEPT (fail closed)', () => {
+  const a = lowAccept();
+  assert.equal(pm([a], { severity: null })[0].final.decision, 'ACCEPT', 'no context given');
+  assert.equal(pm([a], { severity: { files: null } })[0].final.decision, 'ACCEPT', 'diff unreadable');
+  assert.equal(pm([a], { severity: { config: null } })[0].final.decision, 'ACCEPT', 'working-tree config unreadable');
+  assert.equal(pm([lowAccept()])[0].final.decision, 'FOLLOW-UP', 'the plain case still coerces');
+});
+
+test('postMaxPolicy: follow-up only when EVERY config says follow-up; review in either (or an unreadable config) turns it off', () => {
+  const cfg = (v) => ({ review: { post_max_suggestions: v } });
+  assert.equal(postMaxPolicy([cfg('follow-up'), cfg('follow-up')]), 'follow-up');
+  assert.equal(postMaxPolicy([cfg('follow-up'), cfg('review')]), 'review');
+  assert.equal(postMaxPolicy([cfg('review'), cfg('follow-up')]), 'review');
+  assert.equal(postMaxPolicy([cfg('follow-up'), null]), 'review');
+  assert.equal(postMaxPolicy([cfg('follow-up'), {}]), 'review');
+  assert.equal(postMaxPolicy([]), 'review');
+});
+
+// R5 / F9: Claude may tighten a post-limit FOLLOW-UP back to ACCEPT (never loosen it), and it is not coerced again.
+test('claude-ruling over a post-max FOLLOW-UP: tightening to ACCEPT works, is not coerced again, and loosening or a dismissal is still refused', () => {
+  const [coerced] = pm([lowAccept()]);
+  assert.equal(claudeRulingRefusal(coerced, 'ACCEPT'), null);
+  assert.match(claudeRulingRefusal(coerced, 'FOLLOW-UP'), /not waiting for a human decision/);
+  assert.match(claudeRulingRefusal(coerced, 'REJECT'), /not waiting for a human decision/);
+  const tightened = applyClaudeRuling(coerced, { decision: 'ACCEPT', reason: 'worth fixing now', ruledAt: 't' });
+  assert.deepEqual([tightened.final.decision, tightened.final.by], ['ACCEPT', 'claude']);
+  assert.equal(tightened.final.claude.overruled.postMax.ordinal, 5);
+  assert.deepEqual(pm([tightened]), [tightened], 'never re-coerced');
+  assert.match(claudeRulingRefusal(tightened, 'FOLLOW-UP'), /cannot loosen/);
+  // an ordinary settled arbiter FOLLOW-UP is still not reopened by Claude (the allowance is the post-max final only)
+  assert.match(claudeRulingRefusal(lowAccept({ final: settled('FOLLOW-UP', 'arbiter') }), 'ACCEPT'), /not waiting for a human decision/);
+  // a carried (cache) copy of a post-max final may be tightened too; an implemented item never
+  assert.equal(claudeRulingRefusal({ ...coerced, final: { ...coerced.final, by: 'cache' } }, 'ACCEPT'), null);
+  assert.match(claudeRulingRefusal({ ...coerced, implemented: true }, 'ACCEPT'), /already implemented/);
+});
+
+// F5: the filing gate is in reviewEligibilityProblems only; roundOutcome is untouched. The inventory row binds the item into the merge digest (F6).
+const pmState = (items, extra = {}) => ({ maxRounds: 3, currentContentHash: 'h-final', rounds: [round(1, items)], ...extra });
+
+test('post-max FOLLOW-UP: review-complete eligibility refuses it until its issue is filed; roundOutcome (reachedMax / extraRound) is unchanged by it', () => {
+  const [coerced] = pm([lowAccept({ id: 'R5-S1' })]);
+  const unfiled = pmState([coerced]);
+  assert.match(reviewEligibilityProblems(unfiled).join(';'), /post-limit follow-up\(s\) without a filed issue: R5-S1/);
+  const filed = pmState([{ ...coerced, followupIssue: 'https://github.com/o/r/issues/9' }]);
+  assert.deepEqual(reviewEligibilityProblems(filed), []);
+  const plain = pmState([{ ...coerced, final: settled('FOLLOW-UP', 'arbiter') }]);
+  assert.deepEqual(reviewEligibilityProblems(plain), [], 'an ordinary arbiter FOLLOW-UP needs no issue to be eligible');
+  const a = roundOutcome(unfiled);
+  const b = roundOutcome(filed);
+  assert.deepEqual([a.reachedMax, a.extraRound, a.clean], [b.reachedMax, b.extraRound, b.clean]);
+});
+
+test('post-max FOLLOW-UP: one inventory row in the deferral group, saying who accepted it, the round, the limit and the issue; the digest binds it', () => {
+  const crit = item({ id: 'R1-B9', category: 'security', final: settled('FOLLOW-UP', 'claude') });
+  const [coerced] = pm([lowAccept({ id: 'R5-S1', title: 'Rename helper' })]);
+  const none = pmState([crit]);
+  const unfiled = pmState([crit, coerced]);
+  const { rows } = rulingsInventory(unfiled);
+  assert.deepEqual(rows.map((r) => r.split(' · ')[0]), ['R1-B9', 'R5-S1'], 'deferral rows after the critical ones');
+  assert.match(rows[1], /^R5-S1 · FOLLOW-UP · SUGGESTION · maintainability · by arbiter · content [0-9a-f]{12} · "Rename helper" · why: accepted by arbiter in round 5 past limit 3; NOT fixed in this merge; issue not filed yet$/);
+  const filed = pmState([crit, { ...coerced, followupIssue: 'https://github.com/o/r/issues/9' }]);
+  assert.match(rulingsInventory(filed).rows[1], /why: accepted by arbiter in round 5 past limit 3; NOT fixed in this merge; issue #9$/);
+  assert.notEqual(rulingsDigest(unfiled), rulingsDigest(none));
+  assert.notEqual(rulingsDigest(filed), rulingsDigest(unfiled), 'the issue number is part of the row');
+  assert.equal(rulingsInventory(none).count, 1, 'a state without post-max items lists exactly what it did');
+  // a tightened (Claude ACCEPT) item is not a post-limit dismissal any more: no row
+  const tightened = applyClaudeRuling(coerced, { decision: 'ACCEPT', reason: 'now', ruledAt: 't' });
+  assert.equal(rulingsInventory(pmState([crit, tightened])).count, 1);
+});
+
+// ---- the round trip-wire (roundTripWire) ---------------------------------------------------------------------------------------------------------------
+
+// n new ACCEPTs in each counted round; the extra rounds are listed with their own counts.
+const seriesState = (counts, { max = 3, extraRounds = [] } = {}) => ({
+  maxRounds: max,
+  rounds: counts.map((c, i) => round(i + 1, Array.from({ length: c }, () => item({ bucket: 'SUGGESTION', category: 'maintainability', final: settled('ACCEPT') })), `h${i}`, extraRounds.includes(i + 1) ? { baseOnly: true, items: [] } : {})),
+});
+const wire = (state, over = {}) => roundTripWire(state, { extraRounds: 3, notFalling: 2, ...over });
+
+test('roundTripWire: a #288-shaped series (accepts 3,5,6,8,9 against a limit of 3) trips on "not falling"; the numbers are reported', () => {
+  const r = wire(seriesState([3, 5, 6, 8, 9]));
+  assert.equal(r.tripped, true);
+  assert.deepEqual([r.reviewed, r.max, r.acceptsByRound], [5, 3, [3, 5, 6, 8, 9]]);
+  assert.match(r.reasons.join(';'), /2 past-limit round\(s\) accepted at least as many new items as the round before/);
+  assert.equal(wire(seriesState([3, 5, 6, 8]), { }).tripped, false, 'only one past-limit round so far (8 after 6)');
+  assert.equal(wire(seriesState([3, 5, 6, 8]), { notFalling: 1 }).tripped, true);
+});
+
+test('roundTripWire: a falling series, and zero-accept rounds, do not trip on "not falling"', () => {
+  assert.equal(wire(seriesState([6, 5, 4, 3, 2])).tripped, false, 'falling');
+  assert.equal(wire(seriesState([6, 5, 4, 2, 1])).tripped, false);
+  assert.equal(wire(seriesState([3, 2, 1, 0, 0])).tripped, false, '0 >= 0 does not count: nothing was accepted');
+  assert.equal(wire(seriesState([3, 2, 1, 1, 0]), { extraRounds: 10 }).tripped, false, 'a flat 1 then 1 counts once only');
+  assert.equal(wire(seriesState([3, 2, 1, 1, 1])).tripped, true, 'two flat non-zero past-limit rounds');
+});
+
+test('roundTripWire: the hard limit max + extraRounds trips on its own; below it, within the limit, uncapped and base-only rounds do not', () => {
+  const four = seriesState([2, 2, 2, 0, 0, 0]);
+  assert.equal(wire(four, { extraRounds: 3 }).tripped, true, '6 counted rounds >= 3 + 3');
+  assert.match(wire(four, { extraRounds: 3 }).reasons.join(';'), /6 counted rounds reached review\.max_rounds 3 \+ 3/);
+  assert.equal(wire(seriesState([2, 2, 2, 0, 0]), { extraRounds: 3 }).tripped, false);
+  assert.equal(wire(seriesState([5, 6, 7]), { extraRounds: 3 }).tripped, false, 'within the limit nothing trips, however the counts move');
+  const withBase = seriesState([2, 2, 2, 0, 0, 0], { extraRounds: [3] }); // round 3 is a base-only round: 5 counted rounds
+  assert.equal(wire(withBase, { extraRounds: 3 }).reviewed, 5);
+  assert.equal(wire(withBase, { extraRounds: 3 }).tripped, false);
+  assert.equal(roundTripWire({ rounds: seriesState([1, 2, 3, 4, 5, 6]).rounds }, { extraRounds: 1, notFalling: 1 }).tripped, false, 'no finite maxRounds');
+});
+
+test('roundTripWire: a cached ACCEPT and a post-max FOLLOW-UP are not new accepts', () => {
+  const cached = item({ bucket: 'SUGGESTION', category: 'maintainability', final: settled('ACCEPT', 'cache') });
+  const [coerced] = pm([lowAccept()]);
+  const state = { maxRounds: 1, rounds: [round(1, [lowAccept()]), round(2, [cached, cached, coerced]), round(3, [cached])] };
+  assert.deepEqual(wire(state).acceptsByRound, [1, 0, 0]);
 });

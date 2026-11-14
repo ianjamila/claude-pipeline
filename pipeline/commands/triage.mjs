@@ -14,13 +14,15 @@ import { EXIT, UnavailableError, UsageError, intOption, parseCommandArgs, requir
 import { Fail, guarded, requireConfig, resolveRepo } from '../lib/cmd-common.mjs';
 import { SECOND_REVIEW_SCHEMA_PATH, buildCodexArgs, buildSecondReviewPrompt } from '../lib/codex.mjs';
 import { execCodex, readCodexAnswer } from '../lib/codex-exec.mjs';
-import { git, headSha, isAncestor, mergeBase, revParse, reviewContentHash, showFile } from '../lib/git.mjs';
+import { diffFiles, git, headSha, isAncestor, mergeBase, revParse, reviewContentHash, showFile } from '../lib/git.mjs';
 import { hashBranch } from '../lib/risk.mjs';
 import { matchAny } from '../lib/glob.mjs';
 import { GhError, runShellAsync } from '../lib/proc.mjs';
 import { findSubagentTranscript, proveModel, extractJsonBlock } from '../lib/transcript.mjs';
 import { STATE_VERSION_CLAUDE, STATE_VERSION_DEFERRAL, STATE_VERSION_SUBSTITUTE, maxRiskOf, saveState, updateItems, withStateVersion } from '../lib/state.mjs';
-import { askSummary } from '../lib/round-ask.mjs';
+import { askSummary, processReviewSummary, roundsFrom } from '../lib/round-ask.mjs';
+import { postMaxApply, fixRoundScope } from '../lib/fix-verify.mjs';
+import { baseConfigAt } from '../lib/config.mjs';
 import { gatherRoundStatus, reviewedDiff, trustedBaseConfig } from '../lib/round-status.mjs';
 import { createGitHub, guardGh } from '../lib/github.mjs';
 import { askFields, clickGate } from '../lib/click-ask.mjs';
@@ -28,7 +30,7 @@ import { roundAsk, rulingAsk } from '../hooks/lib/owner-go-click.mjs';
 import { grantIdOf, ownerGrantLookups, ownerGrantedRounds, ownerRuled, ownerRulingGap, rulingConfigDirHint } from '../hooks/lib/owner-go.mjs';
 import {
   applyClaudeRuling, applyJudge, applyOwnerRuling, applyTestResult, asciiLine, claudeRulingRefusal, DECISIONS, deferEligibility, deferItemsInState, finalizeWithoutArbiter, isOwnerRuled,
-  isProtectedFinal, markLightLane, reviewedRoundCount, roundAdmission, roundOutcome, rulingContentDigest, secondReviewRefusal, settleSecondReview, substituteAgentFor, validateSecondReview, validateTriage,
+  countsTowardCap, isProtectedFinal, markLightLane, reviewedRoundCount, roundAdmission, roundOutcome, roundTripWire, rulingContentDigest, secondReviewRefusal, settleSecondReview, substituteAgentFor, validateSecondReview, validateTriage,
 } from '../lib/triage.mjs';
 import {
   currentContentHash, ensureRoundDir, findItem, findRound, readFileOrFail, refreshBaseRef, refreshTrustedDefault, requireState, reviewBaseRef, roundDir, sha256, withRouteLock, withStateLock, writeFileAtomic, writeJson,
@@ -58,7 +60,11 @@ export const meta = {
     'pipeline triage ruling-request --pr N --ids ID[,ID…] [--ask] [--repo DIR]',
     '  -> {ok, line}: the LAST line of the reply that asks the owner to rule, `⚖️ Owner ruling needed #N: ID, ID · content <digest12> · repo owner/name`; the digest covers the text of exactly those items in the current review state (exit 1 for an unknown id, a --pr that is not the review state\'s, or a repository off github.com)',
     '  -> --ask (click-to-approve #261, owner_approval: chat): also {ask: {askId, questions}}: a choice question (Not now | Accept all | Follow-up all | Reject all) whose text is the item summaries and then exactly that line, written as an ask file (one-time use, expires after 24 h, superseded by a newer ask for the same PR); the review skill passes it to AskUserQuestion verbatim and the owner-go hook records a human click as the same ruling a typed `ID: accept|follow-up|reject` per asked id records; otherwise ask: null and askSkipped (owner_approval is not chat | owner_go.click is off | dialog hooks not approved: the owner runs `pipeline owner-go approve-dialog-hooks` once | the ask could not be issued)',
-    'pipeline triage round-request --pr N [--ask] [--past] [--repo DIR]',
+    'pipeline triage round-request --pr N [--ask] [--past] [--after-process-review] [--repo DIR]',
+    '  -> the TRIP-WIRE (a prompt, not a gate; ON by default, review.trip_wire_extra_rounds / review.trip_wire_not_falling, the smaller of the working-tree and fork-point values): when the PR has reviewed max_rounds + extra counted rounds, or at least not_falling past-limit rounds',
+    '     accepted (more than 0 and) at least as many new items as the round before, the ask does not print a line: exit 1 {ok:false, error:"trip-wire", tripWire: {tripped, reviewed, max, acceptsByRound, reasons}, processReview: {headline, summary}}. Park the PR with the headline',
+    '     (`pipeline comment --kind blocked --reason <headline>`, run-record outcome blocked, detail process-review), paste the summary and ask the owner. Only after the owner chooses one more round, run it again with --after-process-review: the usual answer and line, plus tripWire and processReview.',
+    '     Not tripped: no tripWire field, the answer is unchanged.',
     '  -> {ok, line, k, n, head, rounds, cost, open, notClean, recommend, why, discard, summary, warnings}: the LAST line of the reply that asks the owner for ONE more review round past review.max_rounds, `🔁 Extra review round needed #N: round K · head <head12> · repo owner/name`',
     '     (k = the counted round it would be: reviewed rounds + 1, base-only and resolution-only rounds not counted; n = the round number to pass to codex-review --round; head = the checked-out HEAD)',
     '  -> everything but line, k, n and head is display only and decides nothing: rounds {reviewed, max, autoExtraUsed, ownerGranted, next}; cost {bookedUsd, reviewUsd, fableUsd, perRoundUsd, lastRound, lastRoundUsd} (the last two from cost.byRound, \`cost --round R\`: the newest counted round with a booking, else null) from the PR\'s run record (read-only; null with a warning when it cannot be read);',
@@ -169,7 +175,7 @@ function validate(rest, ctx) {
   return withStateLock(root, ctx, () => validateLocked(values, n, root, ctx));
 }
 
-function validateLocked(values, n, root, ctx) {
+async function validateLocked(values, n, root, ctx) {
   const state = requireState(root);
   const round = findRound(state, n);
   // One reviewer layer after Codex: a Fable round's items are ruled by the Fable pass alone (arbiter needed/apply).
@@ -196,7 +202,8 @@ function validateLocked(values, n, root, ctx) {
   if (!checked.ok) return invalid(checked.errors);
 
   const env = ctx.env ?? process.env;
-  const items = finalizeWithoutArbiter(applyJudge(round.items, json), { lightLane: state.lightLane, force: forceArbiter(env) });
+  // Past review.max_rounds (+ the owner-granted round) a low-severity ACCEPT becomes a FOLLOW-UP when review.post_max_suggestions says so in both configs (#374 PR B; off by default).
+  const items = await postMaxApply(finalizeWithoutArbiter(applyJudge(round.items, json), { lightLane: state.lightLane, force: forceArbiter(env) }), { state, round, root });
   const next = updateItems(state, n, items);
   const dir = ensureRoundDir(root, n);
   writeJson(path.join(dir, 'triage.json'), { triage: json, judgeProof });
@@ -898,7 +905,7 @@ function pastRoundRequest({ pr, root, config, ctx }) {
 // The line that ends the reply asking the owner for one more review round: the CLI writes it (counted ordinal k, the checked-out head, the
 // repository gh resolves on github.com), so the agent cannot ask for a round or a head of its own choosing. Chat mode only.
 async function roundRequest(rest, ctx) {
-  const { values } = parseCommandArgs(rest, { pr: { type: 'string' }, past: { type: 'boolean' }, repo: { type: 'string' }, ask: { type: 'boolean' } }, { allowPositionals: false });
+  const { values } = parseCommandArgs(rest, { pr: { type: 'string' }, past: { type: 'boolean' }, repo: { type: 'string' }, ask: { type: 'boolean' }, 'after-process-review': { type: 'boolean' } }, { allowPositionals: false });
   const pr = intOption(values, 'pr', { required: true, min: 1 });
   const root = resolveRepo(values, ctx);
   const { config } = await requireConfig(root);
@@ -936,10 +943,36 @@ async function roundRequest(rest, ctx) {
     } catch (err) {
       warnings.push(`the ask could not be summarised (${asciiLine(err?.message, 160)}): the line above still stands`);
     }
+    // The trip-wire (#374 PR B): a prompt before another round, never a refusal of the owner's own words. Tripped without --after-process-review: no line, no ask file.
+    const { wire, processReview } = tripWireOf({ state, config, root, head, k, shown });
+    if (wire.tripped && values['after-process-review'] !== true) {
+      return { exitCode: EXIT.FAILED, output: { ok: false, error: 'trip-wire', k, n, head, tripWire: wire, processReview, warnings } };
+    }
     // (#261) click-to-approve: --ask also writes the dialog's ask file (the question text is exactly the line); it never changes the display fields above.
     const asked = values.ask === true ? askFields({ gate: clickGate({ config, root, ctx }), parts: roundAsk({ repo: slug, pr, line }), ctx }) : {};
-    return { exitCode: EXIT.OK, output: { ok: true, line, k, n, head, ...shown, warnings, ...asked } };
+    return { exitCode: EXIT.OK, output: { ok: true, line, k, n, head, ...shown, warnings, ...asked, ...(wire.tripped ? { tripWire: wire, processReview } : {}) } };
   }, pr));
+}
+
+// The round trip-wire (lib/triage.mjs#roundTripWire) with the SMALLER of each setting in the working-tree and the fork-point config (a PR must not loosen its own wire; an unreadable
+// fork-point config leaves the working-tree one). A wire that cannot be computed is not tripped: it is a prompt, and a broken one must never be what blocks the owner's own ask.
+function tripWireOf({ state, config, root, head, k, shown }) {
+  try {
+    const fork = state.rounds.findLast((r) => typeof r.forkPoint === 'string');
+    const read = fork === undefined ? { ok: false } : baseConfigAt(fork.forkPoint, root);
+    const configs = [config, ...(read.ok ? [read.config] : [])];
+    const smallest = (key) => Math.min(...configs.map((c) => c.review[key]));
+    const wire = roundTripWire(state, { extraRounds: smallest('trip_wire_extra_rounds'), notFalling: smallest('trip_wire_not_falling') });
+    if (!wire.tripped) return { wire, processReview: null };
+    let fixScope = null;
+    try {
+      const last = state.rounds.findLast(countsTowardCap);
+      if (last !== undefined) fixScope = fixRoundScope({ files: diffFiles(last.toHead, head, { cwd: root }), configs });
+    } catch { /* not measured: the line is left out */ }
+    return { wire, processReview: processReviewSummary({ rounds: shown.rounds ?? roundsFrom(state), cost: shown.cost ?? null, open: shown.open, notClean: shown.notClean, wire, fixScope, nextRound: k }) };
+  } catch {
+    return { wire: { tripped: false, reviewed: 0, max: null, acceptsByRound: [], reasons: [] }, processReview: null };
+  }
 }
 
 // The display fields of the ask. `grants` is the same lookup the admission check used (any head); `grantGap` says why it found nothing ('provenance' = a record exists that cannot be
