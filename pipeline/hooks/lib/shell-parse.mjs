@@ -12,6 +12,8 @@
 
 import { sqlShellEscapes, sqlFamilyOf, sqlClientPlan, SQL_CLIENT_NAMES, SQL_RC_MENTION } from './sql-clients.mjs';
 const MAX_COMMANDS = 500;
+// (#352 R22-F1: a named-descriptor word `{fd}` before a redirect operator; bash >= 4.3 also takes an array element (`{a[0]}>f` assigns the number to a[0]))
+const FD_NAME_WORD = /^\{([A-Za-z_]\w*)(?:\[[^\]]*\])?\}$/;
 const MAX_NEST = 200; // in-place nesting of $( ), ( ), <( ) before we give up on the line
 const MAX_WORK = 8_000_000; // total characters lexed across all recursive parses
 const HARD_MAX_DEPTH = 50;
@@ -873,9 +875,9 @@ export function implicitBindsOf(c) {
   }
   const el = /^([A-Za-z_]\w*)\[[^\]]*\]\+?=/.exec(argv[0] ?? '');
   if (el) out.push(el[1]);
-  for (const a of argv) { const fd = /^\{([A-Za-z_]\w*)\}$/.exec(a); if (fd) out.push(fd[1]); }
+  for (const a of argv) { const fd = FD_NAME_WORD.exec(a); if (fd) out.push(fd[1]); }
   // (#352 R21-F1: a LEADING `{k}>f` word is a redirect with no command word and is in no argv: read the names from the command's text too, line continuations removed (a match in a quote only makes this stricter))
-  for (const m of String(c.raw ?? '').replace(/\\\r?\n/g, '').matchAll(/(?<!\$)\{([A-Za-z_]\w*)\}[^\S\n]*[<>]/g)) out.push(m[1]);
+  for (const m of String(c.raw ?? '').replace(/\\\r?\n/g, '').matchAll(/(?<!\$)\{([A-Za-z_]\w*)(?:\[[^\]\n]*\])?\}[^\S\n]*[<>]/g)) out.push(m[1]);
   if (/^\s*coproc\b/.test(String(c.raw ?? ''))) {
     out.push('COPROC', 'COPROC_PID');
     if (/^[A-Za-z_]\w*$/.test(argv[0] ?? '')) out.push(argv[0], `${argv[0]}_PID`);
@@ -2465,7 +2467,7 @@ class Parser {
         seg.redirects.push({ op: rop, target: dup ? '&' + text : text, fd: rfd });
         if (subs.length && text.startsWith('>(')) seg.outSubs.push(subs); // `cat f > >(bash)`: the substitution's commands read what this command writes
         // Why: `exec 3< f.sh; bash <&3`: a descriptor opened from a file earlier on the line (or a `{fd}<` named one) is read by the shell that gets it as stdin
-        if ((rop === '<' || rop === '<>') && ((rfd !== null && rfd !== 0) || (rfd === null && /^\{[A-Za-z_]\w*\}$/.test(seg.words[seg.words.length - 1]?.text ?? '')))) {
+        if ((rop === '<' || rop === '<>') && ((rfd !== null && rfd !== 0) || (rfd === null && FD_NAME_WORD.test(seg.words[seg.words.length - 1]?.text ?? '')))) {
           const e = newSt();
           if (subs.length && isProcSub(text)) subsProduced(subs, e, 1); else if (text !== '/dev/null') { e.files.push(text); e.groups.push([text]); }
           const prev = this.ctx.fdFeeds.get(rfd ?? '{}');
@@ -2502,7 +2504,7 @@ class Parser {
       const dblWas = this.dblOpen; // (read before the `]]` below clears it: it survives a && / || / ( ) that splits the segment inside the [[ ]], R19-B1)
       if (seg.condWatch) {
         if (q < 0 && (text === 'then' || text === 'do' || text === ']]' || AFTER_PAREN_RESERVED.has(text))) { if (text !== ']]') seg.condWatch = false; }
-        else if (q < 0 && /^\{[A-Za-z_]\w*\}$/.test(text) && /[<>]/.test(s[this.i] ?? '')) seg.condAnon = false;
+        else if (q < 0 && FD_NAME_WORD.test(text) && /[<>]/.test(s[this.i] ?? '')) seg.condAnon = false;
         else if (q < 0 && text === '{' && seg.condAnon) seg.condWatch = false;
         else { ctx.ctlBroken = true; if (seg.condDbl === true && text !== '{') ctx.truncated = true; seg.condWatch = false; } // (truncated: the body is in the argv of `[[` here, no command of its own that ctlBroken could refuse: R17-F3)
         seg.condAnon = false;
@@ -2540,7 +2542,7 @@ class Parser {
       else if (seg.afterDbl === true) {
         seg.afterDbl = false;
         if (q < 0 && text === '{') { /* (a brace body: the { splits the segment) */ }
-        else if (q < 0 && /^\{[A-Za-z_]\w*\}$/.test(text) && /[<>]/.test(s[this.i] ?? '')) seg.afterDbl = true; // (R19-F2: a `{fd}` redirect prefix is no word: the watch stays armed for the real word, or the end of the segment)
+        else if (q < 0 && FD_NAME_WORD.test(text) && /[<>]/.test(s[this.i] ?? '')) seg.afterDbl = true; // (R19-F2: a `{fd}` redirect prefix is no word: the watch stays armed for the real word, or the end of the segment)
         else if (q < 0 && (text === 'do' || text === 'elif' || AFTER_PAREN_RESERVED.has(text))) seg.afterDbl = 'kw';
         else ctx.truncated = true;
       }
@@ -2592,7 +2594,7 @@ class Parser {
       }
       if (text === '{' || text === '(') seg.fnActive = false;
       fnPending = fnName && seg.fnActive === true; // (a name of `function NAME` ending the line: its body may open on the next)
-      seg.words.push({ text, qa: q, bm: marks, dyn, subs, win, pat, one, fdRedir: q < 0 && /^\{[A-Za-z_]\w*\}$/.test(text) && /[<>]/.test(s[this.i] ?? '') }); // (fdRedir: a `{fd}>file` redirect prefix, no command word: see finalizeGroup, R19-F2)
+      seg.words.push({ text, qa: q, bm: marks, dyn, subs, win, pat, one, fdRedir: q < 0 && FD_NAME_WORD.test(text) && /[<>]/.test(s[this.i] ?? '') }); // (fdRedir: a `{fd}>file` redirect prefix, no command word: see finalizeGroup, R19-F2)
     };
     const endSeg = (idx) => {
       flushWord();
@@ -3120,6 +3122,9 @@ class Parser {
     // redirect on that command and a syntax error elsewhere, so it runs nothing the other reading could run)
     if (words.some((w) => w.fdRedir === true)) {
       if (!(seg.afterParen === true && words.every((w) => w.fdRedir === true))) this.ctx.ctlBroken = true;
+      // (#352 R22, first arbiter run: a leading `{k}>f` followed by any word is the command `{k}` in sh / bash 3.2, so what follows (an assignment `{k}>f D=x`, `export D=x`, a command) never ran there: refused.
+      // A lone `{fd}>f` (or several) stays narrowed: it runs nothing in either reading)
+      if (fdLead && i < words.length) this.ctx.truncated = true;
       let j = i;
       while (j < words.length && assignOf(words[j])) j++;
       // (push security review of 5f7cdd12: only a pure `exec {fd}>f [{fd2}>g …]` runs nothing; `exec {fd}>f CMD` runs CMD in zsh and a command named {fd} in sh: refused below)

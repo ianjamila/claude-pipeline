@@ -526,11 +526,11 @@ test('#352 R18-F1..F3: a word after a ]] that closes a [[ ]] command is a short-
   refuses('#352 R19-F2b: X=1 {fd}>/dev/null push (main)', `X=1 {fd}>/dev/null ${SHIP}`, {}, MAIN_DIR);
   refuses('#352 R19-F2b: command {fd}>/dev/null push (main)', `command {fd}>/dev/null ${SHIP}`, {}, MAIN_DIR);
   refuses('#352 R19-F2b: git {fd}>/dev/null push (main)', `git {fd}>/dev/null ${PUSH} origin HEAD`, {}, MAIN_DIR);
-  denies('#352 R19-F2b: {fd}>/dev/null X=1 push (main)', `{fd}>/dev/null X=1 ${SHIP}`, {}, MAIN_DIR);
+  refuses('(R22: leading {fd} + word is refused) #352 R19-F2b: {fd}>/dev/null X=1 push (main)', `{fd}>/dev/null X=1 ${SHIP}`, {}, MAIN_DIR);
   refuses('twin (R20: a {fd} word that is not leading is refused): cd other && X=1 {fd}>/dev/null push', `cd /work/other2 && X=1 {fd}>/dev/null ${SHIP}`, {}, MAIN_DIR);
   refuses('twin (R20: a {fd} word that is not leading is refused): cd other && command {fd}>/dev/null push', `cd /work/other2 && command {fd}>/dev/null ${SHIP}`, {}, MAIN_DIR);
   refuses('twin (R20: a {fd} word that is not leading is refused): cd other && git {fd}>/dev/null push', `cd /work/other2 && git {fd}>/dev/null ${PUSH} origin HEAD`, {}, MAIN_DIR);
-  denies('twin (R20: a {fd} word makes the cd of the line uncertain): cd other && {fd}>/dev/null X=1 push', `cd /work/other2 && {fd}>/dev/null X=1 ${SHIP}`, {}, MAIN_DIR);
+  refuses('(R22: leading {fd} + word is refused) twin (R20: a {fd} word makes the cd of the line uncertain): cd other && {fd}>/dev/null X=1 push', `cd /work/other2 && {fd}>/dev/null X=1 ${SHIP}`, {}, MAIN_DIR);
   // lines that use [[ ]] as an ordinary command keep their verdict
   allows('twin: [[ ]] && push', `[[ -n x ]] && ${SHIP}`, {}, '/work/other2');
   allows('twin: [[ ]] || exit; push', `[[ -n x ]] || exit; ${SHIP}`, {}, '/work/other2');
@@ -580,6 +580,18 @@ test('#352 R21-F2: a non-leading {fd}>f word refuses the line whatever the comma
   allows('twin: (true) {fd}>/dev/null; push', `(true) {fd}>/dev/null; ${SHIP}`, {}, GIT_ROOT);
 });
 
+// (#352 R22: a subscripted descriptor name `{a[0]}>f` (bash >= 4.3) is a named-descriptor word like `{a}>f`; a leading one followed by any word refuses the line)
+test('#352 R22: {a[0]}>f is a named-descriptor word, and a leading {fd}>f followed by a word refuses the line', () => {
+  refuses('{a[0]}>f push HEAD:main', `{a[0]}>/dev/null ${SHIP}:${MAIN}`, {}, GIT_ROOT);
+  refuses('git push origin {a[0]}>f (main)', `git ${PUSH} origin {a[0]}>/dev/null`, {}, MAIN_DIR);
+  refuses('echo text | bash {a[0]}>f', `echo 'git ${PUSH} origin HEAD:${MAIN}' | bash {a[0]}>/dev/null`, {}, GIT_ROOT);
+  refuses('{fd}>f X=1 push (main)', `{fd}>/dev/null X=1 ${SHIP}`, {}, MAIN_DIR);
+  refuses('{fd}>f push (agent branch)', `{fd}>/dev/null ${SHIP}`, {}, GIT_ROOT);
+  // unchanged: a lone leading {fd}>f, a pure exec
+  allows('twin: {fd}>/dev/null; push', `{fd}>/dev/null; ${SHIP}`, {}, GIT_ROOT);
+  allows('twin: exec {a[0]}>/dev/null; push', `exec {a[0]}>/dev/null; ${SHIP}`, {}, GIT_ROOT);
+});
+
 // (#352 R19: the R18 watch for a word after `]]` was tied to one segment and to the single next word: an inner && of the [[ ]] split the segment (B1), a reserved word right after `]]` hid the same-line body in
 // the argv of `[[` (F1), and a `{fd}` redirect prefix disarmed it (F2))
 test('#352 R19-B1, R19-F1, R19-F2: the ]] watch survives a && inside [[ ]], a same-line body after ]] then / ]] do is refused, a {fd} redirect does not disarm it', () => {
@@ -591,8 +603,8 @@ test('#352 R19-B1, R19-F1, R19-F2: the ]] watch survives a && inside [[ ]], a sa
   refuses('R19-F1: if [[ a && b ]] then push; fi', `if [[ -n a && -n b ]] then ${SHIP}; fi`);
   refuses('R19-F2: if { true } && [[ ]] {fd}>/dev/null push', `if { true } && [[ -n x ]] {fd}>/dev/null ${SHIP}`);
   refuses('R19-F2: if [[ ( ) ]] {fd}>/dev/null push', `if [[ ( -n x ) ]] {fd}>/dev/null ${SHIP}`);
-  denies('R19-F2: a {fd}>file redirect prefix is no command word: {fd}>/dev/null push (main)', `{fd}>/dev/null ${SHIP}`, {}, MAIN_DIR);
-  denies('R19-F2: true && {fd}>/dev/null push (main)', `true && {fd}>/dev/null ${SHIP}`, {}, MAIN_DIR);
+  refuses('(R22: leading {fd} + word is refused) R19-F2: a {fd}>file redirect prefix is no command word: {fd}>/dev/null push (main)', `{fd}>/dev/null ${SHIP}`, {}, MAIN_DIR);
+  refuses('(R22: leading {fd} + word is refused) R19-F2: true && {fd}>/dev/null push (main)', `true && {fd}>/dev/null ${SHIP}`, {}, MAIN_DIR);
   // lines that use [[ ]] as an ordinary command keep their verdict
   allows('twin: if [[ ]]; then push; fi', `if [[ -n x ]]; then ${SHIP}; fi`, {}, '/work/other2');
   allows('twin: [[ a && b ]] && push', `[[ -n a && -n b ]] && ${SHIP}`, {}, '/work/other2');
@@ -611,9 +623,9 @@ test('#352 R20-F1, R20-F2: a {fd} redirect word before a reserved word, in sh / 
     refuses(`R20-F1: {fd}>/dev/null ${kw} cd other; push (main)`, `{fd}>/dev/null ${kw} cd /work/other2; ${SHIP}`, {}, MAIN_DIR);
   }
   refuses('R20-F1: {fd}>/dev/null function f cd other; push (main)', `{fd}>/dev/null function f cd /work/other2; ${SHIP}`, {}, MAIN_DIR);
-  denies('R20-F2: sh -c {fd}>/dev/null cd other; push (main)', `sh -c '{fd}>/dev/null cd /work/other2; ${SHIP}'`, {}, MAIN_DIR);
-  denies('R20-F2: bash -c {fd}>/dev/null cd other; push (main)', `bash -c '{fd}>/dev/null cd /work/other2; ${SHIP}'`, {}, MAIN_DIR);
-  denies('R20-F2: {fd}>/dev/null cd other; push (main)', `{fd}>/dev/null cd /work/other2; ${SHIP}`, {}, MAIN_DIR);
+  refuses('(R22: leading {fd} + word is refused) R20-F2: sh -c {fd}>/dev/null cd other; push (main)', `sh -c '{fd}>/dev/null cd /work/other2; ${SHIP}'`, {}, MAIN_DIR);
+  refuses('(R22: leading {fd} + word is refused) R20-F2: bash -c {fd}>/dev/null cd other; push (main)', `bash -c '{fd}>/dev/null cd /work/other2; ${SHIP}'`, {}, MAIN_DIR);
+  refuses('(R22: leading {fd} + word is refused) R20-F2: {fd}>/dev/null cd other; push (main)', `{fd}>/dev/null cd /work/other2; ${SHIP}`, {}, MAIN_DIR);
   refuses('R20-F2: sh -c git --namespace {x}>/dev/null push (main)', `sh -c 'git --namespace {x}>/dev/null ${PUSH} origin HEAD:${MAIN}'`, {}, MAIN_DIR);
   refuses('R20-F2: bash -c git --namespace {x}>/dev/null push (main)', `bash -c 'git --namespace {x}>/dev/null ${PUSH} origin HEAD:${MAIN}'`, {}, MAIN_DIR);
   refuses('R20-F2: git --work-tree {x}>/dev/null push (main)', `git --work-tree {x}>/dev/null ${PUSH} origin HEAD:${MAIN}`, {}, MAIN_DIR);

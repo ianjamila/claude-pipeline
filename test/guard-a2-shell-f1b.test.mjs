@@ -126,6 +126,27 @@ test('#352 R21-F1: a leading named descriptor redirection rebinds the name for f
   assert.equal(git('export k=5; zsh run.sh', { 'run.sh': `true; gh issue ${CL} $k\n` }, { issueLabels: labels }).decision, 'allow');
 });
 
+// (#352 R22: bash >= 4.3 takes an array element as the descriptor name (`{F[0]}>f` assigns the number to F[0], so $F changes); a leading `{k}>f` followed by an assignment is the command `{k}` in
+// sh / bash 3.2, so the assignment never ran there and an inherited value stays)
+test('#352 R22: a subscripted named descriptor rebinds its array, and an assignment after a leading {k}>f is not believed', () => {
+  const fs = fakeFs(PROJ, {}, [...DIRS, '.review']);
+  for (const pre of ['{F[0]}>/dev/null true', '{F[0]}>/dev/null', 'ls {F[0]}>/dev/null', 'exec {F[1]}>/dev/null']) {
+    assert.equal(files(`F=x; ${pre}; echo '{}' > .review/round-$F/arbiter-output.json`, fs).decision, 'deny', pre);
+  }
+  for (const body of ['{k}>/dev/null F=x', '{k}>/dev/null export F=x', '{k[0]}>/dev/null F=x']) {
+    const sfs = fakeFs(PROJ, { 'run.sh': `${body}\necho '{}' > .review/round-$F/arbiter-output.json\n` }, [...DIRS, '.review']);
+    assert.equal(files('export F=22; sh run.sh', sfs).decision, 'deny', body);
+  }
+  const CL = 'cl' + 'ose';
+  const labels = (n) => (n === '5' ? [] : ['pipeline-pause']);
+  for (const body of [`{k[0]}>/dev/null; gh issue ${CL} $k\n`, `ls {k[0]}>/dev/null; gh issue ${CL} $k\n`]) {
+    assert.equal(git('export k=5; bash run.sh', { 'run.sh': body }, { issueLabels: labels }).decision, 'deny', body);
+  }
+  // unchanged: a script that assigns plainly
+  const ok = fakeFs(PROJ, { 'run.sh': "F=x\necho '{}' > /tmp/round-$F.json\n" }, [...DIRS, '.review']);
+  assert.equal(files('export F=22; sh run.sh', ok).decision, 'allow');
+});
+
 // ---- the second pass of a stale line spends what the first one left ------------------------------------------------------------------------------------------
 
 // main.sh runs n scripts; the first through "${BASH:-bash}" (rewritten), the last one binds BASH (judged after the rewrite, so the verdict is stale and the line is judged again)
