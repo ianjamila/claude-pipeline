@@ -3130,17 +3130,33 @@ function readOnlyWith(name, args, cmd, ctx, argv) {
   }
   // (#352 merge of main: zsh's print writes its words to standard output like echo; an option cluster before the first operand that binds a name (-v), feeds the history (-s / -S) or the
   // edit buffer (-z), writes to a numbered descriptor (-u, -p) or prompt-expands its words (-P) is not read-only. A word after `-` / `--` or the first operand ends the options.
-  // R28-F2: an option that takes a value (-C -f -u -v -x -X) takes the rest of its cluster (`-C2`), or the next word when it ends the cluster (`-C 1`), and the scan goes on after it.)
+  // R28-F2: an option that takes a value (-C -f -u -v -x -X) takes the rest of its cluster (`-C2`), or the next word when it ends the cluster (`-C 1`), and the scan goes on after it.
+  // R29-F3: -f makes print zsh's printf, which reads the operand of a numeric conversion (or a `*`) as arithmetic: the format, as written and as expanded, must convert no number
+  // (printfFormatEvaluates, as for printf), and no word may hold a subscript-evaluation form. A word that may still start with `-` at run time (`print "$O" x`) may be any option.)
   if (name === 'print') {
-    for (let i = 0; i < args.length; i++) {
-      const a = args[i];
-      if (a === '-' || a === '--' || !/^[-+]/.test(a)) break;
-      for (let k = 1; k < a.length; k++) {
-        if ('vsSzuPp'.includes(a[k])) return false;
-        if ('CfxX'.includes(a[k])) { if (k === a.length - 1) i++; break; }
+    const fmtOf = (ws) => {
+      const out = {};
+      for (let i = 0; i < ws.length; i++) {
+        const a = ws[i];
+        if (/^[$`]/.test(a)) return { bad: true };
+        if (a === '-' || a === '--' || !/^[-+]/.test(a)) break;
+        for (let k = 1; k < a.length; k++) {
+          if ('vsSzuPp'.includes(a[k])) return { bad: true };
+          if ('CfxX'.includes(a[k])) {
+            const value = k < a.length - 1 ? a.slice(k + 1) : ws[++i];
+            if (a[k] === 'f') out.fmt = out.fmt === undefined ? (value ?? null) : null; // (a second -f: which one wins is not modelled)
+            break;
+          }
+        }
       }
-    }
-    return true;
+      return out;
+    };
+    const raw = fmtOf(argv.slice(1));
+    const now = fmtOf(args);
+    if (raw.bad || now.bad) return false;
+    if (raw.fmt === undefined && now.fmt === undefined) return true;
+    if (raw.fmt == null || now.fmt == null || printfFormatEvaluates(raw.fmt) || printfFormatEvaluates(now.fmt)) return false;
+    return ![...args, ...argv.slice(1)].some((w) => SUBSCRIPT_FORM.test(w));
   }
   if (name === 'find') return !args.some((a) => FIND_UNSAFE.test(a));
   if (name === 'git') return gitReadOnly(args) && !toolEnvTouched(cmd, ctx, GIT_TOOL_ENV);

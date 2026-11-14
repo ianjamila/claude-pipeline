@@ -284,6 +284,9 @@ function nextDir(dir, name, argv, ctx, cdpath = false, env = {}) {
   // a word still holding a run-time part (`cd -"$N"` may be a stack entry; Codex review 3 of #50)
   if (args.some((a) => /^[+-]\d+$/.test(a) || DYNAMIC.test(a))) return null;
   const k = args.indexOf('--');
+  // (#352 R29-B1 / R29-F2: an option word the shell refuses (`cd -Q`) fails the cd, which stays where it was, and bash's `pushd -n DIR` succeeds without moving: only cd's -L and -P are known
+  // to move to the operand (zsh's -s refuses a symbolic link, bash's -e / -@ are rare): any other option word, and every pushd option, leaves the directory unknown)
+  if ((k >= 0 ? args.slice(0, k) : args).some((a) => a.length > 1 && a[0] === '-' && !(name === 'cd' && /^-[LP]+$/.test(a)))) return null;
   const operands = k >= 0 ? args.slice(k + 1) : args.filter((a) => !(a.length > 1 && a[0] === '-'));
   if (operands.length > 1) return null;
   // Why: a bare cd goes to the HOME the cd builtin sees: its own prefix (`HOME=d cd`), else the line's (Codex review 3 of #50)

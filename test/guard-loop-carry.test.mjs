@@ -150,3 +150,22 @@ test('#352 R28-F1: the cd-pair shortcut holds only when the second cd surely mov
   allows('a plain pair out and back', `for i in 1 2; do ${PB} origin HEAD; cd /work/other && cd ${GIT_ROOT}; done`);
   allows('a plain pair out and back, in a script', RUN_SH, script('echo', `for i in 1 2; do ${PB} origin HEAD; cd /work/other && cd ${GIT_ROOT}; done`));
 });
+// (#352 R29-B1, R29-F1, R29-F2: an option word the shell refuses (`cd -Q`) fails the cd, which stays where it was, and bash's `pushd -n DIR` succeeds without moving: the directory a cd / pushd
+// leaves is known only for the options that cannot fail or skip the move (-L, -P; `--` ends the options), in a loop's replay and on the straight line alike)
+test('#352 R29-B1/F1/F2: a cd or pushd with an option outside -L / -P leaves the directory unknown', () => {
+  for (const [what, line] of [
+    ['failing option, in a pair (R29-B1)', `for i in 1 2; do ${PB} origin HEAD; cd /work/other && cd -Q ${GIT_ROOT}; done`],
+    ['failing option, after ; (R29-F1)', `for i in 1 2; do ${PB} origin HEAD; cd /work/other; cd -Q ${GIT_ROOT}; done`],
+    ['pushd -n in a loop (R29-F2)', `for i in 1 2; do ${PB} origin HEAD; cd /work/other && pushd -n ${GIT_ROOT}; done`],
+    ['pushd -n on the straight line (R29-F2)', `cd /work/other && pushd -n ${GIT_ROOT} && ${PB} origin HEAD`],
+    ['failing option on the straight line, after ;', `cd /work/other; cd -Q ${GIT_ROOT}; ${PB} origin HEAD`],
+    ['zsh cd -s (refuses a symbolic link)', `cd /work/other && cd -s ${GIT_ROOT} && ${PB} origin HEAD`],
+  ]) {
+    denies(what, line, {}, DIRS);
+    denies(`${what}, in a script`, RUN_SH, script('echo', line), DIRS);
+  }
+  allows('cd -P back to the repository', `cd /work/other && cd -P ${GIT_ROOT} && ${PB} origin HEAD`);
+  allows('cd -L -- back to the repository', `cd /work/other && cd -L -- ${GIT_ROOT} && ${PB} origin HEAD`);
+  allows('cd -LP back, in a loop', `for i in 1 2; do ${PB} origin HEAD; cd /work/other && cd -LP ${GIT_ROOT}; done`);
+  allows('cd -P into a subdirectory and back, in a loop', `for i in 1 2; do ${PB} origin HEAD; cd -P sub && cd ..; done`);
+});
