@@ -91,6 +91,7 @@ function main() {
 
   let exited = null;
   let drained = false;
+  let drainTimer = null;
   const settle = (deadline = false) => { if (exited && !finished) finish(exited.code, exited.signal, { deadline }); };
   child.stdout.on('data', (chunk) => {
     try { writeSync(logFd, chunk); } catch { /* the log is a convenience */ }
@@ -104,7 +105,13 @@ function main() {
   // 'close' fires once the pipe is drained: only then is the capture complete. A grandchild that inherited the pipe can keep it
   // open after the command exits, so after 'exit' the drain is waited for only briefly; at the deadline the capture is closed and
   // flagged drainTimedOut, and the pipe stays open (and keeps being copied to the log) until its last writer is gone.
-  child.stdout.on('close', () => { drained = true; settle(); if (finished) closeLog(); });
+  child.stdout.on('close', () => {
+    drained = true;
+    // The grace timer has nothing left to wait for: cleared, the runner exits as soon as exit.json is written (an open pipe still holds the loop to the deadline).
+    if (drainTimer !== null) { clearTimeout(drainTimer); drainTimer = null; }
+    settle();
+    if (finished) closeLog();
+  });
 
   child.on('error', (err) => {
     note(`failed to start command: ${err.message}`);
@@ -113,7 +120,7 @@ function main() {
   child.on('exit', (code, signal) => {
     exited = { code, signal };
     if (drained) settle();
-    else setTimeout(() => settle(true), DRAIN_GRACE_MS);
+    else drainTimer = setTimeout(() => settle(true), DRAIN_GRACE_MS);
   });
 
   if (child.pid) {

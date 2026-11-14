@@ -125,6 +125,19 @@ test('a normal job carries no drainTimedOut marker', async (t) => {
   assert.equal('drainTimedOut' in r, false);
 });
 
+test('after a normal job reads done its runner process is gone within ~1 s (the drain grace timer does not hold it for 3 s)', { skip: process.platform === 'win32' }, async (t) => {
+  const cwd = scratch(t);
+  const started = start('prompt', node("console.log('x')"), { cwd });
+  const r = await waitJob('prompt', { cwd, timeoutMs: 15_000, full: true, ...FAST });
+  assert.equal(r.state, 'done');
+  const { runnerPid } = JSON.parse(readFileSync(join(started.jobDir, 'meta.json'), 'utf8'));
+  assert.ok(Number.isInteger(runnerPid) && runnerPid > 0, 'meta.json records the runner pid');
+  const alive = () => { try { process.kill(runnerPid, 0); return true; } catch { return false; } };
+  const t0 = Date.now();
+  while (alive() && Date.now() - t0 < 1000) await new Promise((resolve) => setTimeout(resolve, 25));
+  assert.equal(alive(), false, 'the runner must exit once exit.json is written, not after the 3 s drain grace');
+});
+
 function cliSync(cwd, args) {
   const r = spawnSync(process.execPath, [bin, ...args], { cwd, encoding: 'utf8', env: ENV });
   let json = null;
