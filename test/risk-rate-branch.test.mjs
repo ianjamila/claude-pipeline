@@ -303,14 +303,15 @@ test('rateBranch: a dangling origin/HEAD falls back to the config default_branch
   assert.equal(r.stacked, false);
 });
 
-test('rateBranch: a remote default branch that differs from config.default_branch is named in the lane reasons, with the remedy', async (t) => {
+test('rateBranch: a remote default branch that differs from config.default_branch is named in the lane notes (not the reasons), with the remedy', async (t) => {
   const w = world(t, { feature: (r) => r.write('src/a.js', lines(3)) });
   w.repo.git(['branch', 'develop', 'main']);
   w.repo.git(['update-ref', 'refs/remotes/origin/develop', 'develop']);
   w.repo.git(['symbolic-ref', 'refs/remotes/origin/HEAD', 'refs/remotes/origin/develop']);
   const r = await w.rate();
-  const reason = r.laneReasons.find((x) => /origin\/HEAD/.test(x));
-  assert.ok(reason, r.laneReasons.join('; '));
+  const reason = r.laneNotes.find((x) => /origin\/HEAD/.test(x));
+  assert.ok(reason, r.laneNotes.join('; '));
+  assert.ok(!r.laneReasons.some((x) => /origin\/HEAD/.test(x)), 'a note is no reason for Fable (#367)');
   assert.match(reason, /"develop"/);
   assert.match(reason, /"main"/);
   assert.match(reason, /git remote set-head origin -a/);
@@ -359,7 +360,7 @@ test('rateBranch: without origin/HEAD, the remote is asked (ls-remote --symref) 
   assert.throws(() => w.repo.git(['symbolic-ref', 'refs/remotes/origin/HEAD']), /not a symbolic ref|No such/i);
 });
 
-test('rateBranch: an ls-remote answer that differs from the working-tree config wins and is named in the lane reasons', async (t) => {
+test('rateBranch: an ls-remote answer that differs from the working-tree config wins and is named in the lane notes, not the lane reasons (#367)', async (t) => {
   const w = world(t, { feature: (r) => r.write('src/a.js', lines(3)) });
   const origin = bareOrigin(t, w.repo);
   // the remote's own HEAD names `develop`
@@ -367,7 +368,8 @@ test('rateBranch: an ls-remote answer that differs from the working-tree config 
   fs.writeFileSync(path.join(origin, 'HEAD'), 'ref: refs/heads/develop\n');
   const r = await w.rate();
   assert.deepEqual([r.anchor, r.defaultBranch], ['ls-remote', 'develop']);
-  assert.ok(r.laneReasons.some((x) => /git ls-remote/.test(x) && /"develop"/.test(x) && /git remote set-head origin -a/.test(x)), r.laneReasons.join('; '));
+  assert.ok(r.laneNotes.some((x) => /git ls-remote/.test(x) && /"develop"/.test(x) && /git remote set-head origin -a/.test(x)), r.laneNotes.join('; '));
+  assert.ok(!r.laneReasons.some((x) => /git ls-remote/.test(x)), 'informational: never a Fable reason');
 });
 
 // The PR's own commit names default_branch `side`, the working tree too, and `side` forks right after that commit: the mismatch check alone passes.
