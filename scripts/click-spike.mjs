@@ -41,7 +41,7 @@ const MULTI = 'Call the AskUserQuestion tool exactly once with exactly this inpu
 
 // expect: what the recorder must see. human = permissionDecision exactly HUMAN_DECISION and annotations exactly {}; hook = source hook and no annotations;
 // annotated = a human answer whose annotations are NOT empty; prefilled = the tool_use input carries an `answers` key (the recorder refuses that input);
-// not-human = the permissionDecision is not exactly HUMAN_DECISION. since: the first build the case applies to (the committed fixtures of an older build lack it).
+// not-human = the dialog was ANSWERED (a result with an answer, not an error, not ended by the script's own exit key) and the permissionDecision is not exactly HUMAN_DECISION; a dialog that was never answered is inconclusive (judge returns inconclusive: true, ok false). since: the first build the case applies to (the committed fixtures of an older build lack it).
 export const CASES = [
   { name: 'genuine-click', mode: 'none', prompt: SIMPLE, keys: [DOWN, ENTER], expect: 'human', answer: 'Merge' },
   { name: 'pretooluse-hook-answer', mode: 'answer', prompt: SIMPLE, keys: [], expect: 'hook', answer: HOOK_ANSWER },
@@ -166,14 +166,19 @@ export function judge(c, [, use, result], { sent } = {}) {
     ...(Array.isArray(sent) && sent.some((k) => k.phase === 'exit' && k.at <= resultAt) ? { endedByScriptKey: true } : {}),
   };
   const clean = canonicalInput(input) && keyProblem === null;
+  // A not-human verdict needs an answered dialog: a result that is an error, carries no answer, or was recorded after the script's own ESC / /exit says nothing about who (or what) answered.
+  // The script cancelling a dialog that stayed open (a hook that filled nothing in) must never read as "not human": it is inconclusive and fails a run.
+  const errored = blocks(result).some((b) => b?.type === 'tool_result' && b.tool_use_id === use.message.content.find((x) => x?.type === 'tool_use')?.id && b.is_error === true);
+  const inconclusive = c.expect === 'not-human' && (errored || answer === undefined || seen.endedByScriptKey === true);
+  if (inconclusive) seen.inconclusive = errored ? 'the result is an error (the dialog was cancelled, not answered)' : answer === undefined ? 'the result carries no answer' : 'the script sent an exit key before the result was recorded';
   const ok = {
     human: clean && human && emptyNotes && wanted(answer),
     hook: clean && !human && isObj(pd) && pd.source === 'hook' && !(isObj(res) && Object.hasOwn(res, 'annotations')) && wanted(answer),
     annotated: clean && human && isObj(res?.annotations) && Object.keys(res.annotations).length > 0 && wanted(answer),
     prefilled: Object.hasOwn(input ?? {}, 'answers'),
-    'not-human': clean && !human,
+    'not-human': clean && !human && !inconclusive,
   }[c.expect];
-  return { ok, seen };
+  return { ok, seen, ...(inconclusive ? { inconclusive: true } : {}) };
 }
 
 // The headless case: a `claude -p` run proves "not offered headless" only if it finished by itself with exit code 0 and never reached AskUserQuestion.

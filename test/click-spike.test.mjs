@@ -188,3 +188,37 @@ test('R1-F2: --only names are checked against the matrix', () => {
   assert.deepEqual(selectCases(new Set(['genuine-click'])).cases.map((c) => c.name), ['genuine-click']);
   assert.deepEqual(selectCases(new Set(['genuine-click', 'typo'])).unknown, ['typo']);
 });
+
+test('R2-B1: a not-human case needs a real answered result; a dialog the script cancelled (ESC, error result, no answer) is inconclusive, never not-human', () => {
+  const notHuman = ['pretooluse-ask-prefill', 'pretooluse-fill-no-decision'].map(byName);
+  const answered = load('2.1.323', 'pretooluse-ask-prefill');
+  // the committed 2.1.322 recording of the model-prefilled case: the dialog stayed open and the result is the rejection error with no permissionDecision and no answers
+  const cancelled = load('2.1.322', 'model-prefilled-answers');
+  // the same rejection with the canonical tool_use input a script-cancelled dialog really has (the committed 2.1.322 input carries prefilled answers, which fails for another reason)
+  const scriptCancelled = [answered[0], answered[1], cancelled[2]];
+  scriptCancelled[2].message.content[0].tool_use_id = answered[1].message.content.find((b) => b.type === 'tool_use').id;
+  for (const c of notHuman) {
+    assert.equal(judge(c, cancelled).inconclusive, true, `${c.name}: the committed 2.1.322 rejection is inconclusive as a not-human recording`);
+    const j = judge(c, scriptCancelled);
+    assert.equal(j.ok, false, `${c.name}: an error result with no answer is not a not-human verdict`);
+    assert.equal(j.inconclusive, true, `${c.name}: and it is reported as inconclusive`);
+    assert.equal(j.seen.answer, null);
+    // the same shape produced by the script's own ESC: the result is recorded after an exit key
+    const esc = judge(c, answered, { sent: [{ key: '\x1b', at: Date.parse(answered[2].timestamp) - 1000, phase: 'exit' }] });
+    assert.equal(esc.ok, false, `${c.name}: ESC from the script before the result`);
+    assert.equal(esc.seen.endedByScriptKey, true);
+  }
+  // an answered result with an exit key sent before it was recorded was also ended by the script, so it does not count either
+  const early = judge(byName('pretooluse-ask-prefill'), answered, { sent: [{ key: '\x1b', at: Date.parse(answered[2].timestamp) - 10, phase: 'exit' }] });
+  assert.equal(early.ok, false);
+  assert.equal(early.inconclusive, true);
+  // the committed answered recording still passes, with and without exit keys sent after the result
+  assert.equal(judge(byName('pretooluse-ask-prefill'), answered).ok, true);
+  assert.equal(judge(byName('pretooluse-ask-prefill'), answered, { sent: [{ key: '\x1b', at: Date.parse(answered[2].timestamp) + 100, phase: 'exit' }] }).ok, true);
+  // an answered result with an is_error tool_result does not count (answers present but the tool_result was an error)
+  const errored = structuredClone(answered);
+  errored[2].message.content.find((b) => b.type === 'tool_result').is_error = true;
+  assert.equal(judge(byName('pretooluse-ask-prefill'), errored).ok, false);
+  // other expectations are unchanged: the 2.1.322 prefilled case is judged on the tool_use input, not on an answer
+  assert.equal(judge(byName('model-prefilled-answers'), cancelled).ok, true);
+});
