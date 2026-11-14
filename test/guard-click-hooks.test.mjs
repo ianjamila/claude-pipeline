@@ -35,12 +35,13 @@ test('another account config dir (~/.claude-eaglewatch) is held the same: hooks/
   const opts = { home, platform: process.platform, env: {}, realpath: (p) => p, existsSync: (p) => fs.existsSync(p) };
   const ew = path.join(home, '.claude-eaglewatch');
   const write = (p, o = opts) => evaluateFileTool({ tool_name: 'Write', tool_input: { file_path: p, content: 'x' }, cwd: '/repo' }, o).decision;
+  // (#269 CI, Windows: the path is quoted, as a real command must be: unquoted, the shell drops every backslash of a Windows path and the word names a file in the working folder, which the guard rightly allows)
   for (const rel of ['hooks/tab.mjs', 'settings.local.json', 'settings.json']) {
     assert.equal(write(path.join(ew, rel)), 'deny', rel);
-    assert.equal(evaluateBashForFiles(`echo x > ${path.join(ew, rel)}`, { ...opts, cwd: '/repo' }).decision, 'deny', rel);
+    assert.equal(evaluateBashForFiles(`echo x > '${path.join(ew, rel)}'`, { ...opts, cwd: '/repo' }).decision, 'deny', rel);
   }
   assert.equal(write(path.join(ew, 'CLAUDE.md')), 'allow', 'the rest of the config dir stays writable');
-  assert.equal(evaluateBashForFiles(`cat ${path.join(ew, 'settings.local.json')}`, { ...opts, cwd: '/repo' }).decision, 'allow');
+  assert.equal(evaluateBashForFiles(`cat '${path.join(ew, 'settings.local.json')}'`, { ...opts, cwd: '/repo' }).decision, 'allow');
   // $CLAUDE_CONFIG_DIR too
   const cfg = { ...opts, env: { CLAUDE_CONFIG_DIR: '/data/claude-cfg' } };
   assert.equal(write('/data/claude-cfg/hooks/x.mjs', cfg), 'deny');
