@@ -411,3 +411,12 @@ test('#352 R15-F1: the body after a ( ) that ends a zsh if / until condition is 
   allows('twin: cd d && until (false) { push; break; }', `cd /work/other2 && until (false) { ${SHIP}; break; }`);
   allows('twin: cd d && if (true) { push }', `cd /work/other2 && if (true) { ${SHIP} }`);
 });
+
+test('#352 R15-F1: the } of a zsh alternate-form body ends its until / if, so a later || runs when the change failed', () => {
+  denies('switch && until (true) { true; } || push', `${RESET} && until (true) { true; } || ${SHIP}`);
+  denies('switch && until C && (true) { true; break; } || push', `${RESET} && until true && (true) { true; break; } || ${SHIP}`);
+  denies('switch && if (true) { true; } || push', `${RESET} && if (true) { true; } || ${SHIP}`);
+  denies('switch && if (true) { true; } else { true; } || push', `${RESET} && if (true) { true; } else { true; } || ${SHIP}`);
+  allows('twin: switch; until (true) { push; break; }', `${RESET}; until (true) { ${SHIP}; break; }`);
+  allows('twin: switch && until (true) { true; } && push', `${RESET} && until (true) { true; } && ${SHIP}`);
+});

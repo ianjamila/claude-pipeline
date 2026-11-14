@@ -2128,6 +2128,8 @@ class Parser {
     this.pipeLead = ';';
     this.ctlPH = []; // and the pipeHead / pipeLead each open construct was opened under
     this.ctlPL = [];
+    this.ctlAlt = []; // (R15-F1: the `{` is the body of a zsh alternate-form loop / if: its `}` ends that construct too)
+    this.lastCloseAlt = false;
     this.lastClosePH = 0;
     this.lastClosePL = ';';
     ctx.work += src.length;
@@ -2420,7 +2422,7 @@ class Parser {
           pipedFrom: lastSep === '|' ? this.lastStage : null, pipeSkip: lastSep === '|' && this.lastStageParen ? this.lastStage : null, sep: tail ? tail.sep : lastSep, lead: tail ? tail.lead : lastSep === '|' ? this.pipeLead : null, afterClose: tail ? tail.afterClose : lastSep === '&&' && lastAfterClose,
           up: ctx.up, negIn: ctx.neg > 0, negPipe: lastSep === '|' && lastNeg, negLead: false, // (negation: R9-F3; up: R9-F1)
         };
-        tailUndo = tail ? { seg, pipeStart: this.pipeStart, pipeHead: this.pipeHead, pipeLead: this.pipeLead, at: ctx.out.length } : null;
+        tailUndo = tail ? { empty: tail.empty, seg, pipeStart: this.pipeStart, pipeHead: this.pipeHead, pipeLead: this.pipeLead, at: ctx.out.length } : null;
         if (!tail && lastSep !== '|' && lastSep !== '&&' && lastSep !== '||') this.pipeStart = ctx.out.length; // (a & ends the whole and-or list: `a && b &`)
         if (!tail && lastSep !== '|') { this.pipeHead = ctx.out.length; this.pipeLead = lastSep; }
         lastAfterClose = false;
@@ -2492,6 +2494,12 @@ class Parser {
         if (q < 0 && AFTER_PAREN_RESERVED.has(text)) {
           seg.sep = ';'; seg.lead = null; seg.afterClose = false;
           this.pipeStart = tailUndo.at; this.pipeHead = tailUndo.at; this.pipeLead = ';';
+        } else if (!(seg.redirects.length > 0 || (q < 0 && /^\{[A-Za-z_]\w*\}$/.test(text) && /[<>]/.test(s[this.i] ?? '')) || (q < 0 && text === '{' && tailUndo.empty))) {
+          // (R15-F1: any other word is no part of the subshell's command: after a `( )` that ends an if / while / until condition it is the BODY, which runs when the condition FAILED, so it must not
+          // keep the `&&` before the `(`. The list bookkeeping (pipeStart / pipeHead / pipeLead) stays for `&`; a change before the construct is carried by the construct's own level)
+          seg.sep = ';'; seg.lead = null; seg.afterClose = false;
+          // (a `{` straight after the `)` that ends the condition of a loop / if is its zsh alternate-form body: it may not run, as the body of `do` / `then` may not)
+          if (q < 0 && text === '{' && ['loop', 'if'].includes(this.ctlStack[this.ctlStack.length - 1])) seg.condBody = true;
         }
         tailUndo = null;
       }
@@ -2527,10 +2535,17 @@ class Parser {
       else if (q < 0 && cmdPos && text === 'if') { this.ctlOpen('if', segNeg(seg), seg); seg.ctl = { ...seg.ctl, cond: true }; }
       else if (q < 0 && cmdPos && text === 'fi') seg.closesFrom = this.ctlClose(['if']);
       else if (q < 0 && cmdPos && text === 'done') seg.closesFrom = this.ctlClose(['loop']);
-      else if (q < 0 && cmdPos && text === '}') seg.closesFrom = this.ctlClose(['fn', 'brace', 'cbrace']);
+      else if (q < 0 && cmdPos && text === '}') {
+        seg.closesFrom = this.ctlClose(['fn', 'brace', 'cbrace']);
+        // (R15-F1: the `}` of a zsh alternate-form body ends the loop / if it belongs to, unless an else / elif follows)
+        if (seg.closesFrom !== undefined && this.lastCloseAlt && !/^[\s;]*(?:else|elif)(?![\w-])/.test(s.slice(this.i, this.i + 40))) {
+          const outer = this.ctlClose(['loop', 'if']);
+          if (outer !== undefined) seg.closesFrom = outer;
+        }
+      }
       else if (q < 0 && (cmdPos || fnKw) && text === '{') {
         // (a plain group after && / || runs only when that holds, and one that is a pipeline stage runs in a subshell: its commands may not run here -- review of #50)
-        const kind = fnPending || fnKw ? 'fn' : ['&&', '||', '|'].includes(seg.sep) ? 'cbrace' : 'brace';
+        const kind = fnPending || fnKw ? 'fn' : ['&&', '||', '|'].includes(seg.sep) || seg.condBody ? 'cbrace' : 'brace';
         this.ctlOpen(kind, kind !== 'fn' && segNeg(seg), seg);
         if (kind === 'fn') seg.ctl = { ...seg.ctl, fn: true }; // (the body's first command is in this segment: `{ echo x > f; }`)
         if (kind === 'cbrace') seg.ctl = { ...seg.ctl, cond: true };
@@ -2726,6 +2741,7 @@ class Parser {
           flushWord();
           // `f ()`, `f()`, zsh `f g ()`, `function f ()`: the words before an empty `()` are names of functions, and the next `{ }` or `( )` is their body
           const head = /^\(\s*\)/.test(s.slice(this.i, this.i + 64)) && seg ? seg.words.filter((w, k) => !(k === 0 && w.qa < 0 && w.text === 'function')).map((w) => w.text) : null;
+          const emptyParen = /^\(\s*\)/.test(s.slice(this.i, this.i + 64)); // (R15-F1: `()` with nothing inside: a `{` after it is a zsh anonymous function)
           const body = fnPending; // (this group is the body of the function named just before it)
           // (a subshell after && / || runs only when that holds, and one that is a pipeline stage runs apart: its commands may not run, as for a { } group (cbrace).
           // `{ cat a; true || (cat x); cat c; } | bash` runs a+c, which the join a+x+c hid)
@@ -2751,7 +2767,7 @@ class Parser {
           this.pipeStart = stageStart;
           this.pipeHead = stageHead;
           this.pipeLead = stageLead;
-          subTail = { sep: opened.sep, lead: opened.lead ?? null, afterClose: opened.afterClose, end: this.i };
+          subTail = { sep: opened.sep, lead: opened.lead ?? null, afterClose: opened.afterClose, end: this.i, empty: emptyParen };
           // (#352 R12-B1: a ( ) stage of a pipeline is no pipe mark for its OWN commands: they share the stage's directory with each other, and the level that ends gives back what a change in it did.
           // What came before the `|` is marked when the `|` is read (markPipe), and the group as a whole takes the operator of the pipeline (lead).)
           for (const c of ctx.out.slice(outFrom)) Object.defineProperty(c, 'paren', { value: true, enumerable: false, configurable: true });
@@ -2916,6 +2932,7 @@ class Parser {
     this.ctlPS.push(this.pipeStart);
     this.ctlPH.push(this.pipeHead);
     this.ctlPL.push(this.pipeLead);
+    this.ctlAlt.push(!!seg && (kind === 'brace' || kind === 'cbrace') && (seg.condBody === true || (seg.words.length === 1 && seg.words[0].qa < 0 && seg.words[0].text === 'else' && this.ctlStack[this.ctlStack.length - 2] === 'if')));
     if (neg) this.ctx.neg++;
     if (CTL_COUNTER[kind]) this.ctx.ctl[CTL_COUNTER[kind]]++;
     if (kind === 'loop') this.ctx.loops = [...this.ctx.loops, ++this.ctx.loopSeq];
@@ -2928,6 +2945,7 @@ class Parser {
     this.ctlPS.pop();
     this.ctlPH.pop();
     this.ctlPL.pop();
+    this.ctlAlt.pop();
     if (this.ctlNeg.pop()) this.ctx.neg--;
     ctlDec(this.ctx, kind);
   }
@@ -2941,6 +2959,7 @@ class Parser {
       this.lastClosePS = this.ctlPS[k];
       this.lastClosePH = this.ctlPH[k];
       this.lastClosePL = this.ctlPL[k];
+      this.lastCloseAlt = this.ctlAlt[k] === true;
       while (this.ctlStack.length > k) this.popCtl();
       return from;
     }

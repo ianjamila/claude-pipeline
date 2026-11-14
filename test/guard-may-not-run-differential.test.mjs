@@ -46,7 +46,7 @@ const NOOPS = ['true', 'false', 'A=1', 'echo hi', 'cat', '>x', '> /dev/null'];
 // (#352 R14-B1: a named-descriptor redirect, `{fd}>`, reads as a word before its operator: the list still goes on past it)
 const SUB_REDIRS = [' {fd}>/dev/null', ' {fd}> log', ' 2>&1', ' > log', ' >/dev/null 2>&1', ' 2>&1 > log', ' \\\n 2>&1', ' \\\n > log', ' \\\n \\\n >/dev/null 2>&1'];
 const subNode = (body) => (rnd() < 0.5 ? { t: 'sub', body, redir: pick(SUB_REDIRS) } : { t: 'sub', body });
-const WRAPPERS = [['group', 12], ['anon', 6], ['sub', 12], ['subst', 8], ['btick', 4], ['bashc', 10], ['eval', 6], ['if', 9], ['iftrue', 6], ['while', 6], ['loop', 6], ['case', 5], ['not', 14], ['pipe', 14], ['stdin', 9], ['ifelse', 7]];
+const WRAPPERS = [['group', 12], ['anon', 6], ['sub', 12], ['subst', 8], ['btick', 4], ['bashc', 10], ['eval', 6], ['if', 9], ['iftrue', 6], ['while', 6], ['loop', 6], ['case', 5], ['not', 14], ['pipe', 14], ['stdin', 9], ['ifelse', 7], ['zif', 6]];
 // (#352 R10: wrappers of a command: the ones that start a child process (what the command changes is the child's) and the ones that stay in this shell)
 const SPAWN = new Set(['nohup', 'env', 'nice', 'timeout 5', 'sudo', 'find']);
 const SPAWN_WORDS = ['nohup', 'env', 'nice', 'timeout 5', 'sudo'];
@@ -115,6 +115,16 @@ function genWrapper(need, depth, forced) {
     if (rnd() < 0.75) { body.ops.push(pick(['&&', '&&', ';'])); body.items.push(subNode(genBody('none', depth + 1))); }
     return { t: 'ifelse', cond: rnd() < 0.7 ? 'false' : 'true', elif: rnd() < 0.3, body, other: genBody(elseNeed, depth + 1) };
   }
+  if (kind === 'zif') {
+    // (#352 R15-F1: zsh `until C && ( ) { B; break; }`, `if C && (( )) { B } else { E }`, the short form `until C && ( ) B`: a `( )` ends the condition and the word after it is the BODY, which runs when the condition FAILED)
+    const swap = rnd() < 0.5;
+    const condNeed = need === 'both' ? (swap ? 'push' : 'change') : 'none';
+    const bodyNeed = need === 'both' ? (swap ? 'change' : 'push') : need;
+    const body = genBody(bodyNeed, depth + 1);
+    const simple = body.items.length === 1 && ['change', 'push', 'noop'].includes(body.items[0].t) && !body.items[0].hd;
+    const until = rnd() < 0.5;
+    return { t: 'zif', until, paren: pick(['(true)', '((1))']), cond: genBody(condNeed, depth + 1), body, short: simple && rnd() < 0.3, other: !until && rnd() < 0.5 ? genBody('none', depth + 1) : null };
+  }
   if (kind === 'btick' && quoted > 0) return genWrapper(need, depth, 'subst'); // (a backtick text holds no backtick: it would need its own escapes)
   const q = ['subst', 'btick', 'bashc', 'eval', 'stdin'].includes(kind);
   if (q) quoted++;
@@ -147,6 +157,11 @@ function render(n, kind) {
       const last = n.body.items[n.body.items.length - 1];
       const then = render(n.body, kind) + (last.t === 'sub' && !last.redir ? ' ' : '; '); // (#352 R14-F2: a reserved word is none after a redirect: `( ) 2>&1 else` is no shell's syntax)
       return n.elif ? `if ${n.cond}; then ${then}elif ${render(n.other, kind)}; then true; fi` : `if ${n.cond}; then ${then}else ${render(n.other, kind)}; fi`;
+    }
+    case 'zif': {
+      const head = `${n.until ? 'until' : 'if'} ${render(n.cond, kind)} && ${n.paren} `;
+      if (n.short) return `{ ${head}${render(n.body, kind)}; }`; // (zsh reads a && / || after a short-form body as part of the body: the group keeps what follows out of it)
+      return head + `{ ${render(n.body, kind)}; ${n.until ? 'break; ' : ''}}` + (n.other ? ` else { ${render(n.other, kind)}; }` : '');
     }
     case 'iftrue': return `if true; then ${render(n.body, kind)}; fi`;
     case 'while': return `while false; do ${render(n.body, kind)}; done`;
@@ -221,6 +236,12 @@ function evalNode(n, s, kind) {
     case 'case': return evalList(n.body, [s], kind);
     case 'sub': case 'bashc': case 'stdin': return evalList(n.body, [s], kind).map((r) => ({ ...r, cd: s.cd }));
     case 'iftrue': return evalList(n.body, [s], kind);
+    case 'zif': { // (the condition's status is known to the `&& ( )` after it: the body runs when it FAILED for until, when it held for if, and nothing runs when it is skipped: status 0)
+      const cs = evalList(n.cond, [{ ...s, fl: false }], kind).map((r) => ({ ...r, fl: false }));
+      const body = (r) => evalList(n.body, [{ ...r, fl: false }], kind);
+      if (n.until) return flat(cs, (r) => (r.ok ? [{ ...r, ok: true, fl: false }] : body(r).map((x) => ({ ...x, ok: true, fl: false }))));
+      return flat(cs, (r) => (r.ok ? body(r) : n.other ? evalList(n.other, [{ ...r, fl: false }], kind) : [{ ...r, ok: true, fl: false }]));
+    }
     case 'ifelse': return n.cond === 'true' ? evalList(n.body, [{ ...s, fl: false }], kind) : evalList(n.other, [{ ...s, fl: false }], kind).map((r) => (n.elif ? { ...r, ok: true, fl: false } : r)); // (the condition is known: one branch runs; an elif's condition leaves the status of the `true` after it)
     case 'loop': return flat(evalList(n.body, [s], kind).filter((r) => !r.fl), (r) => evalList(n.body, [r], kind)); // (`for x in a b` runs its body twice, the second time from what the first left; a failure the loop goes past is not modelled, as for a ;)
     case 'wrap': { // (a child process: its cd is lost, a branch it switches stays; command / builtin run in this shell)
@@ -274,7 +295,9 @@ test('#400: the guard denies every generated line whose push can run without the
     ['redirect-only command', /(?:^|[;&|{(] ?)>(?:x| \/dev\/null)(?: |;|$)/], ['subshell with a trailing redirect', /\) (?:2>&1|> log|>\/dev\/null 2>&1)/], ['subshell redirect, then a pipe', /\) (?:2>&1|> log|>\/dev\/null 2>&1) \|/], ['reserved word after )', /\) (?:else|elif) /], ['reserved word after a plain subshell, glued', /&& \( [^\n]*\) else /], ['subshell redirect after a line continuation', /\) \\\n (?:2>&1|> log)/], ['subshell redirect after two continuations', /\) \\\n \\\n >\/dev\/null 2>&1/], ['continuation redirect, then &', /\) \\\n (?:2>&1|> log) &(?!&)/], ['continuation redirect, then a pipe', /\) \\\n (?:2>&1|> log) \|/], ['subshell redirect, then &', /\) (?:2>&1|> log|>\/dev\/null 2>&1) &(?!&)/],
     // (#352 R14: a named-descriptor redirect after the `)`, then `&` / `&&` / a pipe; a zsh anonymous function, then `&` or behind `||`)
     ['named-descriptor redirect after )', /\) \{fd\}>(?: log|\/dev\/null)/], ['named-descriptor redirect, then &', /\) \{fd\}>(?: log|\/dev\/null) &(?!&)/], ['named-descriptor redirect, then &&', /\) \{fd\}>(?: log|\/dev\/null) &&/], ['named-descriptor redirect, then a pipe', /\) \{fd\}>(?: log|\/dev\/null) \|/],
-    ['anonymous function', /\(\) \{ /], ['anonymous function, then &', /\(\) \{ [^\n]*\} &(?!&)/], ['anonymous function behind &&', /&& \(\) \{ /], ['anonymous function behind ||', /\|\| \(\) \{ /]]) {
+    ['anonymous function', /\(\) \{ /], ['anonymous function, then &', /\(\) \{ [^\n]*\} &(?!&)/], ['anonymous function behind &&', /&& \(\) \{ /], ['anonymous function behind ||', /\|\| \(\) \{ /],
+    // (#352 R15-F1: a zsh until / if whose condition ends in a `( )`, the body in braces or the short form)
+    ['until, ( ) then a braced body', /until [^\n]*&& (?:\(true\)|\(\(1\)\)) \{ /], ['if, ( ) then a braced body', /if [^\n]*&& (?:\(true\)|\(\(1\)\)) \{ [^\n]*\} else \{ /], ['until / if, ( ) then a short-form body', /(?:until|if) [^\n]*&& (?:\(true\)|\(\(1\)\)) (?!\{)[^\n]*$/m]]) {
     if (process.env.DIFF_COV) console.log(`# cov ${name}: ${[...seen].filter((l) => re.test(l)).length}`);
     assert.ok([...seen].filter((l) => re.test(l)).length >= 5, `the generator should produce lines with: ${name}`);
   }
