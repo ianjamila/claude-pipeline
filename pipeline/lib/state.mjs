@@ -26,10 +26,15 @@ const STRAY_TMP_MAX_AGE_MS = 60 * 60 * 1000;
 // would leave out of the Rulings block and let Claude reopen). Version 4: the state holds a substitute-reviewed round or second review (a Claude stand-in for
 // Codex while its quota was spent) or a budget / governor decision: a pipeline from before the substitute would read it as an ordinary Codex review.
 // Every other state stays 1. (The plan 2026-11-11-codex-substitute-reviewer called this "3"; main had already used 3 for the deferral.)
-export const SUPPORTED_STATE_VERSION = 4;
+// Version 5: an arbiter ruling or Fable finding carries `final.outOfModel` (a FOLLOW-UP ruled outside a review.threat_models model: an older installation would not hold the
+// review back until its issue is filed). A writer picks the HIGHEST version any feature of the state needs (requiredStateVersion).
+export const SUPPORTED_STATE_VERSION = 5;
 export const STATE_VERSION_CLAUDE = 2;
 export const STATE_VERSION_DEFERRAL = 3;
 export const STATE_VERSION_SUBSTITUTE = 4;
+export const STATE_VERSION_OUT_OF_MODEL = 5;
+// Does any final of the state carry the out-of-model marker? Then the writer lifts the state to STATE_VERSION_OUT_OF_MODEL (and only then: ordinary PRs stay readable by old CLIs).
+export const stateNeedsOutOfModelVersion = (state) => (Array.isArray(state?.rounds) ? state.rounds : []).some((r) => (Array.isArray(r?.items) ? r.items : []).some((i) => typeof i?.final?.outOfModel === 'string' && i.final.outOfModel !== ''));
 // The state at (at least) `version`: a writer never lowers the version a state already carries.
 export const withStateVersion = (state, version) => ({ ...state, version: Math.max(Number.isFinite(state?.version) ? state.version : 1, version) });
 const newerThanSupported = (state) => Number.isFinite(state.version) && state.version > SUPPORTED_STATE_VERSION;
@@ -42,8 +47,10 @@ export const isSubstituteRound = (round) => round?.firstReviewer === 'substitute
 // Who gave a second review: 'codex' (no `by`, the first kind), or the pinned Claude substitute that did (R5-5). Anything else that starts with `substitute` reads as plain `substitute`.
 export const secondReviewerOf = (sr) => (typeof sr?.by !== 'string' || !sr.by.startsWith('substitute') ? 'codex' : sr.by === 'substitute-opus' || sr.by === 'substitute-fable' ? sr.by : 'substitute');
 const isSubstituteSecondReview = (item) => typeof item?.secondReview?.by === 'string' && item.secondReview.by.startsWith('substitute');
-// The lowest version that may hold this state: 4 when it holds a substitute round / second review or a governor / budget decision.
+// The lowest version that may hold this state, the HIGHEST any feature in it needs: 5 when a final carries the out-of-model marker (stateNeedsOutOfModelVersion), else
+// 4 when it holds a substitute round / second review or a governor / budget decision, else 1.
 export function requiredStateVersion(state) {
+  if (stateNeedsOutOfModelVersion(state)) return STATE_VERSION_OUT_OF_MODEL;
   const rounds = Array.isArray(state?.rounds) ? state.rounds : [];
   const needs = rounds.some((r) => isSubstituteRound(r) || isPlainObject(r?.governor) || isPlainObject(r?.budget) || (Array.isArray(r?.items) && r.items.some(isSubstituteSecondReview)));
   return needs ? STATE_VERSION_SUBSTITUTE : 1;
@@ -205,9 +212,11 @@ export function decodeFromComment(body) {
 // risk assessment (the state's maxRisk is the highest of them). governor / budget: the Codex-spend decision that sent the round to the substitute, or (governor)
 // that lowered a Codex round's effort. effort: the effort a Codex round ran at.
 // Any of substitute / governor / budget makes the saved state version 4 (STATE_VERSION_SUBSTITUTE).
+// trustedConfigSha: the commit whose committed .claude/pipeline.yml is the TRUSTED config of this round (the default branch's fork point, risk.mjs#trustedBase), which
+// review.threat_models are read from; null = pinned as unavailable (no model applies). Absent only on a round written before it existed (arbiter needed then pins it once).
 export function addRound(state, {
   n, fromHead, toHead, contentHashAtToHead, items, reviewBase, reviewBaseKind, baseOnly, resolutionOnly, conflicted, conflictedCount, blocks, blockCount, blocksWithDrops, droppedTheirsTotal, forkPoint, codexModel, promptSha256, fableRequired, fableReasons, sensitivePaths, admission, ownerGrant, confirmFixed, fableRefresh,
-  firstReviewer, substitute, wholePr, patchSha256, risk, governor, budget, effort,
+  firstReviewer, substitute, wholePr, patchSha256, risk, governor, budget, effort, trustedConfigSha,
 }) {
   if (!Array.isArray(items)) throw new Error(`round ${n}: items must be an array`);
   if (state.rounds.some((r) => r.n === n)) throw new Error(`round ${n} already exists in the review state`);
@@ -231,6 +240,7 @@ export function addRound(state, {
       ...(typeof effort === 'string' ? { effort } : {}),
       ...(governor === undefined ? {} : { governor: structuredClone(governor) }),
       ...(budget === undefined ? {} : { budget: structuredClone(budget) }),
+      ...(trustedConfigSha === undefined ? {} : { trustedConfigSha }),
       ...(baseOnly === true ? { baseOnly: true } : {}),
       ...(fableRefresh === true ? { fableRefresh: true } : {}),
       ...(Array.isArray(confirmFixed) && confirmFixed.length > 0 ? { confirmFixed: [...confirmFixed] } : {}),

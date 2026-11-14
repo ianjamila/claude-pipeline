@@ -139,6 +139,16 @@ test('agents: the two substitute reviewers share one body and differ in the mode
   assert.match(read('agents/judge.md'), /the Claude substitute the\s+round names/);
 });
 
+test('agents: the arbiter defers to the input\'s Threat model section (no bare "prefer ACCEPT" or "Review as an attacker"), the skill never pastes one, and the output example shows scope', () => {
+  for (const doc of ['agents/arbiter.md', 'agents/arbiter-fix.md']) {
+    const text = read(doc).replace(/\s+/g, ' ');
+    assert.match(text, /prefer ACCEPT unless the evidence clearly shows the issue is not real\. When the input has a "Threat model" section/, doc);
+    assert.match(text, /Review as an attacker \(within the input's "Threat model" section when it has one for the file; that section overrides this paragraph\)/, doc);
+    assert.match(text, /"scope":"out-of-model"/, doc);
+  }
+  assert.match(read('skills/review/SKILL.md'), /Never add a threat model or blocking rule to the arbiter prompt: the input carries `review\.threat_models`/);
+});
+
 test('pipeline-setup: ignores the worktree dir, pins verify.expected_steps, mentions the executable shim and the ci keys', () => {
   const setup = read('skills/pipeline-setup/SKILL.md');
   for (const needle of ['<worktree_dir>/', 'verify.expected_steps', '100755', 'ci.approvers', 'ci.guard_checks', '.gitattributes', '{{OWNER}}', '--reason']) {
@@ -158,6 +168,14 @@ test('the docs-only review exemption is documented where owners and agents look:
   assert.match(cli, /Docs-only exemption \(`review\.docs_exempt_paths`/);
   assert.match(cli, /docsExempt: \{files, reviewedHead\}/);
   assert.match(cli, /verify\/CI coverage of the docs head is NOT exempted/);
+});
+
+test('R2-F2 review.threat_models: the template and the config defaults say the Codex prompt carries the model on a Fable-lane round only, and that a modelled path should be a sensitive path', () => {
+  const yml = read('pipeline/templates/pipeline.yml');
+  assert.match(yml, /Codex prompt[^\n]*\n?[^\n]*on a Fable-lane round only/);
+  assert.match(yml, /risk\.high_risk_paths or review\.arbiter_always_paths/);
+  const cfg = read('pipeline/lib/config.mjs');
+  assert.match(cfg, /Codex prompt[^\n]*\n?[^\n]*on a Fable-lane round only/);
 });
 
 test('the review skill says one closing keyword per issue (GitHub links only the first number of `Closes #1, #2`)', () => {
