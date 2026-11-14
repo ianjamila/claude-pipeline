@@ -2,7 +2,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
-import { existsSync, readFileSync, writeFileSync, rmSync, openSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync, rmSync, openSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { roundWorld, findingsOf, low } from './helpers/round-world.mjs';
@@ -252,6 +252,52 @@ test('a finished job with no stdout capture (an older runner) or a cut one: the 
   assertExit(cut, 0, cut.stdout + cut.stderr);
   assert.equal(cut.json.codex.fromState, true);
   assert.equal(w.state().rounds.length, 1, 'nothing was run or discarded');
+});
+
+test('a done job left by a discarded round is not picked up for the same round recorded again at another head (the tag\'s base:head must be the recorded range)', (t) => {
+  const w = roundWorld(t, { max: 3 });
+  assertExit(rc(w, [], ok(w)), 0);
+  assertExit(w.cli(['state', 'discard-round', '--round', '1', '--pr', '7']), 0);
+  assert.equal(existsSync(join(jobsDir(w), 'codex-r1', 'exit.json')), true, 'discard-round leaves the old job behind');
+  w.repo.write('src/fix.js', 'export const fix = 1;\n');
+  const h2 = w.repo.commit('fix');
+  w.prHead(h2);
+  assertExit(w.codex(1, findingsOf([], [low()]), { from: w.base, to: h2 }), 0); // round 1 again, no codex-r1 job for it
+  const r = rc(w, [], ok(w));
+  assertExit(r, 1, r.stdout + r.stderr);
+  assert.equal(r.json.error, 'identity-mismatch');
+  assert.equal('codex' in r.json, false, 'the old job\'s output was not reported');
+  assert.equal(w.state().rounds.length, 1, 'nothing was run or discarded');
+});
+
+test('a failed job (exit 3) while the state already records round R (the substitute path) reports from the state, not the failure JSON', (t) => {
+  const w = roundWorld(t, { max: 3 });
+  const emit = emitter(w);
+  assertExit(w.codex(1, findingsOf([], [low()])), 0); // round 1 recorded another way, same range
+  startJob(w, tagOf(w, w.base, w.head), emit(3, '{"ok":false,"unavailable":true,"error":"codex-unavailable","substitute":{"eligible":true}}', 0));
+  const r = rc(w, []);
+  assertExit(r, 0, r.stdout + r.stderr);
+  assert.equal(r.json.ok, true);
+  assert.equal(r.json.codex.fromState, true);
+  assert.equal('unavailable' in r.json, false);
+  assert.deepEqual(r.json.codex.counts, { blocking: 0, suggestions: 1, worth_considering: 0 });
+});
+
+test('a failed arbiter needed is ok:false, step arbiter-needed, the child\'s error and JSON as result, the child\'s exit code', (t) => {
+  const w = roundWorld(t, { max: 3, yml: 'risk:\n  high_risk_paths: ["src/a.js"]\n' });
+  const cc = join(w.scratch, 'claude-code-2.1.322');
+  mkdirSync(join(cc, 'bin'), { recursive: true });
+  writeFileSync(join(cc, 'package.json'), JSON.stringify({ name: '@anthropic-ai/claude-code', version: '2.1.322' }));
+  const stale = { AI_AGENT: 'claude-code_2-1-318_agent', CLAUDE_CODE_EXECPATH: join(cc, 'bin', 'claude.exe') };
+  const r = rc(w, [], { ...ok(w), ...stale });
+  assertExit(r, 1, r.stdout + r.stderr);
+  assert.equal(r.json.ok, false);
+  assert.equal(r.json.step, 'arbiter-needed');
+  assert.equal(r.json.error, 'stale-terminal');
+  assert.equal(r.json.result.restartRequired, true);
+  assert.equal(r.json.reviewer, 'fable');
+  assert.deepEqual(r.json.codex.counts, { blocking: 0, suggestions: 1, worth_considering: 0 });
+  assert.equal('arbiter' in r.json, false);
 });
 
 test('exit 0 with no usable output and no recorded round: result-unavailable, next job read', (t) => {

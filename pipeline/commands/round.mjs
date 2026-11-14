@@ -27,6 +27,7 @@ export const meta = {
     'pipeline round codex --pr N --round R [--base B] [--head H] [--max-minutes M] [--repo DIR]   (M default 60, max 120)   RUN IT IN THE BACKGROUND (Bash run_in_background): it waits for Codex',
     '  -> exit 0 {ok, codex:{counts, codexPath, baseOnly?, resolutionOnly?, fromState?}, reviewer, arbiter?}   arbiter: the JSON of `arbiter needed --pr N --round R` verbatim, run once when reviewer is fable and the round has no arbiter record',
     '     (with an arbiter record: arbiterState:{recorded, proofOk}; `arbiter needed` is not a read, so it is not called again)',
+    '  -> a failed `arbiter needed` (non-zero exit or no JSON): {ok:false, step:"arbiter-needed", error, result:<its JSON>, codex, reviewer} with the step\'s exit code (error copied from the child; same shape as round publish), e.g. stale-terminal with restartRequired',
     '  -> exit 0 {ok, state:"running", next:"rerun round codex"}: still running after M minutes; the same command adopts the same job',
     '  -> a refusal or failure of a step is that step\'s JSON, unchanged, with its exit code (codex-review --plan, job start, codex-review: empty-range, base-mismatch, head-moved, round-cap, exit 3 unavailable / substitute …);',
     '     update-in-progress adds next:"rerun in a minute"; a job that was replaced by a newer run: {state:"replaced", next:"reconcile"} (never discard-round on its own); lost / missing: the job JSON',
@@ -34,6 +35,8 @@ export const meta = {
     '  --base / --head default to what codex-review admits: the head is the checked-out HEAD, the base the previous round\'s toHead (round 1 or a whole-PR round: the merge base with the PR\'s real base branch, read from GitHub)',
     '  the Codex run is the job codex-rR tagged <pr>:<R>:<base>:<head>: the same tag running is adopted (no second start), another tag running is exit 1 job-conflict',
     '  the result is read from the job\'s whole stdout; when that is missing (an older runner) or was cut, and the state records round R, the report is built from the state, else {next:"job read"}',
+    '  a round already recorded picks up a job codex-rR only when its tag\'s base:head are the recorded round\'s fromHead:toHead (a job left by a discarded round is never used: exit 1 identity-mismatch);',
+    '     a job that ended non-zero while the state already records round R (round recorded another way, e.g. substitute apply) reports from the state ({codex:{fromState:true}}), not the failure JSON',
     '  the command exits early when the process that started it is gone (the job keeps running; rerun it)',
     'pipeline round publish --pr N --round R [--repo DIR]',
     '  -> exit 0 {ok, accepted:{ids, path, count}, followups:[{id, issue}], held:[ids], warnings, outcome}; outcome is `state outcome` verbatim, needsHuman included (published first, then read)',
@@ -168,8 +171,12 @@ async function roundCodex(rest, ctx) {
 
   if (recorded) {
     // The round is in the state: only a finished or running job of THIS round is picked up (a rerun after the waiter was lost); nothing is started.
-    if (!['running', 'done'].includes(existing.state) || !String(existing.tag ?? '').startsWith(prefix)) {
-      throw identityMismatch(`round ${round} is already recorded in the review state and no job ${name} of this round is there to pick up: nothing was run`);
+    // "Of this round" is the recorded range: a job left by a round that was discarded and run again (or recorded another way) carries another base:head.
+    const recordedRound = before.rounds.find((r) => r.n === round);
+    const tagParts = String(existing.tag ?? '').split(':');
+    const sameRange = tagParts.length === 4 && tagParts[2] === recordedRound.fromHead && tagParts[3] === recordedRound.toHead;
+    if (!['running', 'done'].includes(existing.state) || !String(existing.tag ?? '').startsWith(prefix) || !sameRange) {
+      throw identityMismatch(`round ${round} is already recorded in the review state and no job ${name} of this round (base:head as recorded) is there to pick up: nothing was run`);
     }
     for (const [flag, at] of [['base', 2], ['head', 3]]) {
       if (values[flag] !== undefined && fullSha(values[flag], root) !== existing.tag.split(':')[at]) {
@@ -256,6 +263,11 @@ async function finish({ root, ctx, pr, round, snap, jobInfo }) {
   const json = usable ? parseJson(snap.output).json : null;
 
   if (snap.exitCode !== 0) {
+    // A failed job does not record a round: a recorded round R was recorded another way (the substitute path), so the state answers, not the failure.
+    const recordedState = readState(root);
+    if (recordedState && recordedState.pr === pr && recordedState.rounds.some((r) => r.n === round)) {
+      return finishFromState({ root, ctx, pr, round, state: recordedState, report: reportFromState(root, recordedState, round) });
+    }
     if (json === null) {
       return {
         exitCode: snap.exitCode === EXIT.USAGE || snap.exitCode === EXIT.UNAVAILABLE ? snap.exitCode : EXIT.FAILED,
@@ -278,6 +290,11 @@ async function finish({ root, ctx, pr, round, snap, jobInfo }) {
     return { exitCode: EXIT.FAILED, output: { ok: false, error: 'result-unavailable', ...jobInfo, next: 'job read', doc: SPECIAL, message: `job ${jobInfo.name} finished with exit 0 but its output is missing or cut, and the review state does not hold round ${round}`, tail: snap.tail } };
   }
 
+  return finishFromState({ root, ctx, pr, round, state, report });
+}
+
+// The report is built; a Fable round with no arbiter record also gets `arbiter needed`.
+function finishFromState({ root, ctx, pr, round, state, report }) {
   if (report.reviewer !== 'fable') return { exitCode: EXIT.OK, output: report };
   const roundRecord = state.rounds.find((r) => r.n === round);
   if (roundRecord.arbiter !== undefined && roundRecord.arbiter !== null) {
@@ -285,7 +302,12 @@ async function finish({ root, ctx, pr, round, snap, jobInfo }) {
     return { exitCode: EXIT.OK, output: { ...report, arbiterState: { recorded: true, proofOk: roundRecord.arbiter.proofOk ?? null } } };
   }
   const needed = step(root, ['arbiter', 'needed', '--pr', String(pr), '--round', String(round)], ctx);
-  return { exitCode: needed.code, output: { ...report, arbiter: needed.json ?? { ok: false, error: 'no-json', stdout: needed.stdout.slice(0, 2000) } } };
+  if (needed.code !== EXIT.OK || needed.json === null) {
+    // Same shape as round publish: the step that failed, its error, its JSON; the exit code is the step's.
+    const result = needed.json ?? { ok: false, error: 'no-json', stdout: needed.stdout.slice(0, 2000), stderr: needed.stderr.slice(0, 2000) };
+    return { exitCode: needed.code === EXIT.OK ? EXIT.FAILED : needed.code, output: { ...report, ok: false, step: 'arbiter-needed', ...(typeof result.error === 'string' ? { error: result.error } : {}), result } };
+  }
+  return { exitCode: EXIT.OK, output: { ...report, arbiter: needed.json } };
 }
 
 // ---------------------------------------------------------------------------------------------------------------------------------------------
