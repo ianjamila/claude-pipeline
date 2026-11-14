@@ -15,7 +15,7 @@
 import { existsSync, readFileSync, statSync, realpathSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { UNDECIDABLE_HEREDOC, plainExit, sourcePathSearch, commandName, simpleCommands, splitArgs, scriptFileOf, scriptFeedsOf, sqlShellEscapes, startupFilesOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, splicesOptions, spliceText, implicitBindsOf, ZSH_NAME_BINDERS, SHELL_SET_NAMES, withoutLiteralText, INDIRECT_EXPANSION, indirectExpansionOnLine, arithAssignedNames, envUnset, refusalAdvice } from './shell-parse.mjs';
+import { UNDECIDABLE_HEREDOC, plainExit, exitFollows, shapeAt, sourcePathSearch, commandName, simpleCommands, splitArgs, scriptFileOf, scriptFeedsOf, sqlShellEscapes, startupFilesOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, splicesOptions, spliceText, implicitBindsOf, ZSH_NAME_BINDERS, SHELL_SET_NAMES, withoutLiteralText, INDIRECT_EXPANSION, indirectExpansionOnLine, arithAssignedNames, envUnset, refusalAdvice } from './shell-parse.mjs';
 export { withoutLiteralText, INDIRECT_EXPANSION, SETS_BY_NAME };
 import { PM_RUN_ALIASES, PM_WRAPPERS, pmScriptOf, pmCannotRunScript, pmCall, pmMoverName, packageScripts, localBin, nameAtRunTimeIn, markPackageState, pkgOwnWrite, pkgMarkersFor, pmStartDirs, binIsProgram, binSite, binInterpreter, MAX_BIN_INTERPRETERS, lineNames, defaultLexists } from './package-scripts.mjs';
 import { catchAllReason, guardedCommandText, dataLessArgs } from './guarded-text.mjs';
@@ -2825,6 +2825,17 @@ function evalString(str, startDir, ctx, level, child = false) {
   checkDeadline(ctx.budget);
   if (level > MAX_NESTING) return deny('pipeline job start / alias is nested too deeply to verify.');
   const cmds = simpleCommands(str, { env: ctx.env, bashState: ctx.bashState, expired: () => ctx.budget.now() > ctx.budget.deadline }); // a scan that outlasts the deadline gives up: truncated, so denied
+  // #452: the group form `cd d || { echo "no d" >&2; exit 1; }; git push`, read by shell-parse's exitFollows, the files guard's rule (a group entered by ||, its last command a plain exit, no redirection on its closer)
+  let shapeTop; // (the commands of the text's own level and their shape events, built when first asked)
+  // #478 R1-B1: the index in cmds of the group's last command, its `exit` (-1: not this form). The commands after i up to it run only when the cd / checkout FAILED.
+  const exitOfGroup = (i) => {
+    if (!cmds.shape || cmds[i].depth > 0) return -1;
+    shapeTop ??= { top: cmds.filter((c) => !(c.depth > 0)), evAt: shapeAt(cmds.shape) }; // (the commands inside a substitution are listed before the one that holds them; the events count the text's own level only)
+    const k = shapeTop.top.indexOf(cmds[i]);
+    const after = k >= 0 ? exitFollows(shapeTop.top, shapeTop.evAt, k) : -1;
+    return after >= 1 ? cmds.indexOf(shapeTop.top[after - 1]) : -1; // (the exit is the construct's last command; a substitution of the command after it is listed after the exit)
+  };
+  const exitsAsGroup = (i) => exitOfGroup(i) >= 0;
   // Truncated means part of the line was never looked at, so nothing on it can be called harmless (`g''it push` after
   // 500 `true;` must not slip through on a word match).
   if (cmds.undecidable) return deny(UNDECIDABLE_HEREDOC);
@@ -2878,11 +2889,27 @@ function evalString(str, startDir, ctx, level, child = false) {
   ctx.writeFrames.push(frame);
   // the subshells open at the command being walked, outermost first: { id, dir, uncertain } as they were when it started (null: marks not trusted, see subshellsTrusted)
   const subs = subshellsTrusted(cmds) ? [] : null;
+  // #478 R1-B1: the commands of a failure group `cd X || { …; exit 1; }` run only when the cd (or a git checkout / switch) FAILED, in the old directory on the old branch, so they are walked with the state unknown
+  // (`to`: the index of the group's exit; `snap`: the state the cd / checkout left, put back for the commands after the group unless `doubt`: the cd / checkout itself may not have run)
+  let failGroup = null;
   let chdirBase; // (the list's own directory while one command runs in its wrapper's -C / --chdir directory)
   try {
   for (const [i, c] of cmds.entries()) {
     checkDeadline(ctx.budget); // a lookup (branch, labels) can take seconds; the evaluation as a whole may not
     if (chdirBase !== undefined) { dir = chdirBase; chdirBase = undefined; }
+    if (failGroup && failGroup.snap === null) {
+      failGroup.snap = { dir, names: [...ctx.branches.entries()].map(([k, e]) => [k, e.name]) };
+      forgetState();
+    } else if (failGroup && i > failGroup.to) {
+      dir = failGroup.snap.dir;
+      // (#478 R2-F1: when the cd / checkout was itself uncertain, the snapshot is an optimistic state: forgotten, not put back; R2-B1: an entry first made in the group is not in the snapshot: unknown)
+      if (failGroup.doubt) forgetState();
+      else {
+        const was = new Map(failGroup.snap.names);
+        for (const [k, e] of ctx.branches) e.name = was.has(k) ? was.get(k) : null;
+      }
+      failGroup = null;
+    }
     const argv = c.argv;
     if (subs) {
       // Why: a cd inside a subshell ($( ), ( ), backticks, <( )) moves that subshell only: when it ends, the line goes on in the directory it had when the subshell
@@ -2912,8 +2939,11 @@ function evalString(str, startDir, ctx, level, child = false) {
       // (#427, the same rule as the files guard's cd narrowing: only a plain `exit`, alone or with one number, leaves: not `return` (an error at top level), not an exit with a redirection or extra words, and no
       // redirection on the closer of its group, `{ exit 1; } < f`, which the parser lists as a command of no words right after it)
       const orExits = cmds[i + 1]?.sep === '||' && plainExit(cmds[i + 1]) && cmds[i + 2]?.sep !== '|' && cmds[i + 2]?.sep !== '&'
-        && !(cmds[i + 2] !== undefined && cmds[i + 2].argv.length === 0 && (cmds[i + 2].redirects ?? []).length > 0);
+        && !(cmds[i + 2] !== undefined && cmds[i + 2].argv.length === 0 && (cmds[i + 2].redirects ?? []).length > 0)
+        || (changesState && exitsAsGroup(i));
+      if (changesState && !failGroup && exitsAsGroup(i)) failGroup = { to: exitOfGroup(i), snap: null, doubt: false };
       if (changesState && (inFlow(from, i) || c.depth > 0 || c.sep === '&&' || c.sep === '||' || ranInSubshell(cmds, i) || (cmds[i + 1]?.sep === '||' && !orExits))) uncertain = true;
+      if (failGroup && failGroup.snap === null) failGroup.doubt = uncertain; // (the doubt about this cd / checkout, carried or new: it is consumed inside the group)
     }
     // (Phase 3b, Fable attacker pass: `env -C D gh pr merge …` / `sudo -D D …` run the command in D, which the merge check never saw from a
     // cwd outside the repository: it is judged there, or in an unknown directory (null: a chat repo whose repository is unknown) when D cannot be read)
