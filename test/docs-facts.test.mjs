@@ -203,6 +203,19 @@ test('the review skill sends a quota stop, a withheld round and a second review 
   assert.match(merge, /label mode never merges one|Label mode ⇒ no request/);
 });
 
+test('SKILL.md itself carries the steps a short text must not drop: the e2e label before gh pr ready, the Fable-round diff clause, the read-first line', () => {
+  const skill = skillMd();
+  assert.match(skill, /re-run 1\.5[^\n]*`gh pr edit N --add-label <ci\.e2e_label>`[^\n]*then `gh pr ready N`/);
+  assert.match(skill, /rule on every item in it\.` \(Fable round: and review the diff it names\)/);
+  assert.match(skill, /Full text: `reference\/ready-and-handoff\.md`: read it before step 1/);
+  assert.ok(Buffer.byteLength(skill) <= 12 * 1024, 'SKILL.md stays within 12 KB');
+  // the by-hand Codex step is whole in special-rounds.md: the wait and the non-substitute exits are there, and substitute.md opens on a sentence
+  const oneByOne = ref('special-rounds');
+  assert.match(oneByOne, /then `P job wait codex-rR --run-id <runId> --timeout 540`/);
+  for (const needle of ['`empty-range`', '`base-mismatch`', '`head-moved`']) assert.ok(oneByOne.includes(needle), `special-rounds.md must handle ${needle}`);
+  assert.doesNotMatch(ref('substitute'), /^\s+then `P job wait/m);
+});
+
 test('every doc path a round bundle can print exists (action-valued next, like "rerun round codex", is not a path)', async () => {
   const { ROUND_DOCS } = await import('../pipeline/commands/round.mjs');
   assert.ok(ROUND_DOCS.length > 0);

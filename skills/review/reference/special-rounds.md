@@ -14,7 +14,7 @@ The old, still valid way to run a round one command at a time (what `P round cod
 1. **Codex.** base: round 1 `git merge-base origin/<default_branch> HEAD`, later the previous round's `toHead` (`.review/state.json`);
    head: the pushed HEAD; `P state outcome` `nextRound.base` is the base (the merge base when `wholePrOwed`: that round reviews the whole PR). BEFORE every codex-review call run it with `--plan` (same `--pr --round --base --head`) and pass its `expectedEffort` as `--effort`: codex-review refuses any other.
    `P job start codex-rR -- node ~/.claude/pipeline/bin/pipeline.mjs codex-review --pr N --round R --base <base> --head <head> --effort <effort>`,
-
+   then `P job wait codex-rR --run-id <runId> --timeout 540` until `state` is `done` (Old rule 5), and read `exitCode` and the JSON in `tail`. Exit 2 `empty-range`: the "fix" changed no code, go back to step 5. Exit 2 `base-mismatch`: the base is not the one codex-review admits (the previous round's `toHead`, or the merge base for round 1 / a whole-PR round): recompute and rerun. Exit 2 `head-moved`: the PR head moved while Codex ran: recompute the head and rerun. Exit 3 with `substitute.eligible` (a real quota stop, or `reason: withheld`) ⇒ `reference/substitute.md`; not eligible ⇒ rule 2 of SKILL.md.
    An interrupted round (no triage comment yet): `P state discard-round --round R --pr N` before rerunning it.
    `baseOnly: true` (only main merged in): Codex did not run, no items, not counted; it carries the last reviewed result forward.
    `resolutionOnly: true` (a main conflict resolved by choosing lines): a real review of just the resolution, triaged as usual
