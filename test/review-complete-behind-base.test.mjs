@@ -173,6 +173,9 @@ test('review-complete: a behind draft whose base ref could not be refreshed (off
   const w = world(t);
   w.mainMovesOn();
   w.repo.git(['fetch', '-q', 'origin']); // the cached origin/main is already behind-making ...
+  // A real clone has origin/HEAD (git clone sets it); this hand-made fixture does not. Without that cached anchor an offline run
+  // cannot anchor the default branch at all, and the PR needs the Fable pass (#377, S1: covered in review-complete-fetch.test.mjs).
+  w.repo.git(['remote', 'set-head', 'origin', 'main']);
   w.repo.git(['remote', 'set-url', 'origin', join(tmpdir(), 'cp-rcbehind-does-not-exist.git')]); // ... and the refresh fails
   const r = w.cli(['review-complete', '--pr', '7']);
   assertExit(r, 0, r.stderr + r.stdout);
