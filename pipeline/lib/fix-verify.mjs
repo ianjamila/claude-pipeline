@@ -5,8 +5,8 @@
 //               agent `arbiter-fix`, proven at effort `medium` or higher.
 // The choice never decides WHETHER Fable runs (every Fable round still needs a proven pass: triage.mjs#fablePendingRounds), only how much
 // exploration it is asked for. Anything that is not clearly a fix round is `full`.
-import { countsTowardCap } from './triage.mjs';
-import { DEFAULTS } from './config.mjs';
+import { applyPostMaxDefault, countsTowardCap, postMaxPolicy } from './triage.mjs';
+import { DEFAULTS, baseConfigAt, loadConfig } from './config.mjs';
 import { matchAny } from './glob.mjs';
 import { isDocPath } from './doc-paths.mjs';
 
@@ -60,6 +60,24 @@ export function fixRoundCandidate(state, round, { scope }) {
 
 // The 1-based ordinal of counted round n: how many counted rounds (triage.mjs#countsTowardCap) have a number up to and including n.
 export const countedOrdinal = (state, n) => (state?.rounds ?? []).filter((r) => countsTowardCap(r) && r.n <= n).length;
+
+// review.post_max_suggestions for the items of round `round` (#374 PR B): lib/triage.mjs#applyPostMaxDefault with the policy of the working-tree AND the fork-point config ('review' in either, or a
+// config that cannot be read, is off) and the round's counted ordinal. Reads no config at all unless the round is past max + 1. Callers: `arbiter apply` and `triage validate` (the judge); nobody else.
+export async function postMaxApply(items, { state, round, root }) {
+  const max = state?.maxRounds;
+  if (!Number.isInteger(max)) return items;
+  const ordinal = countedOrdinal(state, round.n);
+  if (ordinal <= max + 1) return items;
+  let configs;
+  try {
+    const loaded = await loadConfig(root);
+    const fork = baseConfigAt(round.forkPoint, root);
+    configs = [loaded.ok ? loaded.config : null, fork.ok ? fork.config : null];
+  } catch {
+    configs = [null];
+  }
+  return applyPostMaxDefault(items, { policy: postMaxPolicy(configs), ordinal, max });
+}
 
 const NEW_EXPORT = /^\s*export\s+(async\s+)?(function|class|const|let)\b/;
 

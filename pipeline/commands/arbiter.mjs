@@ -16,7 +16,7 @@ import { fingerprint, largeBinaryNote, resolutionBaseNote, resolutionSection } f
 import { GitError, ReviewBaseUnavailable, diffFiles, ensureReviewBase, reviewPatch, showFile } from '../lib/git.mjs';
 import { baseConfigAt, loadConfig } from '../lib/config.mjs';
 import { collectHardStops } from '../lib/hardstops.mjs';
-import { BRIEFS, BRIEF_FIX_VERIFY, BRIEF_FULL, acceptedEfforts, countedOrdinal, expectationOf, fixRoundCandidate, fixRoundScope } from '../lib/fix-verify.mjs';
+import { BRIEFS, BRIEF_FIX_VERIFY, BRIEF_FULL, acceptedEfforts, countedOrdinal, expectationOf, fixRoundCandidate, fixRoundScope, postMaxApply } from '../lib/fix-verify.mjs';
 import { assessRisk, reviewLane, riskHits, threatModelsFor, trustedBase } from '../lib/risk.mjs';
 import { claudeCodeStatus } from '../lib/claude-code-version.mjs';
 import { floorBypass, floorOutput, judgeAndPublish } from '../lib/floor-proof.mjs';
@@ -653,7 +653,8 @@ async function applyLocked({ n, agentId, givenTag, expectModelPrefix, askedEffor
       .filter(([, entry]) => entry.by === 'arbiter' || isOwnerRuled({ final: entry })));
     const reused = reuseRuled(fresh.map(({ final, ...rest }) => rest), cache, { round: n });
     const findingItems = fresh.map((item, i) => (reused[i].final ? reused[i] : item));
-    const items = [...finalizeWithoutArbiter(ruled, { lightLane: state.lightLane, force: forceArbiter(env) }), ...findingItems];
+    // Past review.max_rounds (+ the owner-granted round) a low-severity ACCEPT becomes a FOLLOW-UP when review.post_max_suggestions says so in both configs (#374 PR B; off by default).
+    const items = await postMaxApply([...finalizeWithoutArbiter(ruled, { lightLane: state.lightLane, force: forceArbiter(env) }), ...findingItems], { state, round, root });
 
     const dir = ensureRoundDir(root, n);
     writeJson(path.join(dir, 'rulings.json'), {

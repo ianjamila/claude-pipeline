@@ -549,3 +549,13 @@ test('priceTables provenance: entries priced under two table dates show both; an
   bad.cost.byPrice = [];
   assert.equal(decodeRecord(`${MARKERS.summary}\n\n${encodeRecord(bad)}`).status, 'invalid');
 });
+
+test('a trip-wire stop is the existing outcome blocked with detail process-review: the record is valid and carries it (no new outcome)', () => {
+  const { record, warnings } = recordForOutcome(null, { repo: 'acme/widgets', pr: PR, branch: 'agent/feature', baseRef: 'main', outcome: 'blocked', detail: 'process-review: Process review before round 4: 2 past-limit round(s) accepted at least as many new items', host: 'h', now: NOW });
+  assert.deepEqual(warnings, []);
+  assert.equal(record.outcome, 'blocked');
+  assert.match(record.detail, /^process-review: /);
+  const decoded = decodeRecord(`${MARKERS.summary}\n\n${encodeRecord(record)}`);
+  assert.equal(decoded.status, 'ok');
+  assert.equal(decoded.record.outcome, 'blocked');
+});

@@ -192,3 +192,58 @@ test('round-request: all the existing refusals stay (label mode, wrong PR, a rou
   assert.match(allowed.json.reason, /round 2 is already allowed \(within review\.max_rounds\)/);
   assert.equal(allowed.json.summary, undefined);
 });
+
+// ---- the round trip-wire (#374 PR B): a prompt, not a gate ----------------------------------------------------------------------------------------------------------
+
+// maxRounds 1, rounds 1 and 2 accepted one fix each: the count did not fall, and 2 rounds are reviewed (limit 1).
+const WIRE_NOT_FALLING = { review: '  trip_wire_not_falling: 1\n' };
+
+test('round-request trip-wire: tripped => exit 1 {error: trip-wire, tripWire, processReview} and NO line, nothing written (state or PR)', (t) => {
+  const w = roundWorld(t, WIRE_NOT_FALLING);
+  w.atCap();
+  const before = [w.stateText(), JSON.stringify(w.fake.comments())];
+  const r = ask(w);
+  assertExit(r, 1, r.stderr + r.stdout);
+  assert.deepEqual([r.json.ok, r.json.error], [false, 'trip-wire']);
+  assert.equal(r.json.tripWire.tripped, true);
+  assert.deepEqual([r.json.tripWire.reviewed, r.json.tripWire.max, r.json.tripWire.acceptsByRound], [2, 1, [1, 1]]);
+  assert.match(r.json.tripWire.reasons.join(';'), /past-limit round\(s\) accepted at least as many new items/);
+  assert.equal(r.json.line, undefined, 'no round line');
+  assert.doesNotMatch(r.stdout, /Extra review round needed/);
+  assert.match(r.json.processReview.headline, /^Process review before round 3: /);
+  assert.match(r.json.processReview.summary, /a prompt, not a gate/);
+  assert.match(r.json.processReview.summary, /New accepts per round: 1, 1/);
+  assert.match(r.json.processReview.summary, /Rounds: 2 reviewed/);
+  assert.deepEqual([w.stateText(), JSON.stringify(w.fake.comments())], before);
+});
+
+test('round-request trip-wire: --after-process-review prints the usual line AND still returns tripWire and processReview', (t) => {
+  const w = roundWorld(t, WIRE_NOT_FALLING);
+  const { h2 } = w.atCap();
+  const r = w.cli(['triage', 'round-request', '--pr', '7', '--after-process-review']);
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.equal(r.json.line, `🔁 Extra review round needed #7: round 3 · head ${h2.slice(0, 12)} · repo ${w.slug}`);
+  assert.equal(r.json.tripWire.tripped, true);
+  assert.match(r.json.processReview.headline, /^Process review before round 3: /);
+});
+
+test('round-request trip-wire: the hard limit (review.trip_wire_extra_rounds) trips on its own; the smaller of the working-tree and fork-point values applies', (t) => {
+  const w = roundWorld(t, { review: '  trip_wire_extra_rounds: 1\n' });
+  w.atCap();
+  const r = ask(w);
+  assertExit(r, 1, r.stderr + r.stdout);
+  assert.match(r.json.tripWire.reasons.join(';'), /2 counted rounds reached review\.max_rounds 1 \+ 1/);
+  // a working-tree edit cannot loosen the committed (fork-point) value
+  w.config({ review: '  trip_wire_extra_rounds: 10\n  trip_wire_not_falling: 5\n' });
+  assertExit(ask(w), 1);
+});
+
+test('round-request trip-wire: not tripped (the default settings, a falling or zero-accept series) leaves the answer unchanged: no tripWire field', (t) => {
+  const w = roundWorld(t);
+  w.atCap();
+  const r = ask(w);
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.equal(r.json.tripWire, undefined);
+  assert.equal(r.json.processReview, undefined);
+  assert.match(r.json.line, /^🔁 Extra review round needed #7: round 3/);
+});
