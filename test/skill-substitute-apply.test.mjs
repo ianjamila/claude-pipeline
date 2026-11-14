@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url';
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 
 test('every `substitute apply` command line in the skills and docs names --pr', () => {
-  for (const file of ['skills/review/SKILL.md', 'docs/cli.md']) {
+  for (const file of ['skills/review/SKILL.md', 'skills/review/reference/substitute.md', 'skills/review/reference/special-rounds.md', 'docs/cli.md']) {
     const text = readFileSync(join(root, file), 'utf8');
     for (const m of text.matchAll(/(?:P|pipeline) substitute apply ([^`\n]*)/g)) assert.match(m[1], /--pr\b/, `${file}: ${m[0]}`);
   }

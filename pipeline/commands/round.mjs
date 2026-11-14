@@ -43,6 +43,9 @@ export const meta = {
   ].join('\n'),
 };
 
+// The doc a `next` that is not an action points at (path under skills/review/): printed as `doc`. test/docs-facts.test.mjs checks every one exists.
+export const ROUND_DOCS = Object.freeze(['reference/special-rounds.md']);
+const SPECIAL = ROUND_DOCS[0];
 export const DEFAULT_MAX_MINUTES = 60;
 export const MAX_MAX_MINUTES = 120;
 const POLL_MS = 1000;
@@ -232,10 +235,10 @@ async function roundCodex(rest, ctx) {
     return { exitCode: EXIT.OK, output: { ok: true, state: 'running', ...jobInfo, elapsedMs: snap.elapsedMs, next: 'rerun round codex' } };
   }
   if (snap.state === 'replaced') {
-    return { exitCode: EXIT.FAILED, output: { ok: false, state: 'replaced', ...jobInfo, next: 'reconcile', message: `job ${name} now belongs to another run: another session may own this round; reconcile, never discard the round on this alone` } };
+    return { exitCode: EXIT.FAILED, output: { ok: false, state: 'replaced', ...jobInfo, next: 'reconcile', doc: SPECIAL, message: `job ${name} now belongs to another run: another session may own this round; reconcile, never discard the round on this alone` } };
   }
   if (snap.state === 'lost' || snap.state === 'missing') {
-    return { exitCode: snap.state === 'missing' ? EXIT.USAGE : EXIT.FAILED, output: { ok: false, ...jobInfo, ...snap } };
+    return { exitCode: snap.state === 'missing' ? EXIT.USAGE : EXIT.FAILED, output: { ok: false, ...jobInfo, ...snap, doc: SPECIAL } };
   }
   return finish({ root, ctx, pr, round, snap, jobInfo });
 }
@@ -256,7 +259,7 @@ async function finish({ root, ctx, pr, round, snap, jobInfo }) {
     if (json === null) {
       return {
         exitCode: snap.exitCode === EXIT.USAGE || snap.exitCode === EXIT.UNAVAILABLE ? snap.exitCode : EXIT.FAILED,
-        output: { ok: false, error: 'codex-no-json', ...jobInfo, exitCode: snap.exitCode, next: 'job read', tail: snap.tail },
+        output: { ok: false, error: 'codex-no-json', ...jobInfo, exitCode: snap.exitCode, next: 'job read', doc: SPECIAL, tail: snap.tail },
       };
     }
     return { exitCode: snap.exitCode, output: json.error === 'update-in-progress' ? { ...json, next: 'rerun in a minute' } : json };
@@ -272,7 +275,7 @@ async function finish({ root, ctx, pr, round, snap, jobInfo }) {
   } else if (inState) {
     report = reportFromState(root, state, round);
   } else {
-    return { exitCode: EXIT.FAILED, output: { ok: false, error: 'result-unavailable', ...jobInfo, next: 'job read', message: `job ${jobInfo.name} finished with exit 0 but its output is missing or cut, and the review state does not hold round ${round}`, tail: snap.tail } };
+    return { exitCode: EXIT.FAILED, output: { ok: false, error: 'result-unavailable', ...jobInfo, next: 'job read', doc: SPECIAL, message: `job ${jobInfo.name} finished with exit 0 but its output is missing or cut, and the review state does not hold round ${round}`, tail: snap.tail } };
   }
 
   if (report.reviewer !== 'fable') return { exitCode: EXIT.OK, output: report };
