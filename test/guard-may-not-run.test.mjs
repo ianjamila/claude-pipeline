@@ -592,6 +592,22 @@ test('#352 R22: {a[0]}>f is a named-descriptor word, and a leading {fd}>f follow
   allows('twin: exec {a[0]}>/dev/null; push', `exec {a[0]}>/dev/null; ${SHIP}`, {}, GIT_ROOT);
 });
 
+// (#352 R23-B1, R23-F1: bash takes any subscript of an array element as the descriptor name, a nested one (`{a[b[0]]}>f`) and a quoted one (`{a['0']}>f`, `{a[$'0']}>f`: quoting does not make the
+// word a plain argument); either is a named-descriptor word like `{a[0]}>f`)
+test('#352 R23-B1, R23-F1: a nested or quoted subscript in a named descriptor is a named-descriptor word', () => {
+  for (const w of ['{a[b[0]]}', "{a['0']}", '{a["0"]}', "{a[$'0']}", "{a[b['0']]}"]) {
+    refuses(`echo text | bash ${w}>f`, `echo 'git ${PUSH} origin HEAD:${MAIN}' | bash ${w}>/dev/null`, {}, GIT_ROOT);
+    refuses(`ls ${w}>f; push`, `ls ${w}>/dev/null; ${SHIP}`, {}, GIT_ROOT);
+    refuses(`${w}>f push HEAD:main`, `${w}>/dev/null ${SHIP}:${MAIN}`, {}, GIT_ROOT);
+    refuses(`git push origin ${w}>f (main)`, `git ${PUSH} origin ${w}>/dev/null`, {}, MAIN_DIR);
+    refuses(`if [[ ]] ${w}>f push`, `if [[ -n x ]] ${w}>/dev/null ${SHIP}`, {}, GIT_ROOT);
+    allows(`twin: exec ${w}>/dev/null; push`, `exec ${w}>/dev/null; ${SHIP}`, {}, GIT_ROOT);
+  }
+  // unchanged: a quoted word that is no named descriptor stays an argument
+  allows("twin: echo '{a}' >/dev/null; push", `echo '{a}' >/dev/null; ${SHIP}`, {}, GIT_ROOT);
+  allows("twin: echo '{a[0]}'x >/dev/null; push", `echo '{a[0]}'x >/dev/null; ${SHIP}`, {}, GIT_ROOT);
+});
+
 // (#352 R19: the R18 watch for a word after `]]` was tied to one segment and to the single next word: an inner && of the [[ ]] split the segment (B1), a reserved word right after `]]` hid the same-line body in
 // the argv of `[[` (F1), and a `{fd}` redirect prefix disarmed it (F2))
 test('#352 R19-B1, R19-F1, R19-F2: the ]] watch survives a && inside [[ ]], a same-line body after ]] then / ]] do is refused, a {fd} redirect does not disarm it', () => {

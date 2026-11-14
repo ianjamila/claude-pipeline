@@ -147,6 +147,22 @@ test('#352 R22: a subscripted named descriptor rebinds its array, and an assignm
   assert.equal(files('export F=22; sh run.sh', ok).decision, 'allow');
 });
 
+// (#352 R23: a nested or quoted subscript in a named descriptor (`{F[a[0]]}>f`, `{F['0']}>f`) rebinds F like `{F[0]}>f` (B1, F1); a bare `{` / `}` word that is no command splits the word groups, so
+// the words after it (`echo { F=x }`, `: { F=x }`, `{k}>f { F=x }`) are read as an assignment that never ran (F2): the line is refused)
+test('#352 R23-B1, R23-F1, R23-F2: nested / quoted subscripted descriptors rebind; an assignment after a bare { or } argument is not believed', () => {
+  const fs = fakeFs(PROJ, {}, [...DIRS, '.review']);
+  for (const pre of ['{F[a[0]]}>/dev/null', '{F[a[0]]}>/dev/null true', "{F['0']}>/dev/null true", '{F["0"]}>/dev/null', "ls {F[$'0']}>/dev/null", "exec {F['1']}>/dev/null"]) {
+    assert.equal(files(`F=x; ${pre}; echo '{}' > .review/round-$F/arbiter-output.json`, fs).decision, 'deny', pre);
+  }
+  for (const body of ['{k}>/dev/null { F=x }', ': { F=x }', 'echo { F=x }', 'echo } F=x', "{k['0']}>/dev/null F=x"]) {
+    const sfs = fakeFs(PROJ, { 'run.sh': `${body}\necho '{}' > .review/round-$F/arbiter-output.json\n` }, [...DIRS, '.review']);
+    assert.equal(files('export F=22; sh run.sh', sfs).decision, 'deny', body);
+  }
+  // unchanged: a real brace group assigns
+  const ok = fakeFs(PROJ, { 'run.sh': "{ F=x; }\necho '{}' > /tmp/round-$F.json\n" }, [...DIRS, '.review']);
+  assert.equal(files('export F=22; sh run.sh', ok).decision, 'allow');
+});
+
 // ---- the second pass of a stale line spends what the first one left ------------------------------------------------------------------------------------------
 
 // main.sh runs n scripts; the first through "${BASH:-bash}" (rewritten), the last one binds BASH (judged after the rewrite, so the verdict is stale and the line is judged again)

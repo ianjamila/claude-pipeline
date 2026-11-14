@@ -1798,6 +1798,9 @@ function collectVars(cmds, ctx) {
     if (k !== '*' && ws.includes(UNKNOWN_WORD) && raw !== undefined && !/\$\(|`/.test(raw) && (raw.startsWith('(') || /\$\{[^}]*[^\w}]/.test(raw))) unknown.add(name);
   }
   // Defensive (mutation check): with more assignments than the scan follows, the target is still judged by rawHit / pathHit on the expanded values (expandRefs) as on main.
+  // (#352 R23-F2: a line whose shape the parser cannot follow (cmds.ctlBroken: a bare { or } argument splits the word groups, so `echo { F=x }` reads as an assignment that never runs; a zsh form,
+  // a {fd} word) may or may not run what it assigns: every name it gives is only known at run time)
+  if (cmds.ctlBroken) for (const k of given.keys()) unknown.add(k);
   if (ctx.assigned?.has('*')) for (const k of given.keys()) unknown.add(k); // (more assignments than the scan follows: every name the line gives is only known at run time)
   if (aPins === null) for (const [k, r] of raws) if (r.size > 1) unknown.add(k);
   // Why (#76 / #81 t7 and the security follow-up): a name an arithmetic assigns (or appends to) holds a value the text does not give (see arithAssignedNames), whether or not the line gave it one
@@ -2742,7 +2745,10 @@ function setPositionals(argv) {
 function sourcedEffects(text, ctx, depth = 0, seenFiles = new Set()) {
   const out = { vars: new Map(), cds: [], all: false, unknownCd: false };
   const cmds = simpleCommands(text, { bashState: ctx.bashState, expired: () => ctx.budget.now() > ctx.budget.deadline });
-  if (cmds.truncated || cmds.dynamic) out.all = true;
+  // (#352 R23-F2: a script line whose shape the parser cannot follow (ctlBroken: a bare { or } argument that splits the word groups, `echo { F=x }`, a zsh condition-then-body form, a {fd} word) may or may
+  // not run the commands read from it: what it binds, and the directory it ends in, are unknown)
+  if (cmds.truncated || cmds.dynamic || cmds.ctlBroken) out.all = true;
+  if (cmds.ctlBroken) out.unknownCd = true; // (`echo { cd d }`: the cd may not run either)
   const from = flowStart(cmds);
   const seen = new Map();
   const local = Object.create(null);

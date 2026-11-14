@@ -12,8 +12,10 @@
 
 import { sqlShellEscapes, sqlFamilyOf, sqlClientPlan, SQL_CLIENT_NAMES, SQL_RC_MENTION } from './sql-clients.mjs';
 const MAX_COMMANDS = 500;
-// (#352 R22-F1: a named-descriptor word `{fd}` before a redirect operator; bash >= 4.3 also takes an array element (`{a[0]}>f` assigns the number to a[0]))
-const FD_NAME_WORD = /^\{([A-Za-z_]\w*)(?:\[[^\]]*\])?\}$/;
+// (#352 R22-F1: a named-descriptor word `{fd}` before a redirect operator; bash >= 4.3 also takes an array element (`{a[0]}>f` assigns the number to a[0]), any subscript: a nested one too (`{a[b[0]]}`, R23-B1))
+const FD_NAME_WORD = /^\{([A-Za-z_]\w*)(?:\[.*\])?\}$/;
+// (#352 R23-F1: bash ignores quoting inside the subscript of a named-descriptor word (`{a['0']}>f`, `{a[$'0']}>f`): the RAW word of a quoted one is matched)
+const FD_SUB_RAW = /^\{[A-Za-z_]\w*\[.*\]\}$/;
 const MAX_NEST = 200; // in-place nesting of $( ), ( ), <( ) before we give up on the line
 const MAX_WORK = 8_000_000; // total characters lexed across all recursive parses
 const HARD_MAX_DEPTH = 50;
@@ -2451,6 +2453,7 @@ class Parser {
       const subs = wsubs;
       const one = wspans.length > 0 && wspans[0][0] === 0 && wspans[0][1] === text.length; // (the first span covers the whole text: no other can follow it)
       const from = wstart;
+      const fdw = /[<>]/.test(s[this.i] ?? '') && (q < 0 ? FD_NAME_WORD.test(text) : FD_SUB_RAW.test(s.slice(from, this.i))); // (a `{fd}>file` redirect prefix: R19-F2, R23-F1)
       cur = '';
       inWord = false;
       qa = -1;
@@ -2467,7 +2470,7 @@ class Parser {
         seg.redirects.push({ op: rop, target: dup ? '&' + text : text, fd: rfd });
         if (subs.length && text.startsWith('>(')) seg.outSubs.push(subs); // `cat f > >(bash)`: the substitution's commands read what this command writes
         // Why: `exec 3< f.sh; bash <&3`: a descriptor opened from a file earlier on the line (or a `{fd}<` named one) is read by the shell that gets it as stdin
-        if ((rop === '<' || rop === '<>') && ((rfd !== null && rfd !== 0) || (rfd === null && FD_NAME_WORD.test(seg.words[seg.words.length - 1]?.text ?? '')))) {
+        if ((rop === '<' || rop === '<>') && ((rfd !== null && rfd !== 0) || (rfd === null && seg.words[seg.words.length - 1]?.fdRedir === true))) {
           const e = newSt();
           if (subs.length && isProcSub(text)) subsProduced(subs, e, 1); else if (text !== '/dev/null') { e.files.push(text); e.groups.push([text]); }
           const prev = this.ctx.fdFeeds.get(rfd ?? '{}');
@@ -2504,7 +2507,7 @@ class Parser {
       const dblWas = this.dblOpen; // (read before the `]]` below clears it: it survives a && / || / ( ) that splits the segment inside the [[ ]], R19-B1)
       if (seg.condWatch) {
         if (q < 0 && (text === 'then' || text === 'do' || text === ']]' || AFTER_PAREN_RESERVED.has(text))) { if (text !== ']]') seg.condWatch = false; }
-        else if (q < 0 && FD_NAME_WORD.test(text) && /[<>]/.test(s[this.i] ?? '')) seg.condAnon = false;
+        else if (fdw) seg.condAnon = false;
         else if (q < 0 && text === '{' && seg.condAnon) seg.condWatch = false;
         else { ctx.ctlBroken = true; if (seg.condDbl === true && text !== '{') ctx.truncated = true; seg.condWatch = false; } // (truncated: the body is in the argv of `[[` here, no command of its own that ctlBroken could refuse: R17-F3)
         seg.condAnon = false;
@@ -2542,7 +2545,7 @@ class Parser {
       else if (seg.afterDbl === true) {
         seg.afterDbl = false;
         if (q < 0 && text === '{') { /* (a brace body: the { splits the segment) */ }
-        else if (q < 0 && FD_NAME_WORD.test(text) && /[<>]/.test(s[this.i] ?? '')) seg.afterDbl = true; // (R19-F2: a `{fd}` redirect prefix is no word: the watch stays armed for the real word, or the end of the segment)
+        else if (fdw) seg.afterDbl = true; // (R19-F2: a `{fd}` redirect prefix is no word: the watch stays armed for the real word, or the end of the segment)
         else if (q < 0 && (text === 'do' || text === 'elif' || AFTER_PAREN_RESERVED.has(text))) seg.afterDbl = 'kw';
         else ctx.truncated = true;
       }
@@ -2594,7 +2597,7 @@ class Parser {
       }
       if (text === '{' || text === '(') seg.fnActive = false;
       fnPending = fnName && seg.fnActive === true; // (a name of `function NAME` ending the line: its body may open on the next)
-      seg.words.push({ text, qa: q, bm: marks, dyn, subs, win, pat, one, fdRedir: q < 0 && FD_NAME_WORD.test(text) && /[<>]/.test(s[this.i] ?? '') }); // (fdRedir: a `{fd}>file` redirect prefix, no command word: see finalizeGroup, R19-F2)
+      seg.words.push({ text, qa: q, bm: marks, dyn, subs, win, pat, one, fdRedir: fdw }); // (fdRedir: a `{fd}>file` redirect prefix, no command word: see finalizeGroup, R19-F2)
     };
     const endSeg = (idx) => {
       flushWord();
