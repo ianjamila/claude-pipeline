@@ -78,3 +78,33 @@ describe('#457: cp -T / -rT / --no-target-directory into home or a parent of a p
     ['a T after -- is a file name', 'cp -r -- -T ./build'],
   ]);
 });
+
+// ---- #464: rsync -R / --relative lands the source's own path below the destination ----
+const SF = ['.claude', ['settings', 'json'].join('.')].join('/'); // (the staged file, spelled from parts)
+describe('#464: rsync -R / --relative into home is a contents merge (the source path is recreated below the destination)', () => {
+  decide('deny', [
+    ['a staged path after /./', `rsync -aR /tmp/stage/./${SF} ~/`],
+    ['after a cd into the stage', `cd /tmp/stage && rsync -aR ${SF} ~/`],
+    ['a glob of the dot folder', 'cd /backup && rsync -aR .claude/* ~/'],
+    ['--relative', `cd /tmp/stage && rsync -a --relative ${SF} ~/`],
+    ['--rel (an abbreviation of 3+ letters)', `cd /tmp/stage && rsync -a --rel ${SF} ~/`],
+    ['-R as its own word', `cd /tmp/stage && rsync -a -R ${SF} ~/`],
+    ['-R after the operands', `cd /tmp/stage && rsync -a ${SF} ~/ -R`],
+    ['--no-relative before --relative', `cd /tmp/stage && rsync -a --no-relative --relative ${SF} ~/`],
+    ['-R beside an unrelated --no- option', `cd /tmp/stage && rsync -aR --no-perms ${SF} ~/`],
+    ['-R beside -e (a value letter after R)', `cd /tmp/stage && rsync -aR -e ssh ${SF} ~/`],
+    ['-Re (R before the value letter)', `cd /tmp/stage && rsync -Re ssh ${SF} ~/`],
+    ['a literal home path', `cd /tmp/stage && rsync -aR ${SF} /home/u`],
+  ]);
+  decide('allow', [
+    ['-aR src/ ./out/ in a project', 'rsync -aR src/ ./out/'],
+    ['-R into a project folder', `cd /tmp/stage && rsync -aR ${SF} ./out`],
+    ['--relative into a project folder', 'rsync -a --relative src/a.js ./out/'],
+    ['--no-relative clears an earlier --relative', `cd /tmp/stage && rsync -a --relative --no-relative ${SF} ~/projects/x`],
+    ['--no-R clears an earlier -R', `cd /tmp/stage && rsync -aR --no-R ${SF} ~/projects/x`],
+    ['-R into a folder of home that holds no protected path', 'cd /tmp/stage && rsync -aR src/a.js ~/projects/x'],
+    ['an -R inside a value is no option', 'rsync -a --exclude=-R src/ ./out/'],
+    ['-e R is a value (the remote shell)', 'rsync -a -e R src/ ./out/'],
+    ['-eR is a value too', 'rsync -a -eR src/ ./out/'],
+  ]);
+});

@@ -3177,7 +3177,7 @@ function splitOperands(argv, name) {
 // R1-B3 / R1-B2 (#300): rsync's own reading of its words (splitOperands is cp's: it takes `--exclude VALUE` / `--timeout 30` for operands and `-t` for a target directory). The options that take a
 // value, as `--opt=v`, as `--opt v`, and as a short letter (`-e ssh`, `-esh`, `-ae ssh`: the rest of a cluster after the letter is its value, a letter that ends it takes the next word); options may stand
 // among the operands or after them (rsync permutes), and `--` ends them. Same-line names are replaced by their value first. { pos: the operands as written, expanded: the same, as expanded, dry: a real
-// -n / --dry-run option word (a value is no option: `--exclude -n`, `-en`), filesFrom: a --files-from option (R6-B1) }
+// -n / --dry-run option word (a value is no option: `--exclude -n`, `-en`), filesFrom: a --files-from option (R6-B1), relative: -R / --relative in force at the end (#464) }
 const RSYNC_VALUE_LONG = new Set(['rsh', 'rsync-path', 'max-delete', 'max-size', 'min-size', 'partial-dir', 'block-size', 'compare-dest', 'copy-dest', 'link-dest', 'exclude', 'exclude-from', 'include', 'include-from',
   'filter', 'files-from', 'out-format', 'log-file', 'log-file-format', 'bwlimit', 'timeout', 'contimeout', 'port', 'address', 'sockopts', 'password-file', 'temp-dir', 'backup-dir', 'suffix', 'chmod', 'chown',
   'usermap', 'groupmap', 'iconv', 'skip-compress', 'compress-level', 'compress-choice', 'zc', 'zl', 'checksum-choice', 'cc', 'checksum-seed', 'modify-window', 'write-batch', 'only-write-batch', 'read-batch',
@@ -3203,6 +3203,7 @@ function rsyncOperands(words, ctx, quoted, split = true) {
   const expanded = [];
   let dry = false;
   let filesFrom = false;
+  let relative = false; // (#464: the last of -R / --relative and --no-relative / --no-R wins; one that holds a substitution is only known at run time, so it sets and never clears)
   let rest = false;
   for (let i = 0; i < items.length; i++) {
     const [w, e] = items[i];
@@ -3215,6 +3216,8 @@ function rsyncOperands(words, ctx, quoted, split = true) {
         // R6-B1: rsync takes any unambiguous abbreviation of a long option (`--file` is only files-from; `--fil` is filter too); the same prefix reading as `--del` in rsyncFlags
         if (o.length >= 4 && 'files-from'.startsWith(o)) { filesFrom = true; if (eq < 0) i++; } // (its value is the next word)
         else if (o === 'dry-run' && eq < 0 && !sub) dry = true;
+        else if (eq < 0 && o.length >= 3 && 'relative'.startsWith(o)) relative = true; // (#464: `--rel` is only relative)
+        else if (eq < 0 && !sub && (o === 'no-R' || (o.length >= 6 && 'no-relative'.startsWith(o)))) relative = false;
         else if (eq < 0 && RSYNC_VALUE_LONG.has(o)) i++; // (the next word is its value, an option-looking one included)
       } else {
         for (let j = 1; j < e.length; j++) { // (linear: a cluster is read once, up to its first value letter)
@@ -3222,6 +3225,7 @@ function rsyncOperands(words, ctx, quoted, split = true) {
           if (RSYNC_VALUE_SHORT.has(ch)) { if (j === e.length - 1) i++; break; }
           if (!/[A-Za-z0-9@ \t\n-]/.test(ch)) break; // (a word held whole by zsh may hold the shell's blanks, `-a -n`; any other character, a U+00A0 included, is no option letter: no dry run in it)
           if (ch === 'n' && !sub) dry = true;
+          else if (ch === 'R') relative = true;
         }
       }
       continue;
@@ -3229,7 +3233,7 @@ function rsyncOperands(words, ctx, quoted, split = true) {
     pos.push(w);
     expanded.push(e);
   }
-  return { pos, expanded, dry, filesFrom };
+  return { pos, expanded, dry, filesFrom, relative };
 }
 
 // R4-B1 / item 6 (#288): rsync's options as the shell passes them. A same-line name is replaced by its value (`D=--delete; rsync -a "$D" SRC ~/`) and a value that holds blanks is several words; a word that
@@ -5446,7 +5450,8 @@ function evaluateBashForFilesFrame(command, opts) {
         const r = rsyncOperands(words, ctx, c.quotedWords, split);
         if (r.dry || r.pos.length < 2) return false;
         // R6-B1: --files-from copies each listed name, relative to the source directory, directly beneath the destination (a slash on the source or not, -r or not: it implies --relative): a contents merge of the source
-        if (r.filesFrom && hit(r.pos[r.pos.length - 1])) return true;
+        // #464: --relative (-R) recreates the source's own path below the destination (`rsync -aR .stage-dir/x ~/`), the same landing, and --files-from implies it
+        if ((r.filesFrom || r.relative) && hit(r.pos[r.pos.length - 1])) return true;
         return contents([r.pos[r.pos.length - 1]], r.expanded.slice(0, -1));
       });
     };
