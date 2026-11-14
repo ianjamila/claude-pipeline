@@ -36,7 +36,7 @@ const QUOTA_LOG = { [`rollout-2026-11-11T15-23-30-${QUOTA_ID}.jsonl`]: 'codex-0.
 function run(dir, extraEnv, over = {}) {
   const outPath = join(dir, 'out.json');
   const env = { ...process.env, PIPELINE_CODEX: `node "${FAKE}"`, FAKE_CODEX_OUTPUT: join(dir, 'answer.json'), ...extraEnv };
-  for (const k of ['FAKE_CODEX_EXIT', 'FAKE_CODEX_STDERR', 'FAKE_CODEX_TURN_FAILED', 'FAKE_CODEX_STDOUT', 'FAKE_CODEX_SIGNAL', 'FAKE_CODEX_HANG_ONCE', 'FAKE_CODEX_CAPTURE', 'FAKE_CODEX_THREAD_ID', 'FAKE_CODEX_FAIL_ONCE', 'FAKE_CODEX_HANG', 'PIPELINE_CODEX_TIMEOUT_MS', 'PIPELINE_CODEX_CAPACITY_RETRY_MS']) {
+  for (const k of ['FAKE_CODEX_EXIT', 'FAKE_CODEX_STDERR', 'FAKE_CODEX_TURN_FAILED', 'FAKE_CODEX_STDOUT', 'FAKE_CODEX_CONFIRM_STDOUT', 'FAKE_CODEX_CONFIRM_EXIT', 'FAKE_CODEX_SIGNAL', 'FAKE_CODEX_HANG_ONCE', 'FAKE_CODEX_CAPTURE', 'FAKE_CODEX_THREAD_ID', 'FAKE_CODEX_FAIL_ONCE', 'FAKE_CODEX_HANG', 'PIPELINE_CODEX_TIMEOUT_MS', 'PIPELINE_CODEX_CAPACITY_RETRY_MS']) {
     if (!(k in extraEnv)) delete env[k];
   }
   writeFileSync(join(dir, 'answer.json'), '{"summary":"ok"}');
@@ -332,4 +332,122 @@ test('readTaskCompleteError: reads only the tail of a big log', (t) => {
   const filler = `${JSON.stringify({ type: 'response_item', payload: { text: 'x'.repeat(1000) } })}\n`.repeat(2000);
   writeFileSync(big, `${JSON.stringify({ type: 'event_msg', payload: { type: 'task_complete', error: { message: 'old', codex_error_info: 'other' } } })}\n${filler}${readFileSync(join(FIX, 'codex-0.154-session-quota.jsonl'), 'utf8')}`);
   assert.equal(readTaskCompleteError(big).codexErrorInfo, 'usage_limit_exceeded');
+});
+
+// ---------- a refused model (cp #431): the stream, the session log and the confirmation run ----------
+
+const MODEL_ID = '01a1daf1-a944-7733-a4cb-3e6c343b8044'; // the real probe's thread id
+const CONFIRM_ID = '01a1daf1-a944-7733-a4cb-3e6c343b8055';
+const REQ = 'gpt-retired-zz9';
+const MODEL_STDOUT = join(FIX, 'codex-0.154-json-model-not-found-stdout.jsonl');
+const MODEL_BODY = JSON.parse(readFileSync(MODEL_STDOUT, 'utf8').trim().split('\n').pop()).error.message;
+
+// A minimal synthetic rollout shaped like the real one (session_meta, turn_context, task_complete with the error and codex_error_info "other").
+function rollout({ id, model = REQ, provider = 'openai', error = MODEL_BODY, complete = true }) {
+  const lines = [
+    { timestamp: '2026-11-15T01:00:00.000Z', type: 'session_meta', payload: { id, session_id: id, originator: 'codex_exec', cli_version: '0.154.0', source: 'exec', model_provider: provider } },
+    { timestamp: '2026-11-15T01:00:00.100Z', type: 'turn_context', payload: { turn_id: 't1', model, effort: 'high' } },
+  ];
+  if (complete) lines.push({ timestamp: '2026-11-15T01:00:01.000Z', type: 'event_msg', payload: { type: 'task_complete', turn_id: 't1', last_agent_message: null, error: { message: error, codex_error_info: 'other' } } });
+  return `${lines.map((l) => JSON.stringify(l)).join('\n')}\n`;
+}
+function sessionsHome(dir, logs) {
+  const home = join(dir, 'codex-home');
+  const day = join(home, 'sessions', '2026', '11', '11');
+  mkdirSync(day, { recursive: true });
+  for (const [id, text] of Object.entries(logs)) writeFileSync(join(day, `rollout-2026-11-11T15-23-30-${id}.jsonl`), text);
+  return home;
+}
+// the captured stream, but for the thread the confirmation run is given
+function confirmStream(dir, body = readFileSync(MODEL_STDOUT, 'utf8')) {
+  const file = join(dir, 'confirm-stdout.jsonl');
+  writeFileSync(file, body.replaceAll(MODEL_ID, CONFIRM_ID));
+  return file;
+}
+// execCodex over the captured refused-model stream: argv carries -C and -o like the real one, requestedModel is the model it asks for
+async function runModel(t, { logs, confirm, requestedModel = REQ, env = {}, stdout = MODEL_STDOUT } = {}) {
+  const dir = scratch(t);
+  const capture = join(dir, 'capture.jsonl');
+  const home = sessionsHome(dir, logs ?? { [MODEL_ID]: rollout({ id: MODEL_ID }), [CONFIRM_ID]: rollout({ id: CONFIRM_ID }) });
+  const outPath = join(dir, 'out.json');
+  const r = await run(dir, {
+    FAKE_CODEX_EXIT: '1', FAKE_CODEX_STDOUT: stdout, FAKE_CODEX_CONFIRM_STDOUT: confirm ?? confirmStream(dir), FAKE_CODEX_CAPTURE: capture, CODEX_HOME: home, ...env,
+  }, { args: ['exec', '-C', dir, '-o', outPath, '-c', `model="${REQ}"`, '-'], requestedModel });
+  const runs = existsSync(capture) ? readFileSync(capture, 'utf8').trim().split('\n').map((l) => JSON.parse(l)) : [];
+  return { r, runs, dir };
+}
+
+test('execCodex: the real refused-model stream, a log that agrees and a confirmation run in an empty temp dir is a proven model stop (session-log, provider openai, confirm thread)', async (t) => {
+  const { r, runs, dir } = await runModel(t);
+  assert.equal(r.ok, false);
+  assert.equal(r.reason, 'model');
+  assert.equal(r.code, 1);
+  assert.equal('quota' in r, false);
+  assert.deepEqual(r.modelStop, { eligible: true, proof: 'session-log', model: REQ, provider: 'openai', message: MODEL_BODY, threadId: MODEL_ID, confirm: { threadId: CONFIRM_ID } });
+  assert.equal(runs.length, 2, 'the main run and the one confirmation run: a model stop is never retried');
+  const [main, confirm] = runs;
+  assert.equal(main.stdin, 'PROMPT');
+  assert.equal(confirm.stdin, 'Reply OK');
+  const at = (argv, flag) => argv[argv.indexOf(flag) + 1];
+  assert.equal(at(main.argv, '-C'), dir);
+  assert.notEqual(at(confirm.argv, '-C'), dir, 'the confirmation run is in a fresh directory of its own');
+  assert.notEqual(at(confirm.argv, '-o'), join(dir, 'out.json'));
+  assert.equal(at(confirm.argv, '-o'), join(at(confirm.argv, '-C'), 'out.json'));
+  assert.deepEqual(main.argv.filter((a) => a.startsWith('model=')), confirm.argv.filter((a) => a.startsWith('model=')), 'the same -c model');
+  assert.equal(existsSync(at(confirm.argv, '-C')), false, 'the temp directory is removed afterwards');
+});
+
+test('execCodex: a refused-model stream with no session log is not proof (stream only): ineligible, no confirmation run', async (t) => {
+  const { r, runs } = await runModel(t, { logs: {} });
+  assert.equal(r.reason, 'model');
+  assert.deepEqual([r.modelStop.eligible, r.modelStop.proof, r.modelStop.unproven], [false, 'stream', 'no-session-log']);
+  assert.equal(runs.length, 1);
+  // a log without a task_complete says nothing either
+  const half = await runModel(t, { logs: { [MODEL_ID]: rollout({ id: MODEL_ID, complete: false }) } });
+  assert.deepEqual([half.r.modelStop.eligible, half.r.modelStop.unproven], [false, 'log-disagrees']);
+  assert.equal(half.runs.length, 1);
+});
+
+test('execCodex: a session log whose task_complete is not model_not_found disagrees: ineligible', async (t) => {
+  const { r, runs } = await runModel(t, { logs: { [MODEL_ID]: rollout({ id: MODEL_ID, error: 'unexpected status 401 Unauthorized' }) } });
+  assert.deepEqual([r.modelStop.eligible, r.modelStop.proof, r.modelStop.unproven], [false, 'session-log', 'log-disagrees']);
+  assert.equal(runs.length, 1);
+});
+
+test('execCodex: the refusal naming another model than the one asked for, or a log whose turn_context ran another model, is ineligible', async (t) => {
+  const named = await runModel(t, { requestedModel: 'gpt-other-1' });
+  assert.deepEqual([named.r.modelStop.eligible, named.r.modelStop.unproven], [false, 'model-differs']);
+  assert.equal(named.runs.length, 1);
+  const ran = await runModel(t, { logs: { [MODEL_ID]: rollout({ id: MODEL_ID, model: 'gpt-other-1' }), [CONFIRM_ID]: rollout({ id: CONFIRM_ID }) } });
+  assert.deepEqual([ran.r.modelStop.eligible, ran.r.modelStop.unproven], [false, 'model-differs']);
+  const none = await runModel(t, { requestedModel: null });
+  assert.deepEqual([none.r.modelStop.eligible, none.r.modelStop.unproven], [false, 'no-requested-model']);
+  const noProvider = await runModel(t, { logs: { [MODEL_ID]: rollout({ id: MODEL_ID }).replace('"model_provider":"openai"', '"x":1') } });
+  assert.deepEqual([noProvider.r.modelStop.eligible, noProvider.r.modelStop.unproven], [false, 'no-provider']);
+});
+
+test('execCodex: a stream whose top-level error says model_not_found but whose final turn.failed says something else is not a model stop', async (t) => {
+  const dir = scratch(t);
+  const stdout = join(dir, 'stream.jsonl');
+  const lines = readFileSync(MODEL_STDOUT, 'utf8').trim().split('\n');
+  lines[lines.length - 1] = JSON.stringify({ type: 'turn.failed', error: { message: 'stream disconnected before completion' } });
+  writeFileSync(stdout, `${lines.join('\n')}\n`);
+  const { r } = await runModel(t, { stdout });
+  assert.equal(r.reason, 'error');
+  assert.equal('modelStop' in r, false);
+});
+
+test('execCodex: the confirmation run must be refused too, with its own log, the same model and the same provider', async (t) => {
+  // it succeeds (exit 0), or fails some other way
+  const ok = await runModel(t, { env: { FAKE_CODEX_CONFIRM_EXIT: '0', FAKE_CODEX_CONFIRM_STDOUT: join(FIX, 'codex-0.154-json-auth-stdout.jsonl') } });
+  assert.deepEqual([ok.r.modelStop.eligible, ok.r.modelStop.proof, ok.r.modelStop.unproven, ok.r.modelStop.confirm], [false, 'session-log', 'confirm-failed', null]);
+  const auth = await runModel(t, { env: { FAKE_CODEX_CONFIRM_EXIT: '1', FAKE_CODEX_CONFIRM_STDOUT: join(FIX, 'codex-0.154-json-auth-stdout.jsonl') } });
+  assert.equal(auth.r.modelStop.unproven, 'confirm-failed');
+  // refused, but its rollout is missing / names another model / another provider
+  const missing = await runModel(t, { logs: { [MODEL_ID]: rollout({ id: MODEL_ID }) } });
+  assert.deepEqual([missing.r.modelStop.eligible, missing.r.modelStop.unproven], [false, 'confirm-unproven']);
+  const other = await runModel(t, { logs: { [MODEL_ID]: rollout({ id: MODEL_ID }), [CONFIRM_ID]: rollout({ id: CONFIRM_ID, model: 'gpt-other-1' }) } });
+  assert.equal(other.r.modelStop.unproven, 'confirm-unproven');
+  const provider = await runModel(t, { logs: { [MODEL_ID]: rollout({ id: MODEL_ID }), [CONFIRM_ID]: rollout({ id: CONFIRM_ID, provider: 'nosuchprov' }) } });
+  assert.deepEqual([provider.r.modelStop.eligible, provider.r.modelStop.proof, provider.r.modelStop.provider, provider.r.modelStop.unproven], [false, 'session-log', 'openai', 'provider-differs']);
 });

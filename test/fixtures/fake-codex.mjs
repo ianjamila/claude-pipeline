@@ -5,6 +5,8 @@
 //   FAKE_CODEX_TURN_FAILED=<msg>  print Codex's --json failure events on stdout (thread.started, turn.started, turn.failed {error:{message}}):
 //                              the only place the pipeline reads a failure reason from (stderr never decides quota)
 //   FAKE_CODEX_STDOUT=<file>   print that file's bytes on stdout first (a captured --json stream); FAKE_CODEX_THREAD_ID overrides the id above
+//   FAKE_CODEX_CONFIRM_STDOUT=<file> / FAKE_CODEX_CONFIRM_EXIT=<n>  the same two, for the one-line "Reply OK" confirmation run of a refused-model stop
+//                              (lib/codex-exec.mjs): that run reads them INSTEAD of FAKE_CODEX_STDOUT / FAKE_CODEX_EXIT when they are set
 //   FAKE_CODEX_FAIL_ONCE=<f>   when <f> does not exist yet, create it and fail this run at once (exit 1, the FAKE_CODEX_TURN_FAILED events); later runs behave
 //                              normally (FAKE_CODEX_TURN_FAILED is then ignored)
 //   FAKE_CODEX_SIGNAL=<sig>    after printing, kill this process with that signal (a run killed from outside)
@@ -56,14 +58,16 @@ if (process.env.FAKE_CODEX_HANG) {
   await new Promise(() => {});
 }
 
-if (process.env.FAKE_CODEX_STDOUT) writeSync(1, readFileSync(process.env.FAKE_CODEX_STDOUT));
+const confirmRun = stdin === 'Reply OK';
+const stdoutFile = confirmRun && process.env.FAKE_CODEX_CONFIRM_STDOUT ? process.env.FAKE_CODEX_CONFIRM_STDOUT : process.env.FAKE_CODEX_STDOUT;
+if (stdoutFile) writeSync(1, readFileSync(stdoutFile));
 if (process.env.FAKE_CODEX_TURN_FAILED && !process.env.FAKE_CODEX_FAIL_ONCE) {
   const id = process.env.FAKE_CODEX_THREAD_ID || '01a1c97d-8cee-7c50-83a7-9994cab1b194';
   for (const e of [{ type: 'thread.started', thread_id: id }, { type: 'turn.started' }, { type: 'turn.failed', error: { message: process.env.FAKE_CODEX_TURN_FAILED } }]) writeSync(1, `${JSON.stringify(e)}\n`);
 }
 if (process.env.FAKE_CODEX_SIGNAL) process.kill(process.pid, process.env.FAKE_CODEX_SIGNAL);
 
-const exit = Number(process.env.FAKE_CODEX_EXIT ?? 0);
+const exit = Number((confirmRun ? process.env.FAKE_CODEX_CONFIRM_EXIT : undefined) ?? process.env.FAKE_CODEX_EXIT ?? 0);
 if (exit !== 0) {
   process.stderr.write(process.env.FAKE_CODEX_STDERR ?? '');
   process.exit(exit);
