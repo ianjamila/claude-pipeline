@@ -365,11 +365,13 @@ function confirmStream(dir, body = readFileSync(MODEL_STDOUT, 'utf8')) {
   return file;
 }
 // execCodex over the captured refused-model stream: argv carries -C and -o like the real one, requestedModel is the model it asks for
-async function runModel(t, { logs, confirm, requestedModel = REQ, env = {}, stdout = MODEL_STDOUT } = {}) {
+// beforeRun(dir): runs once the scratch dir exists, just before execCodex (the temp-dir failure test breaks the machine's temp dir only from there on)
+async function runModel(t, { logs, confirm, requestedModel = REQ, env = {}, stdout = MODEL_STDOUT, beforeRun } = {}) {
   const dir = scratch(t);
   const capture = join(dir, 'capture.jsonl');
   const home = sessionsHome(dir, logs ?? { [MODEL_ID]: rollout({ id: MODEL_ID }), [CONFIRM_ID]: rollout({ id: CONFIRM_ID }) });
   const outPath = join(dir, 'out.json');
+  if (beforeRun) beforeRun(dir);
   const r = await run(dir, {
     FAKE_CODEX_EXIT: '1', FAKE_CODEX_STDOUT: stdout, FAKE_CODEX_CONFIRM_STDOUT: confirm ?? confirmStream(dir), FAKE_CODEX_CAPTURE: capture, CODEX_HOME: home, ...env,
   }, { args: ['exec', '-C', dir, '-o', outPath, '-c', `model="${REQ}"`, '-'], requestedModel });
@@ -450,4 +452,15 @@ test('execCodex: the confirmation run must be refused too, with its own log, the
   assert.equal(other.r.modelStop.unproven, 'confirm-unproven');
   const provider = await runModel(t, { logs: { [MODEL_ID]: rollout({ id: MODEL_ID }), [CONFIRM_ID]: rollout({ id: CONFIRM_ID, provider: 'nosuchprov' }) } });
   assert.deepEqual([provider.r.modelStop.eligible, provider.r.modelStop.proof, provider.r.modelStop.provider, provider.r.modelStop.unproven], [false, 'session-log', 'openai', 'provider-differs']);
+});
+
+test('execCodex: a confirmation run whose temp directory cannot be made (R1-F2) still resolves: a model stop, ineligible, confirm-failed, the main run\'s proof and provider kept', async (t) => {
+  // os.tmpdir() reads TMPDIR (POSIX) / TEMP and TMP (Windows) from this process; a folder that does not exist makes mkdtempSync throw. Tests in a file run one at a time, so restoring it afterwards is safe.
+  const saved = { TMPDIR: process.env.TMPDIR, TEMP: process.env.TEMP, TMP: process.env.TMP };
+  t.after(() => { for (const [k, v] of Object.entries(saved)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; } });
+  const { r, runs } = await runModel(t, { beforeRun: (dir) => { for (const k of Object.keys(saved)) process.env[k] = join(dir, 'no-such-folder', 'tmp'); } });
+  assert.equal(r.ok, false);
+  assert.equal(r.reason, 'model');
+  assert.deepEqual([r.modelStop.eligible, r.modelStop.proof, r.modelStop.provider, r.modelStop.unproven, r.modelStop.confirm], [false, 'session-log', 'openai', 'confirm-failed', null]);
+  assert.equal(runs.length, 1, 'no confirmation run without a directory to run it in');
 });

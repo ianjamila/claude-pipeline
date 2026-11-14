@@ -128,9 +128,11 @@ export function substituteEligibility({ reason, timedOut = false, quota, modelSt
 
 // The message a refused-model stop gives (codex-review and triage second-review): what happened, where review.codex_model is read from and how to fix it, then the ACTUAL substitute
 // verdict (proof is not permission: R1-3). \`model\` is the trusted review.codex_model string, never a name from the provider's message. An unreadable base config (R3-4) says to repair it.
-export function modelRefusalMessage({ model, verdict, defaultBranch }) {
+// `next` is the caller's next step once a substitute is eligible: codex-review has nothing prepared yet (the default: `pipeline substitute prepare`), while triage second-review has already
+// prepared the packet, so its next step is one call of the named agent and then --apply (R1-F1: `substitute prepare` there reads the round's own record and is refused).
+export function modelRefusalMessage({ model, verdict, defaultBranch, next = '`pipeline substitute prepare`' }) {
   const head = `Codex refused the configured model ${model} (model_not_found: retired, renamed, or not available to this Codex login). review.codex_model is read from the pipeline.yml at ${defaultBranch}'s fork point: fix it on ${defaultBranch}, then bring that fix into this branch (merge/update-branch) so its fork point moves.`;
-  if (verdict.eligible) return `${head} A substitute (${verdict.agent}) may stand in: \`pipeline substitute prepare\`.`;
+  if (verdict.eligible) return `${head} A substitute (${verdict.agent}) may stand in: ${next}.`;
   if (verdict.why === 'mode-off') {
     const unreadable = /could not be read \((.*)\); an unreadable base config/.exec(verdict.modeOffFrom ?? '');
     if (unreadable) return `${head} No substitute may stand in: the pipeline.yml at ${defaultBranch}'s fork point is not a valid config (${unreadable[1]}): repair .claude/pipeline.yml on ${defaultBranch} with an owner commit; no PR can get a substitute until then.`;

@@ -606,8 +606,10 @@ test('model stop: exit 3 reason model with the substitute packet; route-2nd hold
   assert.equal(r.json.reason, 'model');
   assert.deepEqual(r.json.modelStop, { proven: true, proof: 'session-log', model: MODEL });
   assert.ok(r.json.message.includes(`Codex refused the configured model ${MODEL} (model_not_found`), r.json.message);
-  assert.ok(r.json.message.includes('A substitute (substitute-opus) may stand in'), r.json.message);
   const sub = r.json.substitute;
+  // the packet is already prepared, so the next step is one agent call and --apply, never `substitute prepare` (R1-F1)
+  assert.ok(r.json.message.includes(`A substitute (substitute-opus) may stand in: call substitute-opus once on the prepared packet (${sub.inputPath}), then \`pipeline triage second-review --apply --pr 7 --tag "${sub.tag}"\`.`), r.json.message);
+  assert.ok(!r.json.message.includes('substitute prepare'), r.json.message);
   assert.deepEqual([sub.eligible, sub.why, sub.agent], [true, 'model', 'substitute-opus']);
   const id8 = sub.tag.split(' ')[2];
   const route = w.route(id8);

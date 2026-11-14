@@ -88,20 +88,27 @@ async function modelFacts({ message, threadId }, { env, now, args, requestedMode
   if (named === null || (named.model !== null && named.model !== requestedModel)) return facts({ unproven: 'model-differs' });
   const main = loggedRefusal(threadId, requestedModel, { env, now });
   if (!main.ok) return facts({ unproven: main.unproven, proof: main.unproven === 'no-session-log' ? 'stream' : 'session-log' });
-  const dir = mkdtempSync(path.join(tmpdir(), 'cp-model-check-'));
+  // Every step of the confirmation run, the temp dir included, is inside the try: whatever fails here leaves the main run's proof standing but unconfirmed, never an error out of execCodex
+  // after a real Codex run (R1-F2). The cleanup is best effort.
+  let dir = null;
+  const base = { proof: 'session-log', provider: main.provider };
   try {
+    dir = mkdtempSync(path.join(tmpdir(), 'cp-model-check-'));
     const outPath = path.join(dir, 'out.json');
     const confirmArgs = argAfter(argAfter(args, '-C', dir), '-o', outPath);
     const { r } = await attempt({ root: dir, env, args: confirmArgs, promptBytes: CONFIRM_PROMPT, outPath, maxTimeoutMs: CONFIRM_TIMEOUT_MS });
     const verdict = analyzeCodexFailure({ code: r.code, signal: r.signal, stderr: r.stderr, stdout: r.stdout, timedOut: r.timedOut });
-    const base = { proof: 'session-log', provider: main.provider };
     if (verdict.reason !== 'model') return facts({ ...base, unproven: 'confirm-failed' });
     const again = loggedRefusal(verdict.threadId, requestedModel, { env, now });
     if (!again.ok) return facts({ ...base, unproven: 'confirm-unproven' });
     if (again.provider !== main.provider) return facts({ ...base, unproven: 'provider-differs' });
     return facts({ ...base, eligible: true, confirm: { threadId: verdict.threadId } });
+  } catch {
+    return facts({ ...base, unproven: 'confirm-failed' });
   } finally {
-    rmSync(dir, { recursive: true, force: true });
+    if (dir !== null) {
+      try { rmSync(dir, { recursive: true, force: true }); } catch { /* best effort: the verdict is already decided */ }
+    }
   }
 }
 

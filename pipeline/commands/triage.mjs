@@ -645,7 +645,7 @@ async function secondReview(rest, ctx) {
       ...(ran.retried ? { retried: ran.retried } : {}),
       ...(modelNote === undefined ? {} : { modelNote }),
       ...(ran.reason === 'quota' && ran.quota ? { quota: { proof: ran.quota.proof, resetAt: ran.quota.resetAt, resetText: ran.quota.resetText } } : {}),
-      ...(ran.reason === 'model' ? { modelStop: { proven: modelStopProven, proof: ran.modelStop?.proof ?? null, model, ...(ran.modelStop?.unproven ? { unproven: ran.modelStop.unproven } : {}) }, message: modelRefusalMessage({ model, verdict: substitute, defaultBranch: config.default_branch }) } : {}),
+      ...(ran.reason === 'model' ? { modelStop: { proven: modelStopProven, proof: ran.modelStop?.proof ?? null, model, ...(ran.modelStop?.unproven ? { unproven: ran.modelStop.unproven } : {}) }, message: modelRefusalMessage({ model, verdict: substitute, defaultBranch: config.default_branch, next: `call ${substitute.agent} once on the prepared packet (${substitute.inputPath}), then \`pipeline triage second-review --apply --pr ${pr} --tag "${substitute.tag}"\`` }) } : {}),
       substitute,
       ...(warnings.length + usageWarnings.length > 0 ? { warnings: [...warnings, ...usageWarnings] } : {}),
     });
