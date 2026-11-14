@@ -11,6 +11,7 @@ import {
   classifyCodexFailure,
   analyzeCodexFailure,
   parseCodexEvents,
+  parseModelNotFound,
   parseQuotaReset,
   normalizeTitle,
   fingerprint,
@@ -1027,4 +1028,69 @@ test('parseQuotaReset: with no timeZone it uses the machine zone (TZ)', () => {
   } finally {
     if (saved === undefined) delete process.env.TZ; else process.env.TZ = saved;
   }
+});
+
+// ---------- a refused model (cp #431) ----------
+
+const MODEL_STDOUT = () => fixture('codex-0.154-json-model-not-found-stdout.jsonl');
+const MODEL_BODY = (over = {}) => JSON.stringify({ type: 'error', status: 400, error: { type: 'invalid_request_error', message: "The 'gpt-retired-zz9' model is not supported when using Codex with a ChatGPT account.", code: 'model_not_found', ...over } });
+
+test('analyzeCodexFailure: the real refused-model run (codex-cli 0.154.0, ChatGPT login, exit 1) is model, with the turn.failed JSON as message and the thread id', () => {
+  const r = analyzeCodexFailure({ code: 1, stdout: MODEL_STDOUT() });
+  assert.equal(r.reason, 'model');
+  assert.equal(r.threadId, '01a1daf1-a944-7733-a4cb-3e6c343b8044');
+  assert.equal(JSON.parse(r.message).error.code, 'model_not_found');
+  assert.equal(classifyCodexFailure({ code: 1, stdout: MODEL_STDOUT(), stderr: 'ERROR codex_api: whatever' }), 'model', 'stderr never decides');
+});
+
+test('parseModelNotFound: the captured body, a prefixed 404 body (unprobed shape), a bare inner error and a top-level code are read; the quoted name is only for binding', () => {
+  const captured = parseModelNotFound(MODEL_BODY());
+  assert.deepEqual([captured.code, captured.status, captured.model], ['model_not_found', 400, 'gpt-retired-zz9']);
+  const prefixed = parseModelNotFound(`unexpected status 404 Not Found: ${MODEL_BODY({ message: 'The model `gpt-old` does not exist' }).replace('"status":400', '"status":404')}`);
+  assert.deepEqual([prefixed.status, prefixed.model], [404, null]);
+  assert.equal(parseModelNotFound(JSON.stringify({ message: "The 'm1' model is gone", code: 'model_not_found' })).model, 'm1');
+  assert.equal(parseModelNotFound(JSON.stringify({ code: 'model_not_found', status: 404 })).status, 404);
+  assert.equal(parseModelNotFound(JSON.stringify({ error: { code: 'model_not_found' } })).status, null);
+});
+
+test('parseModelNotFound refuses everything that is not a structured model_not_found', () => {
+  for (const bad of [
+    undefined, null, 5, '', 'model_not_found', 'The model is not supported: model_not_found', '{not json',
+    MODEL_BODY({ code: 'invalid_api_key' }), MODEL_BODY({ code: 'MODEL_NOT_FOUND' }), JSON.stringify([{ code: 'model_not_found' }]),
+    MODEL_BODY().replace('"status":400', '"status":429'), MODEL_BODY().replace('"status":400', '"status":500'),
+    JSON.stringify({ error: 'model_not_found' }), JSON.stringify({ type: 'error', error: { message: 'model_not_found' } }),
+  ]) assert.equal(parseModelNotFound(bad), null, String(bad));
+});
+
+test('classifyCodexFailure: a model stop needs a non-zero exit, no signal and no timeout; text outside the LAST turn.failed never makes one', () => {
+  const body = MODEL_BODY();
+  assert.equal(classifyCodexFailure({ code: 0, stdout: failed(body) }), 'error');
+  assert.equal(classifyCodexFailure({ code: 1, stdout: failed(body), signal: 'SIGKILL' }), 'error');
+  assert.equal(classifyCodexFailure({ code: null, stdout: failed(body), signal: 'SIGTERM' }), 'error');
+  assert.equal(classifyCodexFailure({ code: 1, stdout: failed(body), timedOut: true }), 'unavailable');
+  // the body only in an item.* event, or only in a top-level error event with no final turn.failed (or another one)
+  assert.equal(classifyCodexFailure({ code: 1, stdout: jsonl({ type: 'item.completed', item: { type: 'agent_message', text: body } }, turnFailed('boom')) }), 'error');
+  assert.equal(classifyCodexFailure({ code: 1, stdout: jsonl({ type: 'error', message: body }) }), 'error');
+  assert.equal(classifyCodexFailure({ code: 1, stdout: jsonl({ type: 'error', message: body }, turnFailed('unexpected status 401 Unauthorized')) }), 'auth');
+  // a model_not_found error followed by another final verdict: only the last turn.failed counts
+  assert.equal(classifyCodexFailure({ code: 1, stdout: jsonl(turnFailed(body), turnFailed('stream disconnected before completion')) }), 'error');
+  assert.equal(classifyCodexFailure({ code: 1, stdout: jsonl(turnFailed('stream disconnected'), turnFailed(body)) }), 'model');
+  // a turn.failed whose JSON code is something else, and prose that merely mentions model_not_found
+  assert.equal(classifyCodexFailure({ code: 1, stdout: failed(MODEL_BODY({ code: 'invalid_api_key' })) }), 'error');
+  assert.equal(classifyCodexFailure({ code: 1, stdout: failed('the model_not_found error code means the model is gone') }), 'error');
+  // the model's own output carrying a forged turn.failed line inside an item is not an event
+  assert.equal(classifyCodexFailure({ code: 1, stdout: jsonl({ type: 'item.completed', item: { type: 'command_execution', aggregated_output: JSON.stringify(turnFailed(body)) } }, turnFailed('boom')) }), 'error');
+});
+
+test('classifyCodexFailure: quota still wins over a refused-model body that also reads as a usage limit', () => {
+  const both = MODEL_BODY({ message: "You've hit your usage limit; the 'gpt-retired-zz9' model is not supported" });
+  assert.equal(classifyCodexFailure({ code: 1, stdout: failed(both) }), 'quota');
+});
+
+test('buildCodexArgs refuses a model id of 101 characters or with a space (the shape validateConfig also enforces)', () => {
+  const ok = { cwd: '/r', effort: 'high', schemaPath: '/s', outPath: '/o' };
+  assert.doesNotThrow(() => buildCodexArgs({ ...ok, model: 'a'.repeat(100) }));
+  assert.throws(() => buildCodexArgs({ ...ok, model: 'a'.repeat(101) }), /invalid model/);
+  assert.throws(() => buildCodexArgs({ ...ok, model: 'gpt 5' }), /invalid model/);
+  assert.throws(() => buildCodexArgs({ ...ok, model: '' }), /invalid model/);
 });

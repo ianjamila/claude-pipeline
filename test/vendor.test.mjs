@@ -10,7 +10,7 @@ import { run as vendor, meta, vendorDrift } from '../pipeline/commands/vendor.mj
 import { MANIFEST_REL, sha256File, walkFiles } from '../pipeline/lib/installer.mjs';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
-const LIBS = ['proc', 'shell-words', 'seams', 'paths', 'yaml', 'config', 'glob', 'diff', 'git', 'hardstops', 'risk', 'integrity', 'locks', 'guard-provenance', 'review-marker', 'resolution', 'doc-paths', 'queue-members', 'workflow-contexts'];
+const LIBS = ['proc', 'shell-words', 'seams', 'paths', 'yaml', 'codex-model-id', 'config', 'glob', 'diff', 'git', 'hardstops', 'risk', 'integrity', 'locks', 'guard-provenance', 'review-marker', 'resolution', 'doc-paths', 'queue-members', 'workflow-contexts'];
 const ENTRIES = ['ci-guard', 'ci-guards-run', 'queue-guards-run', 'smoke', 'supabase-local', 'workflow-contexts'];
 
 const vendorInto = (dir, extra = []) => vendor(['--repo', dir, ...extra], { cwd: dir, env: process.env });
@@ -523,4 +523,19 @@ test('a missing or unreadable .github/workflows warns instead of crashing', asyn
   const r3 = await vendorInto(odd.dir, ['--check']);
   assert.equal(r3.exitCode, 0);
   assert.equal(unwired(r3).length, 1);
+});
+
+test('#443: the vendored config.mjs resolves its codex-model-id import in the project layout and validates review.codex_model (the vendored guard entry loads too)', async () => {
+  const repo = createTmpRepo();
+  const r = await vendorInto(repo.dir);
+  assert.ok(r.output.files.includes('scripts/pipeline/lib/codex-model-id.mjs'), 'the model id shape ships to projects (the vendored config.mjs imports it)');
+  assert.equal(readFileSync(join(sp(repo.dir), 'lib', 'codex-model-id.mjs'), 'utf8'), readFileSync(join(root, 'pipeline', 'lib', 'codex-model-id.mjs'), 'utf8'));
+  const vendored = await import(pathToFileURL(join(sp(repo.dir), 'lib', 'config.mjs')).href);
+  await import(pathToFileURL(join(sp(repo.dir), 'ci-guard.mjs')).href);
+  const base = { version: 1, project: 'p', verify: { full: 'f', quick: 'q' } };
+  const bad = vendored.validateConfig({ ...base, review: { codex_model: 'gpt 5' } });
+  assert.equal(bad.ok, false);
+  assert.ok(bad.errors.some((e) => e.includes('review.codex_model must be a model id')), bad.errors.join('; '));
+  const good = vendored.validateConfig({ ...base, review: { codex_model: 'gpt-6-astra' } });
+  assert.equal(good.ok, true, good.errors.join('; '));
 });

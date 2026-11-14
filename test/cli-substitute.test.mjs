@@ -10,6 +10,9 @@ import { dirname, join } from 'node:path';
 import { roundWorld, findingsOf, low } from './helpers/round-world.mjs';
 import { assertExit } from './helpers/assert-exit.mjs';
 import { readResultText } from './helpers/read-result.mjs';
+import { PROBE_MODEL, modelStopEnv } from './helpers/model-stop.mjs';
+import { DEFAULTS } from '../pipeline/lib/config.mjs';
+import { triageComment } from '../pipeline/lib/render.mjs';
 
 const QUOTA = "You've hit your usage limit. Upgrade to Pro, or try again in 3 hours.";
 const OPUS = 'claude-opus-5-1';
@@ -1045,4 +1048,76 @@ test('R13-F1: a working tree max_packet_mb 1000 does not undo the base config\'s
   const p = w.prepare();
   assertExit(p, 1, p.stdout + p.stderr);
   assert.equal(p.json.error, 'packet-too-large');
+});
+
+// ---------- a refused Codex model (cp #431): evidence kind `model` ----------
+
+const MODEL = DEFAULTS.review.codex_model; // the trusted model of a world with no review.codex_model of its own
+// a proven refused-model run: the captured stream, a rollout for the main run and for the confirmation run, a private CODEX_HOME and Codex record folder
+const modelRun = (w, opts = {}) => ({ ...modelStopEnv(w.scratch, { model: MODEL, ...opts }), PIPELINE_CODEX_STATUS_DIR: w.quota().PIPELINE_CODEX_STATUS_DIR });
+const modelReady = (w) => {
+  const r = w.run(1, modelRun(w));
+  assertExit(r, 3, r.stdout + r.stderr);
+  assert.deepEqual([r.json.reason, r.json.substitute.eligible, r.json.substitute.why], ['model', true, 'model']);
+  const p = w.prepare();
+  assertExit(p, 0, p.stdout + p.stderr);
+  return p.json;
+};
+
+test('model evidence: prepare admits it and names the refused model in the packet; apply records substitute.evidence model + codexModelRefused, and the published triage line says the model was refused', (t) => {
+  const w = world(t);
+  const prep = modelReady(w);
+  assert.equal(prep.evidence, 'model');
+  const input = readFileSync(prep.inputPath, 'utf8');
+  assert.ok(input.includes(`Why a substitute reviews this round: Codex refused the configured model ${MODEL} (model_not_found)`), 'the packet names the trusted model');
+  assert.ok(!input.includes(PROBE_MODEL), 'never a model name taken from the provider message');
+  const r = w.apply(install(w, prep));
+  assertExit(r, 0, r.stdout + r.stderr);
+  assert.equal(r.json.evidence, 'model');
+  const sub = w.state().rounds[0].substitute;
+  assert.deepEqual([sub.evidence, sub.codexModelRefused, sub.resetAt], ['model', MODEL, null]);
+  assert.equal(w.state().rounds[0].codexModel, undefined);
+  assert.deepEqual([w.route().evidence, w.route().via, w.route().substituteEvidence], ['none', 'substitute', 'model']);
+  assert.ok(triageComment(w.state()).includes(`Round 1 — substitute review (Claude Opus; Codex model ${MODEL} refused (fix review.codex_model))`), triageComment(w.state()));
+});
+
+test('model evidence is fresh for 2 hours (reset-passed after), needs the same prompt digest, and the trusted model must still be the refused one (route-mismatch); unproven evidence is no evidence', (t) => {
+  const w = world(t);
+  assertExit(w.run(1, modelRun(w)), 3);
+  const keep = w.route();
+  const refused = (error, code = 1) => { const r = w.prepare(); assertExit(r, code, r.stdout); assert.equal(r.json.error, error); return r.json; };
+  writeFileSync(w.routeFile(), JSON.stringify({ ...keep, at: new Date(Date.now() - 3 * 60 * 60_000).toISOString() }));
+  assert.match(refused('reset-passed').message, /Codex's model refusal \(review\.codex_model gpt-6-astra\) is no longer evidence/);
+  writeFileSync(w.routeFile(), JSON.stringify({ ...keep, at: new Date(Date.now() - 60 * 60_000).toISOString() }));
+  assertExit(w.prepare(), 0);
+  writeFileSync(w.routeFile(), JSON.stringify({ ...keep, promptSha256: 'f'.repeat(64) }));
+  refused('route-mismatch');
+  // the default branch's fork point moved on and now names another model: the refusal says nothing about it (R3-2)
+  writeFileSync(w.routeFile(), JSON.stringify({ ...keep, model: 'gpt-older-1' }));
+  assert.match(refused('route-mismatch').message, /the trusted Codex model is now gpt-6-astra, not the refused gpt-older-1/);
+  const applied = w.apply(w.projects);
+  assertExit(applied, 1, applied.stdout);
+  assert.equal(applied.json.error, 'route-mismatch', 'apply judges it too');
+  // an unproven refusal wrote no model evidence at all
+  const bad = world(t);
+  assertExit(bad.run(1, modelRun(bad, { confirm: { missing: true } })), 3);
+  assert.equal(bad.route().evidence, 'none');
+  const none = bad.prepare();
+  assertExit(none, 1, none.stdout);
+  assert.equal(none.json.error, 'no-evidence');
+});
+
+test('a refused model may send a PROTECTED round (a confirm-fixed one) to a substitute, which budget / governor evidence may not (cf. R5-F2)', (t) => {
+  const w = world(t);
+  const first = w.codex(1, findingsOf([], [low()]));
+  assertExit(first, 0, first.stdout + first.stderr);
+  w.edit((s) => Object.assign(s.rounds[0].items[0], { final: { decision: 'ACCEPT', by: 'claude', needsHuman: false, reason: 'real' }, implemented: true, implementedVia: 'other-files' }));
+  w.repo.write('src/a.js', readFileSync(join(w.repo.dir, 'src', 'a.js'), 'utf8').replace('compute(x.y)', 'compute(x.z)'));
+  const small = w.repo.commit('small tweak');
+  const r2 = w.cli(['codex-review', '--pr', '7', '--round', '2', '--base', w.head, '--head', small, '--effort', 'high'], modelRun(w));
+  assertExit(r2, 3, r2.stdout + r2.stderr);
+  assert.deepEqual([r2.json.reason, r2.json.substitute.eligible, r2.json.substitute.why], ['model', true, 'model']);
+  const prep = w.prepare(2);
+  assertExit(prep, 0, prep.stdout + prep.stderr);
+  assert.equal(prep.json.evidence, 'model');
 });

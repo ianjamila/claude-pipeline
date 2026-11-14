@@ -169,6 +169,23 @@ test('missing verify.full / verify.quick is rejected', () => {
   assert.ok(has(r, 'verify.full') && has(r, 'verify.quick'));
 });
 
+test('review.codex_model must be a model id: a number, a list, spaces, an empty string or 101 characters are rejected (#443); ordinary ids and an absent key pass', () => {
+  const withModel = (codex_model) => validateConfig({ ...minimal(), review: { codex_model } });
+  for (const bad of [5, ['gpt-6-astra'], 'gpt 5', '', 'a'.repeat(101), 'gpt"x', 'gpt-6\nastra', null]) {
+    const r = withModel(bad);
+    assert.equal(r.ok, false, `${JSON.stringify(bad)} must be refused`);
+    assert.ok(has(r, 'review.codex_model must be a model id (letters, digits, . _ -), e.g. gpt-6-astra'), r.errors.join('; '));
+  }
+  for (const good of ['gpt-6-astra', 'o4-mini', 'gpt-5.1-codex', 'a'.repeat(100)]) {
+    const r = withModel(good);
+    assert.equal(r.ok, true, `${good}: ${r.errors.join('; ')}`);
+    assert.equal(r.config.review.codex_model, good);
+  }
+  const absent = validateConfig({ ...minimal(), review: { max_rounds: 2 } });
+  assert.equal(absent.ok, true, absent.errors.join('; '));
+  assert.equal(absent.config.review.codex_model, DEFAULTS.review.codex_model);
+});
+
 test('review.max_rounds outside 1..5 is rejected; effort values validated', () => {
   const r = validateConfig({ ...minimal(), review: { max_rounds: 9 } });
   assert.equal(r.ok, false);

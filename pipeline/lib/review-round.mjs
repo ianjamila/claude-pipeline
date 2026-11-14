@@ -14,6 +14,7 @@
 //
 // Reviewer-specific facts go in `roundFields` (spread into the stored round after the range fields: today `codexModel` and
 // `promptSha256`; a substitute passes `firstReviewer` / `substitute` and no codexModel). The module never reads them back.
+import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { EXIT } from './cli.mjs';
 import { assignIds, buildReviewPrompt, largeBinaryNote, renderFindingsMarkdown } from './codex.mjs';
@@ -373,8 +374,12 @@ export function strictestRouteConfig(config, trusted) {
   const higher = (a, b) => (EFFORTS.indexOf(b) > EFFORTS.indexOf(a) ? b : a);
   const anchored = trusted?.ok !== true && trusted?.anchoredConfig ? knobs(trusted.anchoredConfig) : null;
   const effort = Object.fromEntries(EFFORT_LANES.map((lane) => [lane, higher(higher(wt.effort[lane], other.effort[lane]), anchored ? anchored.effort[lane] : other.effort[lane])]));
+  // Where each choice came from (#445), for the notes that say why a lane or the model is not what the working tree's pipeline.yml says: the SAME selection as above, not a second guess.
+  // A tie goes to the working tree (nothing to explain). -> codexModelFrom: 'fork-point' | 'anchored-fork-point' | 'built-in'; effortFrom[lane]: 'working-tree' | 'fork-point' | 'anchored-fork-point' | 'built-in'.
+  const otherName = trusted?.ok === true ? 'fork-point' : 'built-in';
+  const effortFrom = Object.fromEntries(EFFORT_LANES.map((lane) => [lane, wt.effort[lane] === effort[lane] ? 'working-tree' : anchored && anchored.effort[lane] === effort[lane] ? 'anchored-fork-point' : otherName]));
   return {
-    modeOffFrom, effort, codexModel: (anchored ?? other).codexModel,
+    modeOffFrom, effort, effortFrom, codexModel: (anchored ?? other).codexModel, codexModelFrom: anchored ? 'anchored-fork-point' : otherName,
     smallFixLines: Math.min(wt.smallFixLines, other.smallFixLines), codexRoundBudget: Math.max(wt.codexRoundBudget, other.codexRoundBudget),
     soft: Math.max(wt.soft, other.soft), hard: Math.max(wt.hard, other.hard), mode: wt.mode === 'off' || other.mode === 'off' ? 'off' : wt.mode,
     minWaitMinutes: Math.max(wt.minWaitMinutes, other.minWaitMinutes), maxPacketMb: Math.min(wt.maxPacketMb, other.maxPacketMb),
@@ -423,7 +428,24 @@ export function planRound(adm, { env = process.env, now = Date.now() } = {}) {
     mode: route.mode, protectedKinds: kinds, small, governor, budget,
     normal: baseEffort({ effort, firstOrWholePr: round === 1 || adm.wholePr === true, level: adm.level }), smallFix: effort.small_fix,
   });
-  return { ...decision, round, base: adm.review.base, wholePr: adm.wholePr === true, budget, governor, facts, modeOffFrom: route.modeOffFrom };
+  // #445: when the working tree's own lanes alone would have given another effort, say which source raised it (the lanes are the higher of the working tree's and the fork point's / built-in).
+  // The SAME decision is made with the working tree's lanes, so a small fix-check or a governor-lowered round is compared on its own lane. None for a round a substitute takes.
+  let effortNote;
+  if (decision.route === 'codex') {
+    const own = config.review.effort;
+    const alone = decideRoute({
+      mode: route.mode, protectedKinds: kinds, small, governor, budget,
+      normal: baseEffort({ effort: own, firstOrWholePr: round === 1 || adm.wholePr === true, level: adm.level }), smallFix: own.small_fix,
+    });
+    if (alone.effort !== decision.effort) {
+      const lane = decision.lowered ? 'small_fix' : (round === 1 || adm.wholePr === true) && effort[adm.level] !== undefined ? adm.level : (round === 1 || adm.wholePr === true) ? 'high' : 'followup';
+      effortNote = { workingTree: alone.effort, configured: decision.effort, lane, from: route.effortFrom[lane] };
+    }
+  }
+  return {
+    ...decision, round, base: adm.review.base, wholePr: adm.wholePr === true, budget, governor, facts, modeOffFrom: route.modeOffFrom,
+    ...(effortNote === undefined ? {} : { effortNote }), codexModel: route.codexModel, codexModelFrom: route.codexModelFrom,
+  };
 }
 
 // A base-merge-only round has nothing to ask about: zero findings, and the round says why.
@@ -525,4 +547,29 @@ export async function recordRound({ adm, findings, roundFields = {}, gate, after
     return ruled;
   }));
   return { items, state: saved, grantUsed };
+}
+
+// #445: the review runs the model of the pipeline.yml at the default branch's fork point, never the working tree's. When the working tree names another one, say so (the round still runs; nothing blocks).
+// `configPath` is the working-tree file: a key it omits reads "unset (built-in default <m>)". `defaultBranch`: the trusted default branch the caller resolved (required).
+// -> the note text, or undefined when the working tree agrees with the model that runs.
+export function modelNoteFor({ config, configPath, trustedModel, codexModelFrom, defaultBranch }) {
+  const wt = config.review.codex_model;
+  if (wt === trustedModel) return undefined;
+  let shown = wt;
+  if (wt === DEFAULTS.review.codex_model) {
+    let omitted = false;
+    try { omitted = !/^\s*codex_model\s*:/m.test(readFileSync(configPath, 'utf8')); } catch { /* unreadable: show the value */ }
+    if (omitted) shown = `unset (built-in default ${wt})`;
+  }
+  const dflt = defaultBranch; // the TRUSTED default branch (risk.mjs#hashBranch), required: never the working-tree value a PR can edit (anchor-default-branch.test.mjs pins every config read)
+  const source = codexModelFrom === 'built-in' ? `the built-in default (the pipeline.yml at ${dflt}'s fork point could not be used)`
+    : codexModelFrom === 'anchored-fork-point' ? `the value at ${dflt}'s genuine fork point (the working tree moved default_branch)`
+      : `the value at ${dflt}'s fork point`;
+  return `review.codex_model ${shown} in the working tree is not used: this round runs ${trustedModel}, ${source}; the edit applies once it is on ${dflt} and this branch includes it`;
+}
+
+// #445: why an effort lane is not the one the working tree's pipeline.yml gives. -> the clause codex-review's effort-mismatch message appends.
+export function effortNoteText(note, defaultBranch) {
+  const from = note.from === 'built-in' ? 'the built-in lane' : note.from === 'anchored-fork-point' ? `the lane at ${defaultBranch}'s genuine fork point` : `the lane in the pipeline.yml at ${defaultBranch}'s fork point`;
+  return `the working tree's pipeline.yml alone gives ${note.workingTree}, but each review.effort lane is the higher of the working tree's and ${from} (here ${note.configured}), so a lower lane applies only once it is on ${defaultBranch}`;
 }

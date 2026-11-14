@@ -11,8 +11,10 @@
 //
 // Final evidence by kind (every kind keeps the pending record's fields, `at` becomes the time the evidence was formed, `startedAt` the attempt's start):
 //   quota  { outcome:'failed', reason:'quota', resetAt, resetText, errorEvent:{type, message}, threadId, promptSha256, proof }  (`proof`: 'session-log' | 'stream')
+//   model  { outcome:'failed', reason:'model', model, provider, errorEvent:{type, message}, threadId, promptSha256, proof:'session-log', confirm:{threadId} }  (cp #431: Codex refused the
+//          CONFIGURED model; `model` is always the trusted review.codex_model string, never a name from the provider's message; the confirmation run is lib/codex-exec.mjs's)
 //   none   { outcome:'recorded' } for a round that was recorded, or { outcome:'failed', reason, timedOut?, detail? } for any other failure
-// A quota record with `resetAt: null` is valid for 2 hours from `at` (OUTAGE_NO_RESET_MS), after which Codex must be retried.
+// A quota record with `resetAt: null`, and every model record, is valid for 2 hours from `at` (OUTAGE_NO_RESET_MS), after which Codex must be retried.
 import { randomBytes } from 'node:crypto';
 import { copyFileSync, existsSync, mkdirSync, readFileSync, renameSync } from 'node:fs';
 import path from 'node:path';
@@ -91,7 +93,8 @@ export async function finishAttempt({ root, pr, ctx, round, attempt, final, file
   }));
 }
 
-// When does a quota record stop being evidence (epoch ms)? At resetAt; with no reset time, 2 hours after it was formed.
+// When does a quota or model record stop being evidence (epoch ms)? At resetAt; with no reset time (a model record never has one), 2 hours after it was formed: the owner may have
+// fixed review.codex_model on the default branch in the meantime.
 export function quotaValidUntilMs(route) {
   const reset = route?.resetAt ? Date.parse(route.resetAt) : NaN;
   if (Number.isFinite(reset)) return reset;
@@ -107,17 +110,34 @@ export function resetNear({ resetAt, minWaitMinutes = 0, now = Date.now() }) {
   return minWaitMinutes > 0 && Number.isFinite(resetMs) && resetMs - now <= minWaitMinutes * 60_000;
 }
 
-// May a substitute stand in for this failed Codex run? (plan Rev 6: a real quota stop, proven by Codex's own structured events.)
-//   reason / timedOut / quota: what execCodex reported ({eligible, proof, resetAt, ...} for a quota); mode / minWaitMinutes: review.substitute.
-// -> { eligible, why, agent, resetAt, waitUntil? }. min_wait_minutes 0 (the default) never waits; above 0, a reset within that many minutes is waited for instead
+// May a substitute stand in for this failed Codex run? (plan Rev 6: a real quota stop, proven by Codex's own structured events; cp #431: or a refused model, proven by the session log and a confirmation run.)
+//   reason / timedOut / quota / modelStop: what execCodex reported ({eligible, proof, resetAt, ...} for a quota; {eligible, unproven?, ...} for a refused model); mode / minWaitMinutes: review.substitute.
+// -> { eligible, why, agent, resetAt, waitUntil?, unproven? }; `why` is 'quota' or 'model' when eligible. A model stop has no reset time, so min_wait_minutes never waits for it. min_wait_minutes 0 (the default) never waits; above 0, a reset within that many minutes is waited for instead
 // (eligible false, waitUntil = the reset), and a quota with no reset time is never waited for (nothing to wait until).
-export function substituteEligibility({ reason, timedOut = false, quota, mode, modeOffFrom = null, minWaitMinutes = 0, agent, now = Date.now() }) {
+export function substituteEligibility({ reason, timedOut = false, quota, modelStop, mode, modeOffFrom = null, minWaitMinutes = 0, agent, now = Date.now() }) {
   const resetAt = quota?.resetAt ?? null;
   const out = (eligible, why, extra = {}) => ({ eligible, why, agent, resetAt, ...extra });
   if (timedOut) return out(false, 'timed-out');
-  if (reason !== 'quota') return out(false, `not-quota:${reason}`);
+  if (reason !== 'quota' && reason !== 'model') return out(false, `not-quota:${reason}`); // the string predates 'model' and is kept: tests and skills match it
   if (mode === 'off') return out(false, 'mode-off', modeOffFrom === null ? {} : { modeOffFrom }); // modeOffFrom: where the off came from (strictestRouteConfig)
+  if (reason === 'model') return modelStop?.eligible === true ? out(true, 'model') : out(false, 'model-unproven', typeof modelStop?.unproven === 'string' ? { unproven: modelStop.unproven } : {});
   if (quota?.eligible !== true) return out(false, 'quota-unproven');
   if (resetNear({ resetAt, minWaitMinutes, now })) return out(false, 'reset-near', { waitUntil: resetAt });
   return out(true, 'quota');
+}
+
+// The message a refused-model stop gives (codex-review and triage second-review): what happened, where review.codex_model is read from and how to fix it, then the ACTUAL substitute
+// verdict (proof is not permission: R1-3). \`model\` is the trusted review.codex_model string, never a name from the provider's message. An unreadable base config (R3-4) says to repair it.
+// `next` is the caller's next step once a substitute is eligible: codex-review has nothing prepared yet (the default: `pipeline substitute prepare`), while triage second-review has already
+// prepared the packet, so its next step is one call of the named agent and then --apply (R1-F1: `substitute prepare` there reads the round's own record and is refused).
+export function modelRefusalMessage({ model, verdict, defaultBranch, next = '`pipeline substitute prepare`' }) {
+  const head = `Codex refused the configured model ${model} (model_not_found: retired, renamed, or not available to this Codex login). review.codex_model is read from the pipeline.yml at ${defaultBranch}'s fork point: fix it on ${defaultBranch}, then bring that fix into this branch (merge/update-branch) so its fork point moves.`;
+  if (verdict.eligible) return `${head} A substitute (${verdict.agent}) may stand in: ${next}.`;
+  if (verdict.why === 'mode-off') {
+    const unreadable = /could not be read \((.*)\); an unreadable base config/.exec(verdict.modeOffFrom ?? '');
+    if (unreadable) return `${head} No substitute may stand in: the pipeline.yml at ${defaultBranch}'s fork point is not a valid config (${unreadable[1]}): repair .claude/pipeline.yml on ${defaultBranch} with an owner commit; no PR can get a substitute until then.`;
+    return `${head} No substitute may stand in: ${verdict.modeOffFrom ?? 'review.substitute.mode is off'}.`;
+  }
+  if (verdict.why === 'model-unproven') return `${head} No substitute may stand in: the refusal could not be proven (${verdict.unproven ?? 'unproven'}); run codex-review again once review.codex_model is fixed on ${defaultBranch}.`;
+  return `${head} No substitute may stand in (${verdict.why}).`;
 }

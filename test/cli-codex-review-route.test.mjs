@@ -232,6 +232,22 @@ test('substituteEligibility: every refusal has a why, and quotaValidUntilMs give
   assert.equal(quotaValidUntilMs({ resetAt: null, at: '2026-11-11T07:00:00Z' }), Date.parse('2026-11-11T07:00:00Z') + OUTAGE_NO_RESET_MS);
 });
 
+test('substituteEligibility: a proven refused model (reason model) is eligible, why model, with no reset time; unproven, mode off and a timeout are refused; min_wait never waits for it (cp #431)', () => {
+  const modelStop = { eligible: true, proof: 'session-log', model: 'gpt-x', provider: 'openai' };
+  const now = Date.parse('2026-11-11T08:00:00Z');
+  const base = { reason: 'model', modelStop, mode: 'auto', minWaitMinutes: 0, agent: 'substitute-fable', now };
+  assert.deepEqual(substituteEligibility(base), { eligible: true, why: 'model', agent: 'substitute-fable', resetAt: null });
+  assert.equal(substituteEligibility({ ...base, minWaitMinutes: 720 }).eligible, true, 'no reset time: nothing to wait until');
+  assert.deepEqual(substituteEligibility({ ...base, modelStop: { ...modelStop, eligible: false, unproven: 'confirm-failed' } }), { eligible: false, why: 'model-unproven', agent: 'substitute-fable', resetAt: null, unproven: 'confirm-failed' });
+  assert.equal(substituteEligibility({ ...base, modelStop: undefined }).why, 'model-unproven');
+  assert.equal(substituteEligibility({ ...base, modelStop: { eligible: 'yes' } }).why, 'model-unproven');
+  assert.deepEqual(substituteEligibility({ ...base, mode: 'off', modeOffFrom: 'x' }), { eligible: false, why: 'mode-off', agent: 'substitute-fable', resetAt: null, modeOffFrom: 'x' });
+  assert.equal(substituteEligibility({ ...base, timedOut: true }).why, 'timed-out');
+  assert.equal(substituteEligibility({ ...base, quota: { eligible: true, resetAt: null } }).why, 'model', 'a quota fact does not matter to a model stop');
+  assert.equal(substituteEligibility({ reason: 'quota', modelStop, mode: 'auto', agent: 'a', now }).why, 'quota-unproven', 'a model fact never proves a quota stop');
+  assert.equal(quotaValidUntilMs({ evidence: 'model', at: '2026-11-11T07:00:00Z' }), Date.parse('2026-11-11T07:00:00Z') + OUTAGE_NO_RESET_MS, 'model evidence is fresh for 2 hours');
+});
+
 test('maxRisk: a smaller later diff keeps the PR on substitute-fable (the agent follows maxRisk, not the latest risk)', (t) => {
   const w = world(t, { yml: 'risk:\n  high_risk_paths: ["src/big.js"]\n' });
   assertExit(w.run(1, w.ok()), 0);

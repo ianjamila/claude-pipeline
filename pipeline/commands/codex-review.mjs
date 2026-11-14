@@ -26,14 +26,15 @@ import { CODEX_TIMEOUT_MS, execCodex, readCodexAnswer } from '../lib/codex-exec.
 import { Fail, guarded, requireConfig, resolveRepo } from '../lib/cmd-common.mjs';
 import { DEFAULTS } from '../lib/config.mjs';
 import { headSha, revParse } from '../lib/git.mjs';
-import { admitRound, baseOnlyFindings, headMoved, planRound, recordRound, roundPrompt, routeConfigFor, unavailable } from '../lib/review-round.mjs';
+import { hashBranch } from '../lib/risk.mjs';
+import { admitRound, baseOnlyFindings, effortNoteText, headMoved, modelNoteFor, planRound, recordRound, roundPrompt, routeConfigFor, unavailable } from '../lib/review-round.mjs';
 import { roundDir, writeFileAtomic } from '../lib/review-context.mjs';
 import { createGitHub } from '../lib/github.mjs';
 import { noteCodexAnswered, noteQuotaStop, recordCodexRun } from '../lib/codex-usage.mjs';
 import { higherRisk, maxRiskOf } from '../lib/state.mjs';
 import { substituteAgentFor } from '../lib/triage.mjs';
 import {
-  assertCurrentAttempt, finishAttempt, publishAttemptFiles, startAttempt, substituteEligibility, writeFinalRoute,
+  assertCurrentAttempt, finishAttempt, modelRefusalMessage, publishAttemptFiles, startAttempt, substituteEligibility, writeFinalRoute,
 } from '../lib/route-record.mjs';
 
 export const meta = {
@@ -88,11 +89,13 @@ export const meta = {
     '    {resolutionOnly:true, conflicted, conflictedCount}; the round is a real review but does not count toward the cap. Otherwise',
     '    the whole PR is reviewed as before (a counted round) and {resolutionIneligible:"<reason>"} says why the resolution was not',
     '    taken alone',
-    '  exit 3 {ok:false, unavailable:true, reason: quota|auth|unavailable|error|malformed|github} when Codex or GitHub could not deliver. A Codex failure also carries',
-    '    substitute:{eligible, why, agent, resetAt, waitUntil?}: eligible only for a real quota stop (Codex\'s own turn.failed event, confirmed by its session log when found) with',
+    '  exit 3 {ok:false, unavailable:true, reason: quota|model|auth|unavailable|error|malformed|github} when Codex or GitHub could not deliver. A Codex failure also carries',
+    '    substitute:{eligible, why, agent, resetAt, waitUntil?}: eligible only for a real quota stop (Codex\'s own turn.failed event, confirmed by its session log when found) or a proven refused model (below) with',
     '    review.substitute.mode auto (the stricter of the working-tree and the fork-point config, as above); agent is substitute-fable once the PR was ever high risk (maxRisk), else substitute-opus; review.substitute.min_wait_minutes above 0 and a',
     '    reset within it gives eligible:false, waitUntil (default 0: never wait). A quota stop also carries quota:{proof: session-log|stream, resetAt, resetText}, and is noted',
     '    in the machine-wide Codex record (P codex-status: lastOutage, waiting); the next Codex answer for the PR clears it (best effort: a failure there is a warnings entry, never a failed round)',
+    '  a REFUSED MODEL (reason model: a non-zero exit and a last turn.failed that is Codex\'s typed model_not_found error, status 400 or 404; a retired, renamed or unavailable review.codex_model) is substitute-eligible like a quota stop, with the same proof discipline and no owner step: eligible only when its session log is found and also says model_not_found for the model this run asked for, names a provider, and ONE confirmation run (the same codex command and effort in a fresh empty temp dir with the one-line prompt "Reply OK"; free, a 400 costs no quota; not recorded in the codex-usage ledger) is refused the same way with its own log, the same model and the same provider. The output then carries modelStop:{proven, proof, model, unproven?} and a message that says where review.codex_model is read from and how to fix it (on the default branch, then bring that fix into the branch so its fork point moves) followed by the real substitute verdict (why model | model-unproven | mode-off; an unreadable fork-point config says to repair it with an owner commit). route.json then holds {evidence:model, model: the TRUSTED review.codex_model string, provider, proof:session-log, confirm:{threadId}, promptSha256, errorEvent}: never a model name taken from the provider\'s message. A model stop is never retried and is not noted in the Codex quota record (codex-status); it is evidence for 2 hours',
+    '  effortNote / modelNote (#445, only when they differ; in --plan, the round output and an exit-3 stop; never for a round that goes to a substitute): effortNote {workingTree, configured, lane, from: fork-point|anchored-fork-point|built-in} says the working tree\'s own review.effort lane would have given another effort than the one that runs (each lane is the higher of the working tree\'s and the fork point\'s, so a lower lane applies only once it is on the default branch), and the effort-mismatch message names it; modelNote says the working tree\'s review.codex_model is not used (a key it omits reads "unset (built-in default <m>)"): the round runs the fork point\'s model, or the built-in default when the base config is unreadable. An older pipeline copy renders an evidence kind it does not know (model) as "Codex quota"; there is no state version bump',
     '  a Codex timeout, or a failure whose last turn.failed says the model is at capacity, is retried once in total (same prompt, same attempt; capacity after a wait): retried:{reason:timeout|capacity}; a second timeout is exit 3 unavailable with timedOut:true, never a substitute; a second capacity failure keeps its usual classification (error); quota is never retried',
     '  every Codex attempt first replaces .review/round-R/route.json with {attemptId, evidence:pending, round, base, head, patchSha256, risk, agent, at} and keeps its files in',
     '    round-R/attempt-<attemptId>/ (codex-raw.json, prompt.md). The final evidence (quota | none) and a recorded round are written under the review lock and a per-PR route lock (review, then route; the pending record takes the route lock alone, so a held review lock never stops Codex from starting) only while route.json still',
@@ -109,6 +112,7 @@ export { CODEX_TIMEOUT_MS };
 const planOutput = (p) => ({
   route: p.route, evidence: p.evidence, effort: p.effort, why: p.why, round: p.round, base: p.base, wholePrOwed: p.wholePr, protected: p.protected, small: p.small,
   ...(p.lowered === undefined ? {} : { lowered: p.lowered }),
+  ...(p.effortNote === undefined ? {} : { effortNote: p.effortNote }),
   ...(p.why.startsWith('mode-off') && p.modeOffFrom ? { modeOffFrom: p.modeOffFrom } : {}),
   budget: p.budget, governor: p.governor === null ? null : { usedPct: p.governor.usedPct, soft: p.governor.soft, hard: p.governor.hard, observedAt: p.governor.observedAt },
   facts: { changedLines: Number.isFinite(p.facts.changedLines) ? p.facts.changedLines : null, newFile: p.facts.newFile, sensitive: p.facts.sensitive },
@@ -126,7 +130,7 @@ export const run = guarded(async (argv, ctx) => {
   const planOnly = values.plan === true;
   const effort = planOnly && values.effort === undefined ? 'medium' : requireOption(values, 'effort'); // --plan runs nothing: the effort is only echoed back checked
   const root = resolveRepo(values, ctx);
-  const { config } = await requireConfig(root);
+  const { config, path: configPath } = await requireConfig(root);
   const o = { cwd: root };
 
   // Full SHAs everywhere: they go into the prompt, the state and the round's recorded range.
@@ -157,6 +161,7 @@ export const run = guarded(async (argv, ctx) => {
   // The stricter of the working tree's and the trusted base config (a PR must not turn its own substitute on / shorten the wait / lower its own effort); its model is the trusted one.
   const sub = routeConfigFor(root, config, adm.rated.trustedFork);
   const trustedModel = sub.codexModel;
+  const dflt = hashBranch(root, config); // the trusted default branch (what the remote calls its default), named in the notes and messages below, never the working-tree value a PR can edit
   const model = values.model ?? trustedModel;
   if (model !== trustedModel) {
     throw new Fail(EXIT.USAGE, {
@@ -165,7 +170,14 @@ export const run = guarded(async (argv, ctx) => {
     });
   }
   // The model that will run is checked for shape too, before the plan and before any attempt starts (a malformed codex_model committed at the default branch must not leave a pending route.json) (R2-F2).
-  argsFor(path.join(dir, 'codex-raw.json'), model);
+  // (validateConfig refuses a malformed review.codex_model before this point; a malformed one at the fork point reads as an unreadable base, so this is defence in depth.)
+  try {
+    argsFor(path.join(dir, 'codex-raw.json'), model);
+  } catch (err) {
+    throw new UsageError(`${err.message}; the model comes from review.codex_model of the pipeline.yml at ${dflt}'s fork point: fix it on ${dflt}, then bring that fix into this branch`);
+  }
+  // #445: the working tree names another model than the one that runs (it is never used): say so; the round still runs.
+  const modelNote = modelNoteFor({ config, configPath, trustedModel, codexModelFrom: sub.codexModelFrom, defaultBranch: dflt });
   const { baseOnly, resolutionOnly, resolutionView, resolution, resolutionIneligible } = adm;
   const prompt = roundPrompt(adm);
 
@@ -174,7 +186,10 @@ export const run = guarded(async (argv, ctx) => {
   if (planOnly) {
     return {
       exitCode: EXIT.OK,
-      output: { ok: true, plan: plan === null ? { baseOnly: true, round, base: adm.review.base } : planOutput(plan), expectedEffort: plan?.effort ?? sub.effort.followup },
+      output: {
+        ok: true, plan: plan === null ? { baseOnly: true, round, base: adm.review.base } : planOutput(plan), expectedEffort: plan?.effort ?? sub.effort.followup,
+        ...(modelNote !== undefined && plan?.route !== 'substitute' ? { modelNote } : {}),
+      },
     };
   }
 
@@ -201,7 +216,8 @@ export const run = guarded(async (argv, ctx) => {
   if (plan !== null && plan.route === 'codex' && effort !== plan.effort) {
     throw new Fail(EXIT.USAGE, {
       ok: false, error: 'effort-mismatch', expected: plan.effort, why: plan.why,
-      message: `--effort ${effort} is not the configured effort for round ${round}: use --effort ${plan.effort} (${plan.why}; \`pipeline codex-review --plan\` prints it)`,
+      message: `--effort ${effort} is not the configured effort for round ${round}: use --effort ${plan.effort} (${plan.why}; \`pipeline codex-review --plan\` prints it)${plan.effortNote === undefined ? '' : `; ${effortNoteText(plan.effortNote, dflt)}`}`,
+      ...(plan.effortNote === undefined ? {} : { effortNote: plan.effortNote }),
     });
   }
 
@@ -233,22 +249,32 @@ export const run = guarded(async (argv, ctx) => {
   // A failed run: the verdict on a substitute, the final evidence (compare-and-swap: a superseded attempt exits 2 here instead), the machine-wide record.
   const failed = async (reason, extra, { ran, detail } = {}) => {
     const verdict = substituteEligibility({
-      reason, timedOut: ran?.timedOut === true, quota: ran?.quota, mode: sub.mode, modeOffFrom: sub.modeOffFrom, minWaitMinutes: sub.minWaitMinutes, agent: attempt.route.agent,
+      reason, timedOut: ran?.timedOut === true, quota: ran?.quota, modelStop: ran?.modelStop, mode: sub.mode, modeOffFrom: sub.modeOffFrom, minWaitMinutes: sub.minWaitMinutes, agent: attempt.route.agent,
     });
     const quotaStop = reason === 'quota' && ran?.quota?.eligible === true;
-    const final = quotaStop
+    // A refused model (cp #431) is evidence only when execCodex proved it (session log + confirmation run): the evidence names the TRUSTED model string, never one from the provider's message.
+    const modelStopProven = reason === 'model' && ran?.modelStop?.eligible === true;
+    const final = modelStopProven
       ? {
-        evidence: 'quota', outcome: 'failed', reason: 'quota', resetAt: ran.quota.resetAt, resetText: ran.quota.resetText,
-        errorEvent: { type: 'turn.failed', message: ran.quota.message }, threadId: ran.quota.threadId ?? null, promptSha256, proof: ran.quota.proof,
+        evidence: 'model', outcome: 'failed', reason: 'model', model, provider: ran.modelStop.provider,
+        errorEvent: { type: 'turn.failed', message: ran.modelStop.message }, threadId: ran.modelStop.threadId ?? null, promptSha256, proof: ran.modelStop.proof, confirm: ran.modelStop.confirm,
       }
-      : { evidence: 'none', outcome: 'failed', reason, ...(ran?.timedOut ? { timedOut: true } : {}), ...(detail === undefined ? {} : { detail }) };
+      : quotaStop
+        ? {
+          evidence: 'quota', outcome: 'failed', reason: 'quota', resetAt: ran.quota.resetAt, resetText: ran.quota.resetText,
+          errorEvent: { type: 'turn.failed', message: ran.quota.message }, threadId: ran.quota.threadId ?? null, promptSha256, proof: ran.quota.proof,
+        }
+        : { evidence: 'none', outcome: 'failed', reason, ...(ran?.timedOut ? { timedOut: true } : {}), ...(detail === undefined ? {} : { detail }) };
     await finishAttempt({ root, pr, ctx, round, attempt, final });
     const warnings = quotaStop
       ? await noteQuotaStop({ at: new Date(), resetAt: ran.quota.resetAt, resetText: ran.quota.resetText, repo: repoSlug(), pr, round, worktree: root, env: ctx.env })
       : [];
     return unavailable(reason, {
       ...extra,
+      ...(reason === 'model' ? { modelStop: { proven: modelStopProven, proof: ran.modelStop?.proof ?? null, model, ...(ran.modelStop?.unproven ? { unproven: ran.modelStop.unproven } : {}) }, message: modelRefusalMessage({ model, verdict, defaultBranch: dflt }) } : {}),
       ...(ran?.retried ? { retried: ran.retried } : {}),
+      ...(modelNote === undefined ? {} : { modelNote }),
+      ...(plan?.effortNote === undefined ? {} : { effortNote: plan.effortNote }),
       ...(quotaStop || (reason === 'quota' && ran?.quota) ? { quota: { proof: ran.quota.proof, resetAt: ran.quota.resetAt, resetText: ran.quota.resetText } } : {}),
       substitute: verdict,
       ...(warnings.length + usageWarnings.length > 0 ? { warnings: [...warnings, ...usageWarnings] } : {}),
@@ -261,7 +287,7 @@ export const run = guarded(async (argv, ctx) => {
     // execCodex removes whatever is at the output path first (so it can never be read as this run's answer; the mtime check in
     // readCodexAnswer is the second line of defence, the tree kill on timeout the third).
     writeFileAtomic(path.join(attempt.dir, 'prompt.md'), promptBytes);
-    const ran = await execCodex({ root, env: ctx.env, args, promptBytes, outPath });
+    const ran = await execCodex({ root, env: ctx.env, args, promptBytes, outPath, requestedModel: model });
     // One line per real Codex run, kept or not (the weekly figure in the agent-log line); a ledger that cannot be written is a warning.
     const logged = recordCodexRun({
       kind: 'review', repo: adm.state?.repo || repoSlug(), pr, round, effort, model, ok: ran.ok, resolutionOnly,
@@ -321,6 +347,8 @@ export const run = guarded(async (argv, ctx) => {
       },
       ...(baseOnly ? { baseOnly: true } : {}),
       ...(retried ? { retried } : {}),
+      ...(modelNote === undefined ? {} : { modelNote }),
+      ...(plan?.effortNote === undefined ? {} : { effortNote: plan.effortNote }),
       ...(warnings.length + usageWarnings.length > 0 ? { warnings: [...warnings, ...usageWarnings] } : {}),
       ...(resolutionOnly ? { resolutionOnly: true, conflicted: resolutionView.conflicted, conflictedCount: resolution.conflictedCount } : {}),
       ...(resolutionIneligible === undefined ? {} : { resolutionIneligible }),

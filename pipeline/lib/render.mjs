@@ -92,6 +92,8 @@ const SUBSTITUTE_NAMES = { 'substitute-opus': 'Claude Opus', 'substitute-fable':
 function substituteWhy(sub) {
   if (sub.evidence === 'budget') return isObject(sub.budget) ? `Codex round budget ${line(sub.budget.used)} used` : 'Codex round budget spent';
   if (sub.evidence === 'governor') return isObject(sub.governor) ? `Codex weekly ${line(sub.governor.usedPct)}% ≥ ${line(sub.governor.threshold)}%` : 'Codex weekly quota high';
+  // Codex refused review.codex_model (cp #431). Older pipeline copies render an evidence kind they do not know as "Codex quota" (no state version bump: documented in docs/cli.md).
+  if (sub.evidence === 'model') return typeof sub.codexModelRefused === 'string' && sub.codexModelRefused.trim() !== '' ? `Codex model ${line(sub.codexModelRefused, 100)} refused (fix review.codex_model)` : 'Codex model refused (fix review.codex_model)';
   const reset = typeof sub.resetText === 'string' && sub.resetText.trim() !== '' ? sub.resetText : typeof sub.resetAt === 'string' ? sub.resetAt : '';
   return reset ? `Codex quota, resets ${line(reset, 40)}` : 'Codex quota';
 }
@@ -101,6 +103,19 @@ function substituteLines(rounds) {
     const attempt = Number(sub.attempts) > 1 ? `, attempt ${line(sub.attempts)}` : '';
     return `- Round ${line(r.n)} — substitute review (${SUBSTITUTE_NAMES[sub.agent] ?? 'Claude stand-in'}; ${substituteWhy(sub)}${attempt})`;
   });
+}
+
+// A second review a substitute gave because Codex refused its model is shown whatever the item's final is: claudeRulingLines lists only items Claude ruled, and a REJECT or FOLLOW-UP
+// second review on an item the arbiter ruled keeps final.by arbiter. One line per refused model (several items share one), the repair step in it. The model is agent-written: line().
+function modelRefusalLines(rounds) {
+  const models = new Set();
+  for (const r of rounds) {
+    for (const item of r.items ?? []) {
+      const sr = item?.secondReview;
+      if (isObject(sr) && sr.evidence === 'model') models.add(typeof sr.codexModelRefused === 'string' && sr.codexModelRefused.trim() !== '' ? line(sr.codexModelRefused, 100) : '');
+    }
+  }
+  return [...models].map((m) => `- Codex refused the configured model${m ? ` ${m}` : ''} (model_not_found), so a substitute gave the second review: fix review.codex_model on the default branch, then bring that fix into this branch`);
 }
 
 export function triageComment(state) {
@@ -113,6 +128,8 @@ export function triageComment(state) {
   if (claudeLines.length > 0) out.push('', '#### Claude rulings', '', ...claudeLines);
   const standIns = substituteLines(rounds);
   if (standIns.length > 0) out.push('', '#### Substitute reviews', '', ...standIns);
+  const refusals = modelRefusalLines(rounds);
+  if (refusals.length > 0) out.push('', '#### Codex model refusals', '', ...refusals);
   const reraised = reraisedLines(rounds);
   if (reraised.length > 0) out.push('', '#### Raised again after a deferral', '', ...reraised);
   const granted = grantedRounds(state);

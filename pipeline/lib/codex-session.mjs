@@ -1,7 +1,7 @@
 // Codex keeps a session log of every `codex exec` run under $CODEX_HOME/sessions/YYYY/MM/DD/rollout-<timestamp>-<thread id>.jsonl; its last
 // `task_complete` event says why a run failed in Codex's own typed words (`codex_error_info: "usage_limit_exceeded"` for a quota stop).
 // Everything here is best effort: a missing, unreadable or odd file gives null, never an exception.
-import { closeSync, openSync, readSync, readdirSync, fstatSync } from 'node:fs';
+import { closeSync, openSync, readFileSync, readSync, readdirSync, fstatSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { THREAD_ID_RE } from './codex.mjs';
@@ -67,5 +67,29 @@ export function readTaskCompleteError(file) {
     return null;
   } finally {
     if (fd !== undefined) try { closeSync(fd); } catch { /* already gone */ }
+  }
+}
+
+const MODEL_LOG_MAX_BYTES = 4 * 1024 * 1024;
+
+// Which model and provider a session log says its run used -> { model, provider } (each null when the log does not say), or null when the file cannot be read. `model` is the
+// model of the LAST `turn_context` event (what the turn that failed was asked to run), `provider` is `session_meta.payload.model_provider`. A refused-model session is a few
+// lines; a log over 4 MB is not read (null: the caller treats the run as unproven).
+export function readSessionModel(file) {
+  try {
+    if (statSync(file).size > MODEL_LOG_MAX_BYTES) return null;
+    let model = null;
+    let provider = null;
+    for (const line of readFileSync(file, 'utf8').split('\n')) {
+      const text = line.trim();
+      if (!text.startsWith('{')) continue;
+      let e;
+      try { e = JSON.parse(text); } catch { continue; }
+      if (e?.type === 'session_meta' && provider === null && typeof e.payload?.model_provider === 'string') provider = e.payload.model_provider;
+      else if (e?.type === 'turn_context' && typeof e.payload?.model === 'string') model = e.payload.model;
+    }
+    return { model, provider };
+  } catch {
+    return null;
   }
 }

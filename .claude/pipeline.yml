@@ -81,7 +81,7 @@ risk:
     "pipeline/lib/round-status.mjs", "pipeline/commands/final-gate.mjs", "pipeline/commands/triage.mjs", "pipeline/commands/model-proof.mjs",
     "pipeline/bin/pipeline.mjs",
     "pipeline/lib/closing-keywords.mjs", "pipeline/lib/preflight.mjs", "pipeline/lib/verify-steps.mjs", "pipeline/lib/merge-queue.mjs",
-    "pipeline/lib/github.mjs", "pipeline/lib/codex.mjs", "pipeline/lib/codex-exec.mjs", "pipeline/lib/fix-verify.mjs",
+    "pipeline/lib/github.mjs", "pipeline/lib/codex.mjs", "pipeline/lib/codex-model-id.mjs", "pipeline/lib/codex-exec.mjs", "pipeline/lib/fix-verify.mjs",
     "pipeline/lib/hold.mjs", "pipeline/lib/merge-hold.mjs", "pipeline/lib/cli.mjs", "pipeline/lib/cmd-common.mjs",
     "pipeline/lib/review-lease-wiring.mjs",
     "pipeline/commands/state.mjs", "pipeline/commands/model-floor.mjs", "pipeline/lib/owner-only.mjs", "pipeline/commands/verify.mjs",
