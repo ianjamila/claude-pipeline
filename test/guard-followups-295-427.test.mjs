@@ -2,6 +2,7 @@
 // Home is /home/u and the cwd is /home/u/proj; the filesystem is faked. Protected paths are built from parts so this file does not spell them either.
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
+import { resolve } from 'node:path';
 import { evaluateBashForFiles } from '../pipeline/hooks/lib/files-policy.mjs';
 import { evaluateGitCommand } from '../pipeline/hooks/lib/git-policy.mjs';
 import { reasonCode } from '../pipeline/hooks/lib/deny-log.mjs';
@@ -251,7 +252,8 @@ describe('#300: a contents merge into the home directory (or a parent of it) is 
 const gitRun = (command) => evaluateGitCommand(command, {
   cwd: '/work/repo',
   home: HOME,
-  currentBranch: (dir) => ({ '/work/repo': 'agent/x', '/other': 'agent/y' })[dir] ?? null,
+  // (keys resolved like guard-git's helper: on Windows the guard asks for `D:\other`, not `/other`)
+  currentBranch: (dir) => ({ [resolve('/work/repo')]: 'agent/x', [resolve('/other')]: 'agent/y' })[dir] ?? null,
   pushDestination: () => null,
   issueLabels: () => [],
   readText: () => null,
