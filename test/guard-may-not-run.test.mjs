@@ -511,10 +511,37 @@ test('#352 R17-F3: a word after the ]] that ends a condition, or after repeat N,
   allows('twin: if [[ ]]; then :; fi; push', `if [[ -n x ]]; then :; fi; ${SHIP}`, {}, '/work/other2');
 });
 
+// (#352 R18: the R17-F3 refusal held only when the `]]` armed the watch itself; a `]]` that follows a `( )` inside [[ ]], a `$( [[ ]] )` in the argv of the outer [[ ]] and a `{ }` group before the [[ ]] hid the
+// body again. Any plain word after an unquoted `]]` of a [[ ]] command now refuses the line, however the watch was armed)
+test('#352 R18-F1..F3: a word after a ]] that closes a [[ ]] command is a short-form body in an argv, however the condition was written: the line is refused', () => {
+  refuses('R18-F1: if [[ ( -n x ) ]] push', `if [[ ( -n x ) ]] ${SHIP}`);
+  refuses('R18-F1: if [[ $x == (a) ]] push', `if [[ $x == (a) ]] ${SHIP}`);
+  refuses('R18-F1: if [[ ( -n x ) ]] cd main; push (from the other worktree)', `if [[ ( -n x ) ]] cd /work/main; ${SHIP}`, {}, '/work/other2');
+  refuses('R18-F2: if [[ -n $([[ -n y ]] && echo x) ]] push', `if [[ -n $([[ -n y ]] && echo x) ]] ${SHIP}`);
+  refuses('R18-F2: if [[ -n "$([[ -n y ]] && echo x)" ]] push', `if [[ -n "$([[ -n y ]] && echo x)" ]] ${SHIP}`);
+  refuses('R18-F2: if [[ -n <([[ -n y ]] && echo x) ]] push', `if [[ -n <([[ -n y ]] && echo x) ]] ${SHIP}`);
+  refuses('R18-F3: if { true } && [[ -n x ]] push', `if { true } && [[ -n x ]] ${SHIP}`);
+  refuses('R18-F3: while { true } && [[ -n x ]] push', `while { true } && [[ -n x ]] ${SHIP}`);
+  refuses('R18-F3: until { true } && [[ -n x ]] push', `until { true } && [[ -n x ]] ${SHIP}`);
+  // lines that use [[ ]] as an ordinary command keep their verdict
+  allows('twin: [[ ]] && push', `[[ -n x ]] && ${SHIP}`, {}, '/work/other2');
+  allows('twin: [[ ]] || exit; push', `[[ -n x ]] || exit; ${SHIP}`, {}, '/work/other2');
+  allows('twin: if [[ ]]; then push; fi', `if [[ -n x ]]; then ${SHIP}; fi`, {}, '/work/other2');
+  allows('twin: if [[ ]] then push fi (newline form)', `if [[ -n x ]]\nthen ${SHIP}\nfi`, {}, '/work/other2');
+  allows('twin: [[ ]] 2>/dev/null && push', `[[ -n x ]] 2>/dev/null && ${SHIP}`, {}, '/work/other2');
+  allows('twin: [[ ( ) ]] && push', `[[ ( -n x ) ]] && ${SHIP}`, {}, '/work/other2');
+  allows('twin: [[ $( [[ ]] ) ]] && push', `[[ -n $([[ -n y ]] && echo x) ]] && ${SHIP}`, {}, '/work/other2');
+  allows('twin: { true } && [[ ]] && push', `{ true } && [[ -n x ]] && ${SHIP}`, {}, '/work/other2');
+  allows('twin: [[ "a ]] b" ]] && push', `[[ -n "a ]] b" ]] && ${SHIP}`, {}, '/work/other2');
+  allows("twin: echo ']]' foo; push", `echo ']]' foo; ${SHIP}`, {}, '/work/other2');
+  allows('twin: echo ]] foo; push', `echo ]] foo; ${SHIP}`, {}, '/work/other2');
+  allows('twin: while [[ ]]; do push; done', `while [[ -n x ]]; do ${SHIP}; break; done`, {}, '/work/other2');
+});
+
 // (#352 R17-F5: the zsh condition-then-body forms are not followed, so EVERY line of this cross product that holds a push is refused. No shell model is needed: the generator of the differential test has no
 // "unknown" verdict to compare with, so the forms are enumerated here instead. The condition enders and the bodies are those the rounds 15..17 found by hand, one spelling at a time)
 test('#352 R17-F5: every zsh condition-then-body line (if / until / while + condition ender + redirect + body, case W { }, repeat N) that holds a push is refused', () => {
-  const ENDERS = ['(true)', '((1))', '[[ -n x ]]', '[[ -n a && -n b ]]', '{ true }'];
+  const ENDERS = ['(true)', '((1))', '[[ -n x ]]', '[[ -n a && -n b ]]', '{ true }', '[[ ( -n x ) ]]', '[[ -n $([[ -n y ]] && echo x) ]]', '{ true } && [[ -n x ]]'];
   const REDIRS = ['', ' >/dev/null', ' 2>&1'];
   const BODIES = [`{ ${SHIP}; break }`, `{ ${SHIP} }`, `{ ${SHIP}; }`, SHIP, `{ : } else { ${SHIP} }`, `{ : } else { ${SHIP}; }`, `{ : }; ${SHIP}`];
   const PREFIXES = ['cd /work/other2 && ', 'cd /work/other2; ', 'false && cd /work/other2 && '];
