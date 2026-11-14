@@ -158,17 +158,23 @@ test('#352 R23-B1, R23-F1, R23-F2: nested / quoted subscripted descriptors rebin
     const sfs = fakeFs(PROJ, { 'run.sh': `${body}\necho '{}' > .review/round-$F/arbiter-output.json\n` }, [...DIRS, '.review']);
     assert.equal(files('export F=22; sh run.sh', sfs).decision, 'deny', body);
   }
-  // (#352 R24-F2: a subscript is arithmetic, quotes removed: `exec {a["F=22"]}>f` assigns F, also a name the script inherited. The believed F is harmless (x) and the
-  // subscript sets the round number, so the line is allowed if the subscript is not refused (R26-F1))
+  // (#352 R24-F2: a subscript is arithmetic, quotes removed: `exec {a["F=22"]}>f` assigns F, also a name the script inherited. R26-F1: the inherited F is harmless (x) and the
+  // subscript sets the round number, so in the script form only the subscript refusal denies the quoted spellings (the unquoted `{a[F=22]}` is also caught by the arithmetic-
+  // assignment scan). The one-line form is denied by an older rule as well: a line with a named descriptor word makes every name it assigns unknown (F=x here), so it pins the
+  // outcome, not the refusal)
   for (const body of ['exec {a["F=22"]}>/dev/null', 'exec {a[F=22]}>/dev/null', "exec {a['F=22']}>/dev/null"]) {
     const sfs = fakeFs(PROJ, { 'run.sh': `${body}\necho '{}' > .review/round-$F/arbiter-output.json\n` }, [...DIRS, '.review']);
     assert.equal(files('export F=x; bash run.sh', sfs).decision, 'deny', body);
     assert.equal(files(`F=x; ${body}; echo '{}' > .review/round-$F/arbiter-output.json`, fs).decision, 'deny', body);
   }
-  // (#352 R25-B1: a plain-name subscript evaluates the name's value as arithmetic: `i='F=22'`, `exec {a[i]}>f` assigns F; R26-F1: the believed F is harmless, so only the refusal denies)
+  // (#352 R25-B1: a plain-name subscript evaluates the name's value as arithmetic: `i='F=22'`, `exec {a[i]}>f` assigns F. The script form (F and i inherited) is denied only by the
+  // subscript refusal; the one-line form, as above, by the named-descriptor rule as well)
   assert.equal(files("F=x; i='F=22'; exec {a[i]}>/dev/null; echo '{}' > .review/round-$F/arbiter-output.json", fs).decision, 'deny');
   const ifs = fakeFs(PROJ, { 'run.sh': "exec {a[i]}>/dev/null\necho '{}' > .review/round-$F/arbiter-output.json\n" }, [...DIRS, '.review']);
   assert.equal(files("export F=x i='F=22'; bash run.sh", ifs).decision, 'deny');
+  // (R26-F1 control: the same script shape with a plain-number subscript is allowed, so the denies above come from the subscript, not from the write)
+  const cfs = fakeFs(PROJ, { 'run.sh': "exec {a[0]}>/dev/null\necho '{}' > .review/round-$F/arbiter-output.json\n" }, [...DIRS, '.review']);
+  assert.equal(files("export F=x i='F=22'; bash run.sh", cfs).decision, 'allow');
   const dfs = fakeFs(PROJ, { 'run.sh': "exec {a[0]}>/dev/null\necho '{}' > /tmp/round-$F.json\n" }, [...DIRS, '.review']);
   assert.equal(files('export F=22; bash run.sh', dfs).decision, 'allow');
   // unchanged: a real brace group assigns
