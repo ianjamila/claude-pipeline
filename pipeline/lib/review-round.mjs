@@ -207,11 +207,11 @@ export async function admitRound({ root, config, ctx, pr, round, base, head }) {
 
   // What the reviewer is shown (and what the fix commits are measured against) is exactly this range. Round 1 starts at the merge
   // base; a later round starts where the previous one ended, with the base branch's commits merged in since then taken out.
-  // Only commits that came from the protected default branch are left out: the base side is origin/<default_branch> (never a
+  // Only commits that came from the protected default branch are left out: the base side is origin/<trusted default branch> (GitHub's default; never a
   // branch the PR author chose), and a PR that targets any other branch leaves nothing out. "Targets the default branch" is the trusted one
   // (rated.defaultBranch: origin/HEAD), not config.default_branch: a PR that names its own base branch there would otherwise have that branch's commits left out (#398). An UNTRUSTED anchor
   // (rated.untrusted: an origin remote that answered neither origin/HEAD nor ls-remote, so the default branch is the working tree's, which the PR can edit) leaves nothing out either (S1).
-  // A failed or stale fetch only leaves an older origin/<default_branch>, which can only make the range bigger.
+  // A failed or stale fetch only leaves an older origin/<trusted default branch>, which can only make the range bigger.
   // The conflict case ('whole-pr' above): when the merge of the default branch conflicted and the resolution only chose lines the
   // two sides had, the range is the resolution alone and the round is free of the cap (resolutionReviewBase has every rule).
   const baseBranchRef = reviewBaseRef(root, config, prBase);

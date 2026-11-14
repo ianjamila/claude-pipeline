@@ -24,7 +24,7 @@ export const oneLine = (s) => String(s ?? '').replace(/\s+/g, ' ').trim();
 // git.mjs#reviewBaseRef for the fallback.
 export const reviewBaseRef = (root, config, branch = hashBranch(root, config)) => gitReviewBaseRef(branch, { cwd: root });
 
-// Best-effort refresh of origin/<default_branch>, for the commands that hash the content WITHOUT having fetched (review-complete,
+// Best-effort refresh of origin/<trusted default branch> (GitHub's default), for the commands that hash the content WITHOUT having fetched (review-complete,
 // state outcome, state mark-implemented; codex-review fetches on its own). The hash is the PR's diff against merge-base(origin/<branch>,
 // HEAD): after `update-branch` + `git pull --ff-only` (which fetches the PR branch only) the local origin/<branch> is older than the
 // main that was merged in, so the merge base is older, the diff includes main's new commits and the hash differs from the round's.
