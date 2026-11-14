@@ -523,14 +523,14 @@ test('#352 R18-F1..F3: a word after a ]] that closes a [[ ]] command is a short-
   refuses('R18-F3: if { true } && [[ -n x ]] push', `if { true } && [[ -n x ]] ${SHIP}`);
   refuses('R18-F3: while { true } && [[ -n x ]] push', `while { true } && [[ -n x ]] ${SHIP}`);
   refuses('R18-F3: until { true } && [[ -n x ]] push', `until { true } && [[ -n x ]] ${SHIP}`);
-  denies('#352 R19-F2b: X=1 {fd}>/dev/null push (main)', `X=1 {fd}>/dev/null ${SHIP}`, {}, MAIN_DIR);
-  denies('#352 R19-F2b: command {fd}>/dev/null push (main)', `command {fd}>/dev/null ${SHIP}`, {}, MAIN_DIR);
-  denies('#352 R19-F2b: git {fd}>/dev/null push (main)', `git {fd}>/dev/null ${PUSH} origin HEAD`, {}, MAIN_DIR);
+  refuses('#352 R19-F2b: X=1 {fd}>/dev/null push (main)', `X=1 {fd}>/dev/null ${SHIP}`, {}, MAIN_DIR);
+  refuses('#352 R19-F2b: command {fd}>/dev/null push (main)', `command {fd}>/dev/null ${SHIP}`, {}, MAIN_DIR);
+  refuses('#352 R19-F2b: git {fd}>/dev/null push (main)', `git {fd}>/dev/null ${PUSH} origin HEAD`, {}, MAIN_DIR);
   denies('#352 R19-F2b: {fd}>/dev/null X=1 push (main)', `{fd}>/dev/null X=1 ${SHIP}`, {}, MAIN_DIR);
-  allows('twin: cd other && X=1 {fd}>/dev/null push', `cd /work/other2 && X=1 {fd}>/dev/null ${SHIP}`, {}, MAIN_DIR);
-  allows('twin: cd other && command {fd}>/dev/null push', `cd /work/other2 && command {fd}>/dev/null ${SHIP}`, {}, MAIN_DIR);
-  allows('twin: cd other && git {fd}>/dev/null push', `cd /work/other2 && git {fd}>/dev/null ${PUSH} origin HEAD`, {}, MAIN_DIR);
-  allows('twin: cd other && {fd}>/dev/null X=1 push', `cd /work/other2 && {fd}>/dev/null X=1 ${SHIP}`, {}, MAIN_DIR);
+  refuses('twin (R20: a {fd} word that is not leading is refused): cd other && X=1 {fd}>/dev/null push', `cd /work/other2 && X=1 {fd}>/dev/null ${SHIP}`, {}, MAIN_DIR);
+  refuses('twin (R20: a {fd} word that is not leading is refused): cd other && command {fd}>/dev/null push', `cd /work/other2 && command {fd}>/dev/null ${SHIP}`, {}, MAIN_DIR);
+  refuses('twin (R20: a {fd} word that is not leading is refused): cd other && git {fd}>/dev/null push', `cd /work/other2 && git {fd}>/dev/null ${PUSH} origin HEAD`, {}, MAIN_DIR);
+  denies('twin (R20: a {fd} word makes the cd of the line uncertain): cd other && {fd}>/dev/null X=1 push', `cd /work/other2 && {fd}>/dev/null X=1 ${SHIP}`, {}, MAIN_DIR);
   // lines that use [[ ]] as an ordinary command keep their verdict
   allows('twin: [[ ]] && push', `[[ -n x ]] && ${SHIP}`, {}, '/work/other2');
   allows('twin: [[ ]] || exit; push', `[[ -n x ]] || exit; ${SHIP}`, {}, '/work/other2');
@@ -574,16 +574,16 @@ test('#352 R19-B1, R19-F1, R19-F2: the ]] watch survives a && inside [[ ]], a sa
 // a {fd} word that is not leading (and not before exec) or a leading one followed by a reserved word refuses the line)
 test('#352 R20-F1, R20-F2: a {fd} redirect word before a reserved word, in sh / dash / bash 3.2 reading, or mid-command never makes a cd certain', () => {
   for (const kw of ['then', 'else', 'elif', 'do', 'fi', 'done', 'while', 'until', '!', 'esac', 'if']) {
-    denies(`R20-F1: {fd}>/dev/null ${kw} cd other; push (main)`, `{fd}>/dev/null ${kw} cd /work/other2; ${SHIP}`, {}, MAIN_DIR);
+    refuses(`R20-F1: {fd}>/dev/null ${kw} cd other; push (main)`, `{fd}>/dev/null ${kw} cd /work/other2; ${SHIP}`, {}, MAIN_DIR);
   }
-  denies('R20-F1: {fd}>/dev/null function f cd other; push (main)', `{fd}>/dev/null function f cd /work/other2; ${SHIP}`, {}, MAIN_DIR);
+  refuses('R20-F1: {fd}>/dev/null function f cd other; push (main)', `{fd}>/dev/null function f cd /work/other2; ${SHIP}`, {}, MAIN_DIR);
   denies('R20-F2: sh -c {fd}>/dev/null cd other; push (main)', `sh -c '{fd}>/dev/null cd /work/other2; ${SHIP}'`, {}, MAIN_DIR);
   denies('R20-F2: bash -c {fd}>/dev/null cd other; push (main)', `bash -c '{fd}>/dev/null cd /work/other2; ${SHIP}'`, {}, MAIN_DIR);
   denies('R20-F2: {fd}>/dev/null cd other; push (main)', `{fd}>/dev/null cd /work/other2; ${SHIP}`, {}, MAIN_DIR);
-  denies('R20-F2: sh -c git --namespace {x}>/dev/null push (main)', `sh -c 'git --namespace {x}>/dev/null ${PUSH} origin HEAD:${MAIN}'`, {}, MAIN_DIR);
-  denies('R20-F2: bash -c git --namespace {x}>/dev/null push (main)', `bash -c 'git --namespace {x}>/dev/null ${PUSH} origin HEAD:${MAIN}'`, {}, MAIN_DIR);
-  denies('R20-F2: git --work-tree {x}>/dev/null push (main)', `git --work-tree {x}>/dev/null ${PUSH} origin HEAD:${MAIN}`, {}, MAIN_DIR);
-  denies('R20-F2: git --namespace {x}>/dev/null push (main)', `git --namespace {x}>/dev/null ${PUSH} origin HEAD:${MAIN}`, {}, MAIN_DIR);
+  refuses('R20-F2: sh -c git --namespace {x}>/dev/null push (main)', `sh -c 'git --namespace {x}>/dev/null ${PUSH} origin HEAD:${MAIN}'`, {}, MAIN_DIR);
+  refuses('R20-F2: bash -c git --namespace {x}>/dev/null push (main)', `bash -c 'git --namespace {x}>/dev/null ${PUSH} origin HEAD:${MAIN}'`, {}, MAIN_DIR);
+  refuses('R20-F2: git --work-tree {x}>/dev/null push (main)', `git --work-tree {x}>/dev/null ${PUSH} origin HEAD:${MAIN}`, {}, MAIN_DIR);
+  refuses('R20-F2: git --namespace {x}>/dev/null push (main)', `git --namespace {x}>/dev/null ${PUSH} origin HEAD:${MAIN}`, {}, MAIN_DIR);
 });
 
 // (#352 R17-F5: the zsh condition-then-body forms are not followed, so EVERY line of this cross product that holds a push is refused. No shell model is needed: the generator of the differential test has no
