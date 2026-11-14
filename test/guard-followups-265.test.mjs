@@ -135,6 +135,16 @@ describe('#265 (g): a long script is brace-expanded in bounded chunks', () => {
     assert.ok(r.decision === 'allow' || r.decision === 'deny');
     assert.ok(ms < 4000, `${ms} ms`);
   });
+  // #425 R1-F4: a minified bundle: long whitespace-free runs with a few comma groups and many lone `{` (the expansion regex is quadratic on such a run; one round can also grow a piece far past the cap)
+  test('a 900 kB minified-like program (3,900-character runs, comma groups and many lone braces) stays inside the CPU bound', () => {
+    const run = `f{a,b}${'{x=1;'.repeat(760)}g{c,d}${'{y'.repeat(20)}`.slice(0, 3900);
+    const body = `${run}\n`.repeat(230);
+    const c = { cmd: 'node /home/u/proj/big.mjs', ...files('/home/u/proj/big.mjs', body) };
+    assert.ok(c.readText('/home/u/proj/big.mjs').length > 850_000 && c.readText('/home/u/proj/big.mjs').length < 1_000_000);
+    const { r, ms } = cpuTimed(() => go(c));
+    assert.ok(r.decision === 'allow' || r.decision === 'deny');
+    assert.ok(ms < 4000, `${ms} ms`);
+  });
 });
 
 describe('cd X || { …; exit 1; } narrows what follows (everyday shape, as cd X || exit 1)', () => {

@@ -815,8 +815,10 @@ function braceExpand(s, ctx) {
 // #265 (g): a program's text past 5,000 characters is expanded piece by piece. A brace group holds no whitespace (the expansion above reads only `\S` runs), so the text is cut at whitespace into
 // pieces of at most 4,000 characters (a single longer run is cut where it stands: no one word of a program is that long), and each piece costs what a short text costs.
 const BRACE_CHUNK = 4000;
+const BRACE_GROWTH_CAP = 50_000; // (the cap of one text, braceExpand's, on how much all the pieces together may grow)
 function braceExpandChunks(s, ctx) {
   const parts = [];
+  let grown = 0;
   for (let from = 0; from < s.length;) {
     let to = Math.min(s.length, from + BRACE_CHUNK);
     if (to < s.length) {
@@ -825,7 +827,16 @@ function braceExpandChunks(s, ctx) {
       if (k > from) to = k;
     }
     const piece = s.slice(from, to);
-    parts.push(piece.includes('{') ? braceExpand(piece, ctx) : piece);
+    // #425 R1-F4: a piece costs up to a quadratic scan (a minified run of lone `{`), so the evaluation deadline is checked per piece (a GuardLimit denies); once the pieces have grown by more than the per-text cap
+    // the rest stays as it is and the cut is flagged like a cap hit inside one text (braceOver)
+    if (ctx.budget) checkDeadline(ctx.budget);
+    if (grown > BRACE_GROWTH_CAP || !piece.includes('{')) parts.push(piece);
+    else {
+      const out = braceExpand(piece, ctx);
+      grown += out.length - piece.length;
+      parts.push(out);
+    }
+    if (grown > BRACE_GROWTH_CAP) ctx.braceOver = true;
     from = to;
   }
   return parts.join('');
