@@ -3177,11 +3177,27 @@ function splitOperands(argv, name) {
 // R1-B3 / R1-B2 (#300): rsync's own reading of its words (splitOperands is cp's: it takes `--exclude VALUE` / `--timeout 30` for operands and `-t` for a target directory). The options that take a
 // value, as `--opt=v`, as `--opt v`, and as a short letter (`-e ssh`, `-esh`, `-ae ssh`: the rest of a cluster after the letter is its value, a letter that ends it takes the next word); options may stand
 // among the operands or after them (rsync permutes), and `--` ends them. Same-line names are replaced by their value first. { pos: the operands as written, expanded: the same, as expanded, dry: a real
-// -n / --dry-run option word (a value is no option: `--exclude -n`, `-en`), filesFrom: a --files-from option (R6-B1), relative: -R / --relative in force at the end (#464) }
+// -n / --dry-run option word (a value is no option: `--exclude -n`, `-en`; nor is the word after an unknown or ambiguous long option, #465), maybe: the indexes of the operands that may be such a value, filesFrom: a --files-from option (R6-B1), relative: -R / --relative in force at the end (#464) }
 const RSYNC_VALUE_LONG = new Set(['rsh', 'rsync-path', 'max-delete', 'max-size', 'min-size', 'partial-dir', 'block-size', 'compare-dest', 'copy-dest', 'link-dest', 'exclude', 'exclude-from', 'include', 'include-from',
   'filter', 'files-from', 'out-format', 'log-file', 'log-file-format', 'bwlimit', 'timeout', 'contimeout', 'port', 'address', 'sockopts', 'password-file', 'temp-dir', 'backup-dir', 'suffix', 'chmod', 'chown',
   'usermap', 'groupmap', 'iconv', 'skip-compress', 'compress-level', 'compress-choice', 'zc', 'zl', 'checksum-choice', 'cc', 'checksum-seed', 'modify-window', 'write-batch', 'only-write-batch', 'read-batch',
-  'protocol', 'info', 'debug', 'outbuf', 'stop-after', 'time-limit', 'stop-at', 'remote-option', 'copy-as', 'early-input', 'max-alloc']);
+  'protocol', 'info', 'debug', 'outbuf', 'stop-after', 'time-limit', 'stop-at', 'remote-option', 'copy-as', 'early-input', 'max-alloc', 'stderr', 'dparam']);
+// #465: the long options that take no value; with RSYNC_VALUE_LONG they let rsyncLongKind read an abbreviation (rsync takes any unambiguous prefix). A `--no-…` option is always a flag.
+const RSYNC_FLAG_LONG = ['verbose', 'quiet', 'stats', 'human-readable', 'progress', 'itemize-changes', 'archive', 'recursive', 'relative', 'backup', 'update', 'inplace', 'append', 'append-verify', 'dirs', 'old-dirs', 'mkpath',
+  'links', 'copy-links', 'copy-unsafe-links', 'safe-links', 'munge-links', 'copy-dirlinks', 'keep-dirlinks', 'hard-links', 'perms', 'executability', 'acls', 'xattrs', 'owner', 'group', 'devices', 'specials', 'times', 'atimes',
+  'open-noatime', 'crtimes', 'omit-dir-times', 'omit-link-times', 'super', 'fake-super', 'sparse', 'preallocate', 'dry-run', 'whole-file', 'checksum', 'one-file-system', 'existing', 'ignore-existing', 'remove-source-files',
+  'delete', 'delete-before', 'delete-during', 'delete-delay', 'delete-after', 'delete-excluded', 'delete-missing-args', 'ignore-missing-args', 'ignore-errors', 'force', 'prune-empty-dirs', 'numeric-ids', 'partial',
+  'delay-updates', 'compress', 'cvs-exclude', 'from0', 'protect-args', 'secluded-args', 'trust-sender', 'ipv4', 'ipv6', 'list-only', 'size-only', 'ignore-times', 'msgs2stderr', 'fsync', 'copy-devices', 'write-devices',
+  'daemon', 'detach', 'help', 'version', 'fuzzy', 'blocking-io', '8-bit-output', 'no-motd', 'append-verify', 'ignore-non-existing'];
+// 'value': a long option (or the abbreviation of only value options) that takes a value; 'flag': takes none; null: unknown or ambiguous between the two (the caller reads the next word as a possible value AND a possible operand)
+const rsyncLongKind = (o) => {
+  if (o.startsWith('no-') || RSYNC_FLAG_LONG.includes(o)) return 'flag';
+  if (RSYNC_VALUE_LONG.has(o)) return 'value';
+  const value = [...RSYNC_VALUE_LONG].filter((x) => x.startsWith(o)).length;
+  const flag = RSYNC_FLAG_LONG.filter((x) => x.startsWith(o)).length;
+  if (o === 'no') return 'flag';
+  return value > 0 && flag === 0 ? 'value' : flag > 0 && value === 0 ? 'flag' : null;
+};
 const RSYNC_VALUE_SHORT = new Set(['e', 'f', 'B', 'T', 'M', '@']);
 const SUBST_TEXT = /[`]|\$\(/;
 // R2-B1 / #459: bash splits an UNQUOTED word that a same-line name changed on blanks (an empty value is no word), and each piece is an argument of its own: `FLAGS='-a --include n'; rsync $FLAGS SRC/ ~/`
@@ -3204,9 +3220,13 @@ function rsyncOperands(words, ctx, quoted, split = true) {
   let dry = false;
   let filesFrom = false;
   let relative = false; // (#464: the last of -R / --relative and --no-relative / --no-R wins; one that holds a substitution is only known at run time, so it sets and never clears)
+  const maybe = new Set(); // (#465: the operands that follow an unknown or ambiguous long option: its value, or an operand, as far as can be told)
+  let after = false;
   let rest = false;
   for (let i = 0; i < items.length; i++) {
     const [w, e] = items[i];
+    const unsure = after; // (this word follows an unknown or ambiguous long option: it is never read as a dry-run flag, and it may be an operand)
+    after = false;
     if (!rest && e === '--') { rest = true; continue; }
     if (!rest && e.length > 1 && e[0] === '-') {
       const sub = SUBST_TEXT.test(e); // (an option word that holds a substitution is only known at run time: it is no dry run)
@@ -3215,25 +3235,31 @@ function rsyncOperands(words, ctx, quoted, split = true) {
         const o = eq < 0 ? e.slice(2) : e.slice(2, eq);
         // R6-B1: rsync takes any unambiguous abbreviation of a long option (`--file` is only files-from; `--fil` is filter too); the same prefix reading as `--del` in rsyncFlags
         if (o.length >= 4 && 'files-from'.startsWith(o)) { filesFrom = true; if (eq < 0) i++; } // (its value is the next word)
-        else if (o === 'dry-run' && eq < 0 && !sub) dry = true;
+        else if (o === 'dry-run' && eq < 0 && !sub && !unsure) dry = true;
         else if (eq < 0 && o.length >= 3 && 'relative'.startsWith(o)) relative = true; // (#464: `--rel` is only relative)
         else if (eq < 0 && !sub && (o === 'no-R' || (o.length >= 6 && 'no-relative'.startsWith(o)))) relative = false;
-        else if (eq < 0 && RSYNC_VALUE_LONG.has(o)) i++; // (the next word is its value, an option-looking one included)
+        else if (eq < 0) { // (#465: rsync takes any unambiguous abbreviation, `--timeo 30`, `--exclud x`)
+          const kind = rsyncLongKind(o);
+          if (kind === 'value') i++; // (the next word is its value, an option-looking one included)
+          else if (kind === null) after = true; // (unknown or ambiguous: the next word may be its value AND an operand, never a dry-run flag)
+        }
       } else {
         for (let j = 1; j < e.length; j++) { // (linear: a cluster is read once, up to its first value letter)
           const ch = e[j];
           if (RSYNC_VALUE_SHORT.has(ch)) { if (j === e.length - 1) i++; break; }
           if (!/[A-Za-z0-9@ \t\n-]/.test(ch)) break; // (a word held whole by zsh may hold the shell's blanks, `-a -n`; any other character, a U+00A0 included, is no option letter: no dry run in it)
-          if (ch === 'n' && !sub) dry = true;
+          if (ch === ' ' || ch === '\t' || ch === '\n') { if (!sub && !unsure) dry = true; break; } // (#460: zsh passes `-a -n` as ONE word, and a cluster that reaches a blank before a value letter is a usage error: rsync writes nothing, as bash's real dry run does)
+          if (ch === 'n' && !sub && !unsure) dry = true;
           else if (ch === 'R') relative = true;
         }
       }
       continue;
     }
+    if (unsure) maybe.add(pos.length);
     pos.push(w);
     expanded.push(e);
   }
-  return { pos, expanded, dry, filesFrom, relative };
+  return { pos, expanded, dry, filesFrom, relative, maybe };
 }
 
 // R4-B1 / item 6 (#288): rsync's options as the shell passes them. A same-line name is replaced by its value (`D=--delete; rsync -a "$D" SRC ~/`) and a value that holds blanks is several words; a word that
@@ -5449,10 +5475,15 @@ function evaluateBashForFilesFrame(command, opts) {
       return [true, false].some((split) => {
         const r = rsyncOperands(words, ctx, c.quotedWords, split);
         if (r.dry || r.pos.length < 2) return false;
+        // #465: the last operand is the destination, unless it follows an unknown or ambiguous long option and is that option's value: then the one before it is (every such word is judged as a possible destination, R5-F2)
         // R6-B1: --files-from copies each listed name, relative to the source directory, directly beneath the destination (a slash on the source or not, -r or not: it implies --relative): a contents merge of the source
         // #464: --relative (-R) recreates the source's own path below the destination (`rsync -aR .stage-dir/x ~/`), the same landing, and --files-from implies it
-        if ((r.filesFrom || r.relative) && hit(r.pos[r.pos.length - 1])) return true;
-        return contents([r.pos[r.pos.length - 1]], r.expanded.slice(0, -1));
+        for (let ci = r.pos.length - 1; ci >= 1; ci--) {
+          if ((r.filesFrom || r.relative) && hit(r.pos[ci])) return true;
+          if (contents([r.pos[ci]], r.expanded.slice(0, ci))) return true;
+          if (!r.maybe.has(ci)) break;
+        }
+        return false;
       });
     };
     const homeWriter = cmds.find((c) => {
@@ -5465,6 +5496,8 @@ function evaluateBashForFilesFrame(command, opts) {
         if (name !== 'rsync') return false;
         const f = rsyncFlags(c.argv, ctx, c.raw);
         if (!f.del && !f.rm && !f.unknown) return false;
+        // #460: a dry run (both readings of the words agree) deletes nothing at the destination and removes no source
+        if ([true, false].every((split) => rsyncOperands(wordsOf(c), ctx, c.quotedWords, split).dry)) return false;
         // R5-F2: --delete removes what the source lacks at the destination, --remove-source-files removes the sources; rsync permutes its options, so the last word can be the value of one
         // (`rsync -a --delete SRC ~/ --timeout 30`): with either flag, known or not, EVERY word (a positional or an option's value) is judged as a possible destination
         return operandsOf(c).some(hit);

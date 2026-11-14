@@ -108,3 +108,49 @@ describe('#464: rsync -R / --relative into home is a contents merge (the source 
     ['-eR is a value too', 'rsync -a -eR src/ ./out/'],
   ]);
 });
+
+// ---- #465: rsync takes any unambiguous abbreviation of a long option, a value option included ----
+describe('#465: an abbreviated long value option takes its value (the value is no operand and no dry-run flag)', () => {
+  decide('deny', [
+    ['--exclud x after the operands', 'rsync -a --files-from=/tmp/l /tmp/stage ~/ --exclud x'],
+    ['--timeo 30 after the operands', 'rsync -a /tmp/stage/ ~/ --timeo 30'],
+    ['--exclud -n: the pattern -n is no dry run', 'rsync -a --exclud -n /tmp/stage/ ~/'],
+    ['--bwl 100 after the operands', 'rsync -a /tmp/stage/ ~/ --bwl 100'],
+    ['--exclude-f F after the operands', 'rsync -a /tmp/stage/ ~/ --exclude-f F'],
+    ['an unknown option then a value-looking word after the operands (it may be an operand)', 'rsync -a /tmp/stage/ ~/ --zzzz x'],
+    ['an unknown option then -n (it may be its value: no dry run)', 'rsync -a --zzzz -n /tmp/stage/ ~/'],
+    ['an ambiguous abbreviation of a value option and a flag, then -n', 'rsync -a --ex -n /tmp/stage/ ~/'],
+    ['an ambiguous abbreviation, then a word after the operands', 'rsync -a /tmp/stage/ ~/ --ex x'],
+    ['two abbreviated values after the operands', 'rsync -a /tmp/stage/ ~/ --timeo 30 --bwl 5'],
+  ]);
+  decide('allow', [
+    ['the everyday --exclude with its value', 'rsync -av --exclude node_modules src/ dest/'],
+    ['an abbreviated value option before the operands, into a project', 'rsync -a --exclud node_modules src/ ./out/'],
+    ['--timeo 30 into a project', 'rsync -a /tmp/stage/ ./out/ --timeo 30'],
+    ['a real -n after a known flag option is still a dry run', 'rsync -a --progress -n /tmp/stage/ ~/'],
+    ['a real -n after a known flag option (--delete) is still a dry run', 'rsync -a --delete -n /tmp/stage/ ~/'],
+    ['-n after an exact value option is its value, but a separate -n is still read', 'rsync -a -n --exclude x /tmp/stage/ ~/'],
+    ['an unknown option, a project destination', 'rsync -a --zzzz x src/ ./out/'],
+  ]);
+});
+
+// ---- #460: the unsplit (zsh) reading of an option word that holds a blank ----
+// zsh passes `-a -n` as ONE word; rsync reads it as a cluster, meets the blank (no option letter) and refuses with a usage error, so nothing is written. bash splits it and -n is a real dry run: both write nothing.
+describe('#460: a single-dash word that reaches a blank before a value letter is a usage error (nothing is written), in either reading', () => {
+  decide('allow', [
+    ['-a -n', "OPTS='-a -n'; rsync $OPTS /tmp/x/ ~/"],
+    ['-avz --exclude=.git -n', "OPTS='-avz --exclude=.git -n'; rsync $OPTS /tmp/x/ ~/"],
+    ['-a --delete -n', "OPTS='-a --delete -n'; rsync $OPTS /tmp/x/ ~/"],
+    ['-a -n, quoted (one word in both shells)', "OPTS='-a -n'; rsync \"$OPTS\" /tmp/x/ ~/"],
+    ['a tab between the letters', "OPTS=$'-a\\t-n'; rsync $OPTS /tmp/x/ ~/"],
+    ['-av --dry-run (still allowed)', "OPTS='-av --dry-run'; rsync $OPTS /tmp/x/ ~/"],
+  ]);
+  decide('deny', [
+    ['-a --delete: bash passes a real --delete, so it writes', "OPTS='-a --delete'; rsync $OPTS /tmp/x/ ~/"],
+    ['-a --exclude=x (bash: a real run)', "OPTS='-a --exclude=x'; rsync $OPTS /tmp/x/ ~/"],
+    ['-ae ssh -n: -e takes the rest as its value, the -n is not a flag in the unsplit reading', "OPTS='-ae ssh -n'; rsync $OPTS /tmp/x/ ~/"],
+    ['--exclude=a -n (a double-dash word is a pattern, not a cluster)', "OPTS='--exclude=a -n'; rsync -a $OPTS /tmp/x/ ~/"],
+    ['a no-break space is no blank (existing pin)', "OPTS='-a -n'; rsync $OPTS /tmp/x/ ~/"],
+    ['-a -n with a substitution is only known at run time', "OPTS=\"-a -n $(echo x)\"; rsync $OPTS /tmp/x/ ~/"],
+  ]);
+});
