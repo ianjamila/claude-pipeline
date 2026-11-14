@@ -1832,6 +1832,7 @@ test('state that becomes unknown mid-line stays enforced; control flow counts fr
     'true && cd /other; bash step.sh',
     'false || cd /other; ./step.sh',
     'cd /other || exit 1 & git push', // `|| exit` does not help a backgrounded cd
+    'cd /other || return; git push', // #427: a top-level `return` is an error and the shell goes on (this was an allow before; the files guard's cd narrowing refused it since #425)
     // a ( subshell is still found in the text
     '(B=main); git push origin HEAD:$B',
   ];
@@ -1847,7 +1848,6 @@ test('state that becomes unknown mid-line stays enforced; control flow counts fr
     'B=agent/x; git commit -m "fix for loop"; git push origin "$B"',
     'git commit -m "fix (again)"; B=agent/x; git push origin HEAD:$B',
     'cd /other || exit 1; git push',
-    'cd /other || return; git push',
     'cd /other; bash ok.sh',
     'source env.sh && npm test',
   ];
