@@ -691,3 +691,32 @@ test('late lane, R3 over three rounds: round 2 widens integrity.test_globs, roun
   assert.equal(n3.json.brief, 'full');
   assert.match(n3.json.briefReason, /late fix round: the fix scope is flagged \(new non-test file: helpers\/make\.js\)/);
 });
+
+// ---- review.post_max_suggestions wired into `arbiter apply` (#374 PR B). maxRounds is edited to -1 so round 1 counts as "past max + 1" without owner grants. ----
+
+function applyPastMax(t, policy) {
+  const w = world(t, { yml: YML(policy === undefined ? '' : `  post_max_suggestions: ${policy}\n`) });
+  assertExit(w.codex(1, findingsOf([finding({ file: 'src/big.js' })])), 0); // src/big.js is a file the PR changed: the location resolves, so the item is low severity
+  w.edit((s) => { s.maxRounds = -1; });
+  const needed = w.needed(1);
+  assertExit(needed, 0, needed.stdout + needed.stderr);
+  const a = w.apply(1, needed.json, { answer: { rulings: [{ id: 'R1-S1', ruling: 'ACCEPT', confidence: 'high', reasoning: 'src/big.js:3 is a vague name' }], findings: [] } });
+  assertExit(a, 0, a.stdout + a.stderr);
+  return w;
+}
+
+test('arbiter apply: past the limit with post_max_suggestions follow-up, a low-severity arbiter ACCEPT is stored as a FOLLOW-UP with postMax, state version 6', (t) => {
+  const w = applyPastMax(t, 'follow-up');
+  const item = w.state().rounds[0].items.find((i) => i.id === 'R1-S1');
+  assert.deepEqual([item.final.decision, item.final.by, item.final.postMax.ordinal, item.final.postMax.max, item.final.postMax.from], ['FOLLOW-UP', 'arbiter', 1, -1, 'ACCEPT']);
+  assert.equal(w.state().version, 6);
+});
+
+test('arbiter apply: the default policy (review) keeps the same arbiter ACCEPT past the limit, and the state version stays 1', (t) => {
+  for (const policy of [undefined, 'review']) {
+    const w = applyPastMax(t, policy);
+    const item = w.state().rounds[0].items.find((i) => i.id === 'R1-S1');
+    assert.deepEqual([item.final.decision, item.final.postMax], ['ACCEPT', undefined], String(policy));
+    assert.equal(w.state().version, 1);
+  }
+});
