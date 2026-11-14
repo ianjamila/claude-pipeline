@@ -23,7 +23,7 @@ import { pmCall, pmMoverName, packageScripts, defaultLexists, localBin, nameAtRu
 import os from 'node:os';
 import path from 'node:path';
 import { toPosix, expandHome, isInside, samePath, drivePosix, transcriptRes, configDirOf, HOME_CONFIG_DIR_RE } from '../../lib/paths.mjs';
-import { UNDECIDABLE_HEREDOC, plainExit, simpleCommands, commandName, scriptFileOf, scriptFeedsOf, startupFilesOf, startupVarsOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, sqlShellEscapes, sourcePathSearch, splicesOptions, spliceText, implicitBindsOf, MATCH_NAMES, ZSH_NAME_BINDERS, indirectExpansionOnLine, arithAssignedNames, refusalAdvice } from './shell-parse.mjs';
+import { UNDECIDABLE_HEREDOC, exitFollows, shapeAt, simpleCommands, commandName, scriptFileOf, scriptFeedsOf, startupFilesOf, startupVarsOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, sqlShellEscapes, sourcePathSearch, splicesOptions, spliceText, implicitBindsOf, MATCH_NAMES, ZSH_NAME_BINDERS, indirectExpansionOnLine, arithAssignedNames, refusalAdvice } from './shell-parse.mjs';
 import { flattenProgram, newWriteFrame, exportRecords, writtenTo, writtenCandidates, joinedReadings, writtenNamesIn, writeSignature, unmodelledBefore, sedArgsUnsafe, sedWriteTargets, sedInPlaceArg, awkArgsPure, sortArgsPure, flowStart, inFlow } from './line-writes.mjs';
 import { ZSH_MODIFIED, zshModifiedNames, scriptCandidates, execLineOf, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, countScript, countReading, substitute, GuardLimit, execLinesOf, paramReadings, readingsOf, UNKNOWN_WORD, assigningDefaults, spliceLines } from './script-candidates.mjs';
 import { SETS_BY_NAME } from './git-policy.mjs';
@@ -5199,8 +5199,7 @@ function evaluateBashForFilesFrame(command, opts) {
   //    everything after the `fi` are read against every directory known (the chain ends);
   //  - inside a subshell, group or body entered with a live chain, `;` keeps the chain until a command that may change the directory has run there.
   const narrowShapes = (top) => {
-    const evAt = new Map();
-    for (const e of cmds.shape) { const l = evAt.get(e.at); if (l) l.push(e); else evAt.set(e.at, [e]); }
+    const evAt = shapeAt(cmds.shape);
     const joinAfter = (k) => { // the join that follows top[k]: the next command's own, `then` reads as &&, a `}` is looked through, any other closer ends the construct
       for (const e of evAt.get(k + 1) ?? []) {
         if (e.kind === '}') continue;
@@ -5222,30 +5221,7 @@ function evaluateBashForFilesFrame(command, opts) {
     // #410: `cd DIR || exit 1` (also `|| exit`; not `|| return`, see below): when the cd fails the shell leaves, so whatever runs after the exit command surely follows a cd that succeeded. The exit must be a plain command of its own
     // (not a pipeline stage or a background job: those leave only a subshell), in the same construct as the cd.
     // (the same for a brace group, `cd DIR || { echo "no dir"; exit 1; }`: its last command is the exit and every command before it is joined by ; or a newline, so the exit surely runs when the group does)
-    const leavesAfter = (k) => { // the index of the command that surely follows a cd that succeeded, or -1
-      const x = top[k + 1];
-      if (x === undefined) return -1;
-      const opens = evAt.get(k + 1);
-      let last = k + 1; // (the command that must be the exit, and the index of the command after the construct)
-      if (opens !== undefined) {
-        if (opens.length !== 1 || opens[0].kind !== '{' || opens[0].sep !== '||') return -1;
-        let j = k + 2;
-        while (j < top.length && !evAt.has(j)) j++;
-        const closes = evAt.get(j);
-        if (closes === undefined || closes.length !== 1 || closes[0].kind !== '}') return -1;
-        for (let m = k + 2; m < j; m++) if (top[m].sep !== ';') return -1;
-        last = j - 1;
-      } else if (x.sep !== '||' || evAt.has(k + 2)) return -1;
-      const e = top[last];
-      // R1-B1 (Codex round 1): only `exit` counts. A top-level `return` is an error and the shell goes on (it leaves only inside a function or a sourced file, and a function is no shape that is narrowed at all).
-      // R1-B2: a redirection on the exit, or on the group's closer (`} < f`, read as a command of no words that holds it), may fail before the exit runs, and then the shell goes on: no narrowing.
-      // (a redirection on a command before the exit, `{ echo no >&2; exit 1; }`, only fails that command)
-      // R1-F1: `exit` alone or with ONE literal number; `exit 1 2` is refused ("too many arguments") and the shell goes on, and a run-time word (`exit $X`) may split into two
-      if (!plainExit(e)) return -1; // (shell-parse's plainExit: the one rule, the git guard's orExits reads it too)
-      if (last !== k + 1 && top[last + 1] !== undefined && top[last + 1].argv.length === 0 && (top[last + 1].redirects ?? []).length > 0) return -1;
-      const y = top[last + 1];
-      return y === undefined || y.sep === ';' || y.sep === '&&' ? last + 1 : -1;
-    };
+    const leavesAfter = (k) => exitFollows(top, evAt, k); // the index of the command that surely follows a cd that succeeded, or -1 (shell-parse's one rule, the git guard's orExits reads it too)
     let resume; // (the chain a cd leaves for the command after its `|| exit`, { at, chain })
     let known = unique([ctx.cwd, ...seedDirs]); // where the shell can be so far
     let chain = null; // the directories after an &&-joined run of sure cd's

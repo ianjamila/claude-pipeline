@@ -15,7 +15,7 @@
 import { existsSync, readFileSync, statSync, realpathSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { UNDECIDABLE_HEREDOC, plainExit, sourcePathSearch, commandName, simpleCommands, splitArgs, scriptFileOf, scriptFeedsOf, sqlShellEscapes, startupFilesOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, splicesOptions, spliceText, implicitBindsOf, ZSH_NAME_BINDERS, SHELL_SET_NAMES, withoutLiteralText, INDIRECT_EXPANSION, indirectExpansionOnLine, arithAssignedNames, envUnset, refusalAdvice } from './shell-parse.mjs';
+import { UNDECIDABLE_HEREDOC, plainExit, exitFollows, shapeAt, sourcePathSearch, commandName, simpleCommands, splitArgs, scriptFileOf, scriptFeedsOf, sqlShellEscapes, startupFilesOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, splicesOptions, spliceText, implicitBindsOf, ZSH_NAME_BINDERS, SHELL_SET_NAMES, withoutLiteralText, INDIRECT_EXPANSION, indirectExpansionOnLine, arithAssignedNames, envUnset, refusalAdvice } from './shell-parse.mjs';
 export { withoutLiteralText, INDIRECT_EXPANSION, SETS_BY_NAME };
 import { PM_RUN_ALIASES, PM_WRAPPERS, pmScriptOf, pmCannotRunScript, pmCall, pmMoverName, packageScripts, localBin, nameAtRunTimeIn, markPackageState, pkgOwnWrite, pkgMarkersFor, pmStartDirs, binIsProgram, binSite, binInterpreter, MAX_BIN_INTERPRETERS, lineNames, defaultLexists } from './package-scripts.mjs';
 import { catchAllReason, guardedCommandText, dataLessArgs } from './guarded-text.mjs';
@@ -2825,6 +2825,14 @@ function evalString(str, startDir, ctx, level, child = false) {
   checkDeadline(ctx.budget);
   if (level > MAX_NESTING) return deny('pipeline job start / alias is nested too deeply to verify.');
   const cmds = simpleCommands(str, { env: ctx.env, bashState: ctx.bashState, expired: () => ctx.budget.now() > ctx.budget.deadline }); // a scan that outlasts the deadline gives up: truncated, so denied
+  // #452: the group form `cd d || { echo "no d" >&2; exit 1; }; git push`, read by shell-parse's exitFollows, the files guard's rule (a group entered by ||, its last command a plain exit, no redirection on its closer)
+  let shapeTop; // (the commands of the text's own level and their shape events, built when first asked)
+  const exitsAsGroup = (i) => {
+    if (!cmds.shape || cmds[i].depth > 0) return false;
+    shapeTop ??= { top: cmds.filter((c) => !(c.depth > 0)), evAt: shapeAt(cmds.shape) }; // (the commands inside a substitution are listed before the one that holds them; the events count the text's own level only)
+    const k = shapeTop.top.indexOf(cmds[i]);
+    return k >= 0 && exitFollows(shapeTop.top, shapeTop.evAt, k) >= 0;
+  };
   // Truncated means part of the line was never looked at, so nothing on it can be called harmless (`g''it push` after
   // 500 `true;` must not slip through on a word match).
   if (cmds.undecidable) return deny(UNDECIDABLE_HEREDOC);
@@ -2912,7 +2920,8 @@ function evalString(str, startDir, ctx, level, child = false) {
       // (#427, the same rule as the files guard's cd narrowing: only a plain `exit`, alone or with one number, leaves: not `return` (an error at top level), not an exit with a redirection or extra words, and no
       // redirection on the closer of its group, `{ exit 1; } < f`, which the parser lists as a command of no words right after it)
       const orExits = cmds[i + 1]?.sep === '||' && plainExit(cmds[i + 1]) && cmds[i + 2]?.sep !== '|' && cmds[i + 2]?.sep !== '&'
-        && !(cmds[i + 2] !== undefined && cmds[i + 2].argv.length === 0 && (cmds[i + 2].redirects ?? []).length > 0);
+        && !(cmds[i + 2] !== undefined && cmds[i + 2].argv.length === 0 && (cmds[i + 2].redirects ?? []).length > 0)
+        || (changesState && cmds[i + 1]?.sep === '||' && exitsAsGroup(i));
       if (changesState && (inFlow(from, i) || c.depth > 0 || c.sep === '&&' || c.sep === '||' || ranInSubshell(cmds, i) || (cmds[i + 1]?.sep === '||' && !orExits))) uncertain = true;
     }
     // (Phase 3b, Fable attacker pass: `env -C D gh pr merge …` / `sudo -D D …` run the command in D, which the merge check never saw from a
