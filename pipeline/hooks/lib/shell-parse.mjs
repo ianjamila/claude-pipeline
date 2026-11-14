@@ -13,9 +13,10 @@
 import { sqlShellEscapes, sqlFamilyOf, sqlClientPlan, SQL_CLIENT_NAMES, SQL_RC_MENTION } from './sql-clients.mjs';
 const MAX_COMMANDS = 500;
 // (#352 R22-F1: a named-descriptor word `{fd}` before a redirect operator; bash >= 4.3 also takes an array element (`{a[0]}>f` assigns the number to a[0]), any subscript: a nested one too (`{a[b[0]]}`, R23-B1))
-const FD_NAME_WORD = /^\{([A-Za-z_]\w*)(?:\[.*\])?\}$/;
-// (#352 R23-F1: bash ignores quoting inside the subscript of a named-descriptor word (`{a['0']}>f`, `{a[$'0']}>f`): the RAW word of a quoted one is matched)
-const FD_SUB_RAW = /^\{[A-Za-z_]\w*\[.*\]\}$/;
+const FD_NAME_WORD = /^\{([A-Za-z_]\w*)(?:\[.*\])?\}$/s; // (s: a subscript may hold a newline, inside a substitution: R24-B1)
+// (#352 R23-F1: bash ignores quoting inside the subscript of a named-descriptor word (`{a['0']}>f`, `{a[$'0']}>f`): the RAW word of a quoted one is matched, newlines included (R24-B1), after its line
+// continuations are removed, as the shell removes them before it reads the word (`{a\<newline>['0']}>f`, R24-F1))
+const FD_SUB_RAW = /^\{[A-Za-z_]\w*\[.*\]\}$/s;
 const MAX_NEST = 200; // in-place nesting of $( ), ( ), <( ) before we give up on the line
 const MAX_WORK = 8_000_000; // total characters lexed across all recursive parses
 const HARD_MAX_DEPTH = 50;
@@ -2453,7 +2454,9 @@ class Parser {
       const subs = wsubs;
       const one = wspans.length > 0 && wspans[0][0] === 0 && wspans[0][1] === text.length; // (the first span covers the whole text: no other can follow it)
       const from = wstart;
-      const fdw = /[<>]/.test(s[this.i] ?? '') && (q < 0 ? FD_NAME_WORD.test(text) : FD_SUB_RAW.test(s.slice(from, this.i))); // (a `{fd}>file` redirect prefix: R19-F2, R23-F1)
+      const fdw = /[<>]/.test(s[this.i] ?? '') && (q < 0 ? FD_NAME_WORD.test(text) : FD_SUB_RAW.test(s.slice(from, this.i).replace(/\\\r?\n/g, ''))); // (a `{fd}>file` redirect prefix: R19-F2, R23-F1, R24)
+      // (#352 R24-F2: the subscript of an indexed array is arithmetic, quotes removed, so `exec {a["x=5"]}>f` assigns x: a named descriptor whose subscript is anything but a plain number or name refuses the line)
+      if (fdw && (q >= 0 || (text.includes('[') && !/^\{[A-Za-z_]\w*\[(?:\d+|[A-Za-z_]\w*)\]\}$/.test(text)))) ctx.truncated = true;
       cur = '';
       inWord = false;
       qa = -1;

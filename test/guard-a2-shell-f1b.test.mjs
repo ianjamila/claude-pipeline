@@ -158,6 +158,11 @@ test('#352 R23-B1, R23-F1, R23-F2: nested / quoted subscripted descriptors rebin
     const sfs = fakeFs(PROJ, { 'run.sh': `${body}\necho '{}' > .review/round-$F/arbiter-output.json\n` }, [...DIRS, '.review']);
     assert.equal(files('export F=22; sh run.sh', sfs).decision, 'deny', body);
   }
+  // (#352 R24-F2: a subscript is arithmetic, quotes removed: `exec {a["F=x"]}>f` assigns F, also a name the script inherited)
+  for (const body of ['exec {a["F=x"]}>/dev/null', 'exec {a[F=x]}>/dev/null', "exec {a['F=x']}>/dev/null"]) {
+    const sfs = fakeFs(PROJ, { 'run.sh': `${body}\necho '{}' > .review/round-$F/arbiter-output.json\n` }, [...DIRS, '.review']);
+    assert.equal(files('export F=22; bash run.sh', sfs).decision, 'deny', body);
+  }
   // unchanged: a real brace group assigns
   const ok = fakeFs(PROJ, { 'run.sh': "{ F=x; }\necho '{}' > /tmp/round-$F.json\n" }, [...DIRS, '.review']);
   assert.equal(files('export F=22; sh run.sh', ok).decision, 'allow');
