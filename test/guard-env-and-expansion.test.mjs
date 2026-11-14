@@ -30,6 +30,7 @@ const DENY = [
   ['openssl: -out in a variable', `O=-out; openssl dgst $O ${S} /tmp/x`],
   // (b) `$_` is the last word of the previous command: a name only known at run time
   ['tee $_ after echo S', `echo ${S}; tee $_ < /tmp/payload`],
+  ['tee $_ after echo TR (the twin of the `$_x` control)', `echo ${TR}; tee $_ < /tmp/payload`],
   ['node $_ after cat TR', `cat ${TR}; node evil.mjs $_`],
   ['cp to $_ after echo S', `echo ${S}; cp /tmp/payload $_`],
   ['a redirect to $_ after echo S', `echo ${S}; echo x > $_`],
@@ -72,7 +73,9 @@ const ALLOW = [
   ['git with an ordinary variable prefix', 'FOO=1 git status'],
   ['a plain command naming $_ with no protected file on the line', 'echo hi; cat $_'],
   ['a read-only command given $_ on a line that names a protected file', `echo ${S}; cat $_`],
-  ['$_x is another name', `echo ${S}; tee $_x < /tmp/payload`],
+  // (a transcript, not the settings file: a line naming a hook-declaring file with input fed into a program is refused by the fed-interpreter rule whatever the variable is called;
+  // a transcript is protected for the `$_` rule (see the deny for `cat TR; node evil.mjs $_`) but declares no hook, so only the `$_` vs `$_x` distinction decides)
+  ['$_x is another name', `echo ${TR}; tee $_x < /tmp/payload`],
   ['sed with a $1 in a quoted program on a protected file', `sed -n 's/a/b/p' ${TR}`],
   ['awk with $1 in the program on a transcript', `awk '{print $1}' ${TR}`],
 ];

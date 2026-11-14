@@ -34,7 +34,8 @@ const SCAN_STATE_FILE = 'agent-log-close.json';
 const PHT_OFFSET_MS = 8 * 3600 * 1000; // Asia/Manila is UTC+8 all year, no DST
 
 const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-const PENDING_RE = new RegExp(`^- (\\S+) · #(\\d+) · .* · ${escapeRe(DEFAULT_OUTCOME)}$`);
+// (`pipeline summary` may end the line with its weekly Codex figure, codex-usage.mjs codexUsageSuffix: still pending)
+const PENDING_RE = new RegExp(`^- (\\S+) · #(\\d+) · .* · ${escapeRe(DEFAULT_OUTCOME)}(?: · Codex \\d+d: \\d+ runs? \\([^()]*\\))?$`);
 const RESOLUTION_RE = /^- \S+ · #(\d+) · prod smoke (\S+) · deploy (\S+) · observed (\d{4}-\d{2}-\d{2}) (\d{2}:\d{2}) · run (\d+)$/;
 
 /** A PHT wall clock for an instant (ms): { date: 'YYYY-MM-DD', time: 'HH:mm' }. Fixed +8h shift, host-zone-proof. */

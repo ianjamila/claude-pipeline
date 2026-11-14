@@ -109,3 +109,20 @@ test('EW #1533: round 5 ran before grants (rounds 6 to 9 granted): refused with 
   assert.deepEqual(after.granted.map((g) => [g.n, g.past === true]), [[5, true], [6, false], [7, false], [8, false], [9, false]]);
   assert.equal(w.published().rounds.find((r) => r.n === 5).ownerGrant.past, true);
 });
+
+// #269 R26-F1: --ask with --past answers with ask: null and a reason (a past round is approved by typing), never with neither key, and issues no ask.
+test('round-request --past --ask: the line as without --ask, plus ask null and askSkipped (a past round is approved by typing)', (t) => {
+  const w = world(t, [
+    { n: 1, admission: 'normal' }, { n: 2, admission: 'normal' }, { n: 3, admission: 'normal' }, { n: 4, admission: 'auto-extra' },
+    { n: 5 }, { n: 6, granted: true }, { n: 7, granted: true }, { n: 8, granted: true }, { n: 9, granted: true },
+  ]);
+  const plain = w.cli(['triage', 'round-request', '--pr', '7', '--past']);
+  assertExit(plain, 0, plain.stderr + plain.stdout);
+  assert.equal('ask' in plain.json, false, 'without --ask nothing is added');
+  const asked = w.cli(['triage', 'round-request', '--pr', '7', '--past', '--ask']);
+  assertExit(asked, 0, asked.stderr + asked.stdout);
+  assert.equal(asked.json.line, plain.json.line);
+  assert.equal(asked.json.past, true);
+  assert.equal(asked.json.ask, null);
+  assert.match(asked.json.askSkipped, /past round is approved by typing/);
+});

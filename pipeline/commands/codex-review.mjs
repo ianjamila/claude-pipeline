@@ -29,7 +29,7 @@ import { headSha, revParse } from '../lib/git.mjs';
 import { admitRound, baseOnlyFindings, headMoved, planRound, recordRound, roundPrompt, routeConfigFor, unavailable } from '../lib/review-round.mjs';
 import { roundDir, writeFileAtomic } from '../lib/review-context.mjs';
 import { createGitHub } from '../lib/github.mjs';
-import { noteCodexAnswered, noteQuotaStop } from '../lib/codex-usage.mjs';
+import { noteCodexAnswered, noteQuotaStop, recordCodexRun } from '../lib/codex-usage.mjs';
 import { higherRisk, maxRiskOf } from '../lib/state.mjs';
 import { substituteAgentFor } from '../lib/triage.mjs';
 import {
@@ -97,6 +97,8 @@ export const meta = {
     '  every Codex attempt first replaces .review/round-R/route.json with {attemptId, evidence:pending, round, base, head, patchSha256, risk, agent, at} and keeps its files in',
     '    round-R/attempt-<attemptId>/ (codex-raw.json, prompt.md). The final evidence (quota | none) and a recorded round are written under the review lock and a per-PR route lock (review, then route; the pending record takes the route lock alone, so a held review lock never stops Codex from starting) only while route.json still',
     '    holds this attempt in pending, else exit 2 {error:superseded} (nothing written, nothing deleted); the winner\'s files are copied to round-R/. The file is written by this command only',
+    '  every real Codex run (not a base-only round), answered or failed, adds one line to <home>/.claude/pipeline-state/codex-usage.jsonl (the weekly figure `pipeline summary` prints);',
+    '    a ledger that cannot be written never fails the round: it adds warnings:[…] to the reply',
     '  env: PIPELINE_CODEX_TIMEOUT_MS overrides the 30 minute Codex timeout, PIPELINE_CODEX_CAPACITY_RETRY_MS the 30 second wait before the capacity retry (tests)',
   ].join('\n'),
 };
@@ -249,16 +251,22 @@ export const run = guarded(async (argv, ctx) => {
       ...(ran?.retried ? { retried: ran.retried } : {}),
       ...(quotaStop || (reason === 'quota' && ran?.quota) ? { quota: { proof: ran.quota.proof, resetAt: ran.quota.resetAt, resetText: ran.quota.resetText } } : {}),
       substitute: verdict,
-      ...(warnings.length > 0 ? { warnings } : {}),
+      ...(warnings.length + usageWarnings.length > 0 ? { warnings: [...warnings, ...usageWarnings] } : {}),
     });
   };
 
   // Runs Codex over the prepared prompt and returns its validated findings (every failure is an exit-3 Fail).
+  const usageWarnings = [];
   const askCodex = async () => {
     // execCodex removes whatever is at the output path first (so it can never be read as this run's answer; the mtime check in
     // readCodexAnswer is the second line of defence, the tree kill on timeout the third).
     writeFileAtomic(path.join(attempt.dir, 'prompt.md'), promptBytes);
     const ran = await execCodex({ root, env: ctx.env, args, promptBytes, outPath });
+    // One line per real Codex run, kept or not (the weekly figure in the agent-log line); a ledger that cannot be written is a warning.
+    const logged = recordCodexRun({
+      kind: 'review', repo: adm.state?.repo || repoSlug(), pr, round, effort, model, ok: ran.ok, resolutionOnly,
+    }, { env: ctx.env, ...(ctx.home ? { home: ctx.home } : {}) });
+    if (!logged.ok) usageWarnings.push(logged.warning);
     if (!ran.ok) throw await failed(ran.reason, { code: ran.code, timedOut: ran.timedOut, detail: ran.detail }, { ran, detail: ran.detail });
 
     if (headSha(o) !== head) throw headMoved();
@@ -313,7 +321,7 @@ export const run = guarded(async (argv, ctx) => {
       },
       ...(baseOnly ? { baseOnly: true } : {}),
       ...(retried ? { retried } : {}),
-      ...(warnings.length > 0 ? { warnings } : {}),
+      ...(warnings.length + usageWarnings.length > 0 ? { warnings: [...warnings, ...usageWarnings] } : {}),
       ...(resolutionOnly ? { resolutionOnly: true, conflicted: resolutionView.conflicted, conflictedCount: resolution.conflictedCount } : {}),
       ...(resolutionIneligible === undefined ? {} : { resolutionIneligible }),
       ...(grantUsed === undefined ? {} : { grantUsed }),
