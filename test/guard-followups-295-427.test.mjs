@@ -206,6 +206,22 @@ describe('#300: a contents merge into the home directory (or a parent of it) is 
     ['R1-B4: a run-time folder name, then a file below it, into home', 'rsync -a /tmp/"$X"/sub ~/'],
     ['R1-B4: cp of a run-time file into home (everyday)', 'cp "$f" ~/'],
   ]);
+  // R2-B1 / #459: an unquoted value of a same-line name is split on blanks into words (a quoted one stays one word)
+  decide('deny', [
+    ['R2-B1: a flags name holding --include n (the n is a value, no dry run)', "FLAGS='-a --include n'; rsync $FLAGS /tmp/x/ ~/"],
+    ['R2-B1: --info=progress2 in a flags name', "OPTS='-a --info=progress2'; rsync $OPTS /tmp/x/ ~/"],
+    ['R2-B1: --human-readable in a flags name', "OPTS='-a --human-readable'; rsync $OPTS /tmp/x/ ~/"],
+    ['R2-B1: --inplace --numeric-ids in a flags name', "OPTS='-a --inplace --numeric-ids'; rsync $OPTS /tmp/x/ ~/"],
+    ['#459: the operands inside a flags name', "A='-a /tmp/x/'; rsync $A ~/"],
+    ['#459: two sources in one name', "S='/tmp/x/ /tmp/y'; rsync -a $S ~/"],
+    ['#459: an empty last word is dropped, not the destination', "X=; rsync -a /tmp/x/ ~/ $X"],
+  ]);
+  decide('allow', [
+    ['R2-B1: a flags name, a folder by name', "OPTS='-a --info=progress2'; rsync $OPTS /tmp/x ~/"],
+    ['R2-B1: a flags name that is a real dry run', "OPTS='-an'; rsync $OPTS /tmp/x/ ~/"],
+    ['R2-B1: a flags name with a dry run among its words', "OPTS='-a -n'; rsync $OPTS /tmp/x/ ~/"],
+    ['#459: a quoted name stays one word (its value is the one source)', "S='/tmp/x y'; rsync -a \"$S\" ~/proj/"],
+  ]);
   decide('deny', [
     ['R1-B3: `--` ends the options', 'rsync -a -- /tmp/x/ ~/'],
     ['R1-B3: --rsh=VALUE then the operands', 'rsync -a --rsh=ssh /tmp/x/ ~/'],

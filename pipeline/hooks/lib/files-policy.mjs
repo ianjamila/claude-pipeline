@@ -2656,16 +2656,23 @@ const RSYNC_VALUE_LONG = new Set(['rsh', 'rsync-path', 'max-delete', 'max-size',
   'usermap', 'groupmap', 'iconv', 'skip-compress', 'compress-level', 'compress-choice', 'zc', 'zl', 'checksum-choice', 'cc', 'checksum-seed', 'modify-window', 'write-batch', 'only-write-batch', 'read-batch',
   'protocol', 'info', 'debug', 'outbuf', 'stop-after', 'time-limit', 'stop-at', 'remote-option', 'copy-as', 'early-input', 'max-alloc']);
 const RSYNC_VALUE_SHORT = new Set(['e', 'f', 'B', 'T', 'M', '@']);
-function rsyncOperands(words, ctx) {
+// R2-B1 / #459: an UNQUOTED word that a same-line name changed is several words (its value split on blanks; an empty value is none), each read as an argument of its own: `FLAGS='-a --include n'; rsync $FLAGS SRC/ ~/`
+// is not a cluster with an n in it, `A='-a /tmp/x/'` holds an operand, `X=; … $X` leaves no last word. A quoted word (cmd.quotedWords) stays one.
+function rsyncOperands(words, ctx, quoted) {
+  const items = []; // [as written (or the piece), as expanded]
+  for (const w of words.slice(1)) {
+    if (ctx.budget) checkDeadline(ctx.budget);
+    if (!RUNTIME_PART.test(w)) { items.push([w, w]); continue; }
+    const e = expandRefs(w, ctx);
+    if (e === w || quoted?.has(w)) items.push([w, e]);
+    else for (const piece of e.split(/\s+/)) if (piece !== '') items.push([piece, piece]);
+  }
   const pos = [];
   const expanded = [];
   let dry = false;
   let rest = false;
-  const args = words.slice(1);
-  for (let i = 0; i < args.length; i++) {
-    if (ctx.budget) checkDeadline(ctx.budget);
-    const w = args[i];
-    const e = RUNTIME_PART.test(w) ? expandRefs(w, ctx) : w;
+  for (let i = 0; i < items.length; i++) {
+    const [w, e] = items[i];
     if (!rest && e === '--') { rest = true; continue; }
     if (!rest && e.length > 1 && e[0] === '-') {
       if (e[1] === '-') {
@@ -4854,7 +4861,7 @@ function evaluateBashForFilesFrame(command, opts) {
       let dests;
       let sources;
       if (name === 'rsync') {
-        const r = rsyncOperands(words, ctx);
+        const r = rsyncOperands(words, ctx, c.quotedWords);
         if (r.dry) return false;
         if (r.pos.length < 2) return false;
         dests = [r.pos[r.pos.length - 1]];
