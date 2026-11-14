@@ -23,7 +23,8 @@ function emitter(w) {
   return (code, json, ms = 0) => ['node', file, String(code), json, String(ms)];
 }
 const startJob = (w, tag, cmd, env = {}) => assertExit(w.cli(['job', 'start', '--tag', tag, 'codex-r1', '--', ...cmd], env), 0);
-const untilExists = async (file, ms = 15_000) => {
+// generous: a loaded machine (shared dev Mac, load 80+) needs well over 15 s to start a detached job
+const untilExists = async (file, ms = 60_000) => {
   const end = Date.now() + ms;
   while (!existsSync(file)) {
     if (Date.now() > end) throw new Error(`timed out waiting for ${file}`);
