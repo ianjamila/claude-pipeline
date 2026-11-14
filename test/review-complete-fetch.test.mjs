@@ -14,6 +14,7 @@ import { fileURLToPath } from 'node:url';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
 import { createFakeGh, pipelineYml, REPO_VIEW } from './helpers/fakegh-env.mjs';
 import { assertExit } from './helpers/assert-exit.mjs';
+import { floorEnv } from './helpers/floor-env.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const bin = join(here, '..', 'pipeline', 'bin', 'pipeline.mjs');
@@ -74,7 +75,7 @@ function world(t, { withOrigin = true, accept = false } = {}) {
     cli(args, env = {}) {
       const r = spawnSync(process.execPath, [bin, ...args], {
         cwd: repo.dir, encoding: 'utf8',
-        env: { ...process.env, ...fake.env, PIPELINE_CODEX: `node "${fakeCodex}"`, PIPELINE_LOCK_DIR: lockDir, ...env },
+        env: { ...process.env, ...fake.env, PIPELINE_CODEX: `node "${fakeCodex}"`, PIPELINE_LOCK_DIR: lockDir, ...floorEnv(), ...env },
       });
       let json = null;
       try { json = r.stdout ? JSON.parse(r.stdout) : null; } catch { /* the assertion on json will say so */ }
@@ -194,6 +195,13 @@ test('origin is unreachable and the content has no covering round: review-comple
   const w = world(t);
   w.repo.git(['remote', 'set-url', 'origin', join(w.scratch, 'does-not-exist.git')]);
   w.prHead(w.head);
+  // A fixture clone made by hand has no refs/remotes/origin/HEAD, so with the remote unreachable nothing anchors the default branch except the working tree's own config, which a PR can edit (#377, S1):
+  // the base config is untrusted, the PR needs the Fable pass and the substitute is off. That is intended, not a regression of the cached-ref behaviour.
+  const unanchored = w.cli(['review-complete', '--pr', '7']);
+  assertExit(unanchored, 1, unanchored.stderr + unanchored.stdout);
+  assert.match(unanchored.json.reason, /needs the Fable review pass.*could not be anchored on the remote/);
+  // A real clone has origin/HEAD (git clone sets it): that cached anchor is a source a PR cannot edit, so the cached-ref behaviour below holds offline.
+  w.repo.git(['remote', 'set-head', 'origin', 'main']);
   const ok = w.cli(['review-complete', '--pr', '7']);
   assertExit(ok, 0, ok.stderr + ok.stdout);
 
