@@ -299,6 +299,14 @@ export function createGitHub({ cwd, env, ghFn = gh } = {}) {
       return { id: r.id, url: r.html_url, action: existing ? 'updated' : 'created' };
     },
 
+    // Edits the comment the caller already found (id from its own fresh read of the newest viewer-authored marker comment): no second listing (#396).
+    // The same marker rule as upsertComment: the body must start with it, or the next run could not find the comment again.
+    updateComment(id, marker, body) {
+      if (!String(body).startsWith(marker)) throw new Error('comment body must start with its marker, or the next run could not find it');
+      const r = api('PATCH', `repos/${self.repo().slug}/issues/comments/${id}`, { body });
+      return { id: r.id, url: r.html_url, action: 'updated' };
+    },
+
     // Always a NEW comment, never an edit: for append-only evidence (run events) that no later writer may overwrite.
     createComment(n, body) {
       const r = api('POST', `repos/${self.repo().slug}/issues/${prNumber(n)}/comments`, { body });

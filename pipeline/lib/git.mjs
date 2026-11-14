@@ -275,7 +275,7 @@ function historyProblem({ from, head, baseRef }, o) {
     if (parents.length === 1) return fail('history-nonmerge', `${cur} is not a merge commit`);
     if (parents.length > 2) return fail('history-octopus', `${cur} merges ${parents.length} parents`);
     if (parents.length === 0) return fail('history-not-first-parent', `${cur} is a root commit`);
-    if (!isAncestor(parents[1], baseRef, o)) return fail('history-foreign-merge', `${cur} merges ${parents[1]}, which is not on ${baseRef}`);
+    if (!isAncestor(parents[1], baseRef, o)) return fail('history-foreign-merge', `${cur} merges ${parents[1]}, which is not on ${displayRef(baseRef)}`);
     cur = parents[0];
   }
   return null;
@@ -720,9 +720,12 @@ export function reviewBaseRef(branch, o) {
   }
 }
 
+// The short, human-facing form of a ref reviewBaseRef returned (refs/remotes/origin/main -> origin/main).
+export const displayRef = (ref) => String(ref).replace(/^refs\/remotes\//, '');
+
 // The branch the remote itself calls its default (what refs/remotes/origin/HEAD points at), or null when the clone has none or it is not a plain
 // origin/<branch>, or that ref does not resolve (a dangling symref after a rename fetched with prune: git symbolic-ref does not need the target to exist). A
-// source a PR cannot edit: unlike .claude/pipeline.yml it is not part of the tree under review.
+// source a PR cannot edit: unlike .claude/pipeline.yml it is not part of the tree under review. The target is resolved fully qualified, like the symref was read.
 export function remoteDefaultBranch(o) {
   const out = gitOrNull(['symbolic-ref', '-q', 'refs/remotes/origin/HEAD'], 1, o);
   const m = /^refs\/remotes\/origin\/(.+)\n?$/.exec(out ?? '');

@@ -335,3 +335,29 @@ test('listIssuesByCreator: a 180 s timeout and a mid-pagination failure are GhEr
   assert.throws(() => scanGh({ code: 124, stdout: '[{"number":1}]', stderr: '', timedOut: true }).gh.listIssuesByCreator({ creator: 'me' }), GhError);
   assert.throws(() => scanGh({ code: 1, stdout: '[{"number":1}]', stderr: 'HTTP 502', timedOut: false }).gh.listIssuesByCreator({ creator: 'me', since: '2026-11-09T23:30:00Z' }), GhError);
 });
+
+// #396: writeSummaryComment holds the id of its own fresh read, so the write PATCHes that id; the comments are listed once (the read), not again for the write.
+test('writeSummaryComment PATCHes the id it read: no second listing of the comments; with no comment yet it creates one', async () => {
+  const { writeSummaryComment, readSummaryComment } = await import('../pipeline/lib/summary-comment.mjs');
+  const { MARKERS } = await import('../pipeline/lib/render.mjs');
+  const listings = (fake) => fake.lines().filter((l) => l.includes('issues/4/comments --paginate')).length;
+  const a = mk([
+    REPO, ME,
+    comments(
+      { id: 10, body: `${MARKERS.summary}\nold`, user: { login: 'me' } },
+      { id: 12, body: `${MARKERS.summary}\nnewer`, user: { login: 'me' } },
+      { id: 13, body: `${MARKERS.summary}\nsomeone else's`, user: { login: 'other' } },
+    ),
+    { match: '^api -X PATCH repos/acme/widgets/issues/comments/12 ', stdoutJson: { id: 12, html_url: 'https://x/12' } },
+  ]);
+  const existing = readSummaryComment(a.gh, 4);
+  assert.equal(listings(a.fake), 1);
+  const r = writeSummaryComment(a.gh, 4, { sections: 'new sections', existing });
+  assert.deepEqual([r.id, r.action], [12, 'updated']);
+  assert.equal(listings(a.fake), 1, 'the write did not list the comments again');
+  assert.ok(a.fake.lines().some((l) => l.includes('-X PATCH repos/acme/widgets/issues/comments/12 ')));
+
+  const b = mk([REPO, ME, comments(), { match: '^api -X POST repos/acme/widgets/issues/4/comments ', stdoutJson: { id: 99, html_url: 'https://x/99' } }]);
+  const created = writeSummaryComment(b.gh, 4, { sections: 'first' });
+  assert.equal(created.action, 'created');
+});
