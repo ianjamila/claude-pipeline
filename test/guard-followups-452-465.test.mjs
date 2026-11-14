@@ -53,3 +53,28 @@ describe('#452: the git guard reads `cd X || { …; exit 1; }` like the files gu
   NOT('the group is a background job', 'cd /other || { echo no; exit 1; } &\ngit push');
   NOT('the push is joined by ||', 'cd /other || { echo no; exit 1; } || git push');
 });
+
+// ---- #457: cp / install with -T (--no-target-directory) copy a folder's CONTENTS onto the destination ----
+describe('#457: cp -T / -rT / --no-target-directory into home or a parent of a protected path is a contents merge', () => {
+  decide('deny', [
+    ['cp -rT /tmp/x ~', 'cp -rT /tmp/x ~'],
+    ['cp -T /tmp/x ~/', 'cp -T /tmp/x ~/'],
+    ['cp -aT /tmp/x $HOME', 'cp -aT /tmp/x $HOME'],
+    ['cp -Tr /tmp/x /home/u', 'cp -Tr /tmp/x /home/u'],
+    ['cp -r -T /tmp/x ~', 'cp -r -T /tmp/x ~'],
+    ['cp --no-target-directory -r /tmp/x ~', 'cp --no-target-directory -r /tmp/x ~'],
+    ['cp -rT after a cd out of home', 'cd /tmp && cp -rT stage ~'],
+    ['install -T /tmp/x ~', 'install -T /tmp/x ~'],
+    ['sudo cp -rT /tmp/x ~', 'sudo cp -rT /tmp/x ~'],
+  ]);
+  decide('allow', [
+    ['cp -T a b in a project dir', 'cp -T a b'],
+    ['cp -rT /tmp/x ./build', 'cp -rT /tmp/x ./build'],
+    ['cp -aT src dist', 'cp -aT src dist'],
+    ['cp --no-target-directory a b', 'cp --no-target-directory a b'],
+    ['cp -T into a folder of home that holds no protected path', 'cp -rT /tmp/x ~/projects/site'],
+    ['cp -r /tmp/x ./build (no T)', 'cp -r /tmp/x ./build'],
+    ['cp a ~/notes.txt (no T: a file)', 'cp a ~/notes.txt'],
+    ['a T after -- is a file name', 'cp -r -- -T ./build'],
+  ]);
+});

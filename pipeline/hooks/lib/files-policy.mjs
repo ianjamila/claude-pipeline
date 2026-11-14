@@ -3148,6 +3148,7 @@ function splitOperands(argv, name) {
   const args = argv.slice(1);
   const pos = [];
   let target = null;
+  let noTarget = false; // (#457: -T / --no-target-directory, GNU cp and install: the destination IS the copy, a folder source lands as its contents)
   const dirMode = name === 'install' && args.some((a) => a === '-d' || a === '--directory');
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
@@ -3155,6 +3156,10 @@ function splitOperands(argv, name) {
     if (a === '-t' || a === '--target-directory') { target = args[++i]; continue; }
     if (a.startsWith('--target-directory=')) { target = a.slice('--target-directory='.length); continue; }
     if (/^-t.+/.test(a) && !a.startsWith('--')) { target = a.slice(2); continue; }
+    if (a === '--no-target-directory') noTarget = true;
+    else if (a.length > 1 && a[0] === '-' && a[1] !== '-') { // (a short cluster, read up to its first letter that takes a value: -t DIR, -S SUFFIX, install's -m MODE / -o OWNER / -g GROUP)
+      for (let j = 1; j < a.length && !'tSmog'.includes(a[j]); j++) if (a[j] === 'T') noTarget = true;
+    }
     if (a.length > 1 && a.startsWith('-')) continue;
     pos.push(a);
   }
@@ -3166,7 +3171,7 @@ function splitOperands(argv, name) {
     const b = posix.basename(trimSlashes(toPosix(src)));
     if (b && b !== '.' && b !== '..' && !/[*?[]/.test(b)) written.push(`${trimSlashes(d)}/${b}`);
   }
-  return { written, dests, sources };
+  return { written, dests, sources, noTarget };
 }
 
 // R1-B3 / R1-B2 (#300): rsync's own reading of its words (splitOperands is cp's: it takes `--exclude VALUE` / `--timeout 30` for operands and `-t` for a target directory). The options that take a
@@ -5432,6 +5437,8 @@ function evaluateBashForFilesFrame(command, opts) {
       });
       if (name !== 'rsync') {
         const r = splitOperands(words, name);
+        // #457: cp / install -T (--no-target-directory) copy the CONTENTS of a folder source onto the destination: `cp -rT /tmp/x ~` writes the staged protected files over the real ones, whatever the source is called
+        if (r.noTarget && (name === 'cp' || name === 'install') && r.dests.some(hit)) return true;
         return contents(r.dests, r.sources.map((s) => (RUNTIME_PART.test(s) ? expandRefs(s, ctx) : s))); // (R1-B4: the source as the shell will pass it)
       }
       // R3-F1: bash and zsh read a changed unquoted word differently; each reading that is no dry run is judged, and either one finding a contents merge counts
