@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import { cpuTimed } from './helpers/timing.mjs';
 import assert from 'node:assert/strict';
-import { splitArgs, simpleCommands, commandName, allRedirects, scriptFileOf } from '../pipeline/hooks/lib/shell-parse.mjs';
+import { splitArgs, simpleCommands, commandName, allRedirects, scriptFileOf, implicitBindsOf } from '../pipeline/hooks/lib/shell-parse.mjs';
 
 const argvs = (s, o) => simpleCommands(s, o).map((c) => c.argv.join(' '));
 const sorted = (a) => [...a].sort();
@@ -219,6 +219,33 @@ test('pathological nesting does not blow the stack or hang', () => {
     assert.ok(Array.isArray(cmds));
     assert.ok(ms < 5000, `finished in reasonable time (${Math.round(ms)} ms of CPU)`);
   }
+});
+
+// (#352 R21 pre-check: every construct level copies the list of enclosing levels (ctx.up), so 50 000 nested `{ ` used ~4 GB; nesting past MAX_NEST constructs refuses the line, as `$(` does)
+test('#352: deeply nested constructs ({ }, if, loops) are refused past the nesting limit, in bounded memory', () => {
+  for (const s of ['{ '.repeat(20000), 'if true; then '.repeat(20000), 'for x in y; do '.repeat(20000), 'while true; do '.repeat(20000)]) {
+    const h0 = process.memoryUsage().heapUsed;
+    const { r: cmds, ms } = cpuTimed(() => simpleCommands(s));
+    assert.equal(cmds.truncated, true, s.slice(0, 20));
+    assert.ok(ms < 2000, `${s.slice(0, 20)}: ${Math.round(ms)} ms of CPU`);
+    assert.ok(process.memoryUsage().heapUsed - h0 < 200e6, `${s.slice(0, 20)}: bounded memory`);
+  }
+  // ordinary nesting is untouched
+  const ok = simpleCommands('{ '.repeat(20) + 'git status' + '; }'.repeat(20));
+  assert.equal(ok.truncated, false);
+});
+
+// (#352 R23-F3: the named-descriptor scan of implicitBindsOf read a subscript up to its `]` from every `{name[`: quadratic on a run of `{a[` with no `]`, and a hook that times out allows. Any `{name[` now
+// reports the name (fail closed, linear), which also covers a nested or quoted subscript)
+test('#352 R23-F3: the named-descriptor name scan is linear and reports any subscripted name', () => {
+  const raw = ': ' + '{a['.repeat(50000) + '; true';
+  const { r, ms } = cpuTimed(() => implicitBindsOf({ argv: [':'], raw }));
+  assert.ok(ms < 300, `${Math.round(ms)} ms of CPU`);
+  assert.ok(r.includes('a'));
+  for (const [raw2, name] of [['{F[a[0]]}>/dev/null', 'F'], ["{a['0']}>/dev/null", 'a'], ['ls {k[0]}>/dev/null', 'k'], ['exec {k}>/dev/null', 'k'], ['{k} >/dev/null', 'k']]) {
+    assert.ok(implicitBindsOf({ argv: [], raw: raw2 }).includes(name), raw2);
+  }
+  assert.ok(!implicitBindsOf({ argv: ['echo'], raw: 'echo ${k} > f' }).includes('k'));
 });
 
 test('truncated is a non-enumerable property so deepEqual on the array is unaffected', () => {

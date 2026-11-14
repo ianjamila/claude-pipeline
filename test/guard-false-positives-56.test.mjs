@@ -552,6 +552,18 @@ test('#56 Fable review of 2edea61: a zsh precommand modifier, an option carrying
   allowBoth('for f in src/a.ts a.mjs; do cp $f /tmp/x/; done', SPEC);
 });
 
+// (#352 R20-F3: a line continuation inside the named-fd redirect still binds the name, like the plain line above)
+test('#352 R20-F3: exec {k}\\<newline>>/dev/null rebinds k as exec {k}>/dev/null does', () => {
+  const labels = (n) => (n === '7' || n === '10' ? ['pipeline-pause'] : []);
+  const fsx = fakeFs(GIT_ROOT, {}, DIRS);
+  assert.equal(git('k=5; exec {k}>/dev/null; gh issue close $k', fsx, { issueLabels: labels }).decision, 'deny');
+  assert.equal(git('k=5; exec {k}\\\n>/dev/null; gh issue close $k', fsx, { issueLabels: labels }).decision, 'deny');
+  assert.equal(git('k=5; exec {k\\\n}>/dev/null; gh issue close $k', fsx, { issueLabels: labels }).decision, 'deny');
+  // (push security review of 5f7cdd12: a leading {k}>f word is skipped from argv, and still rebinds k)
+  assert.equal(git('k=5; {k}>/dev/null true; gh issue close $k', fsx, { issueLabels: labels }).decision, 'deny');
+  assert.equal(git('k=5; {k}>/dev/null; gh issue close $k', fsx, { issueLabels: labels }).decision, 'deny');
+});
+
 test('#56 replay of 96848c2: template text the shell never expands, and zsh flags that cannot assign, are no indirect expansion', () => {
   const D = fakeFs(PROJ, {}, DIRS);
   for (const cmd of [

@@ -2210,6 +2210,15 @@ function dirLikeWord(cmds, ci, ctx, bases, fromFile = false) {
   if (w.length > MAX_DIR_WORD) return false;
   // (a sourced file is judged on its own text: the line's variables are not what its assignments leave, R18-F6)
   const e = fromFile ? w : expandRefs(w, ctx);
+  // (#352 merge of main: `exec {k}>f` / `{a[0]}>f`, an unquoted named-descriptor word right before `<` / `>`, opens a descriptor in zsh and bash >= 4.1 and is the command `{k}` in sh /
+  // bash 3.2, which have no AUTO_CD. Only zsh with IGNORE_BRACES reads it as a plain word (a `[N]` subscript then a glob): it runs a cd only when a directory named `{name…}` is there or
+  // made on the line. The brace is no run-time part here; the shell-parse side marks the line ctlBroken, so no cd on it is believed either)
+  const fdWord = /^\{([A-Za-z_]\w*)(?:\[\d+\])?\}$/.exec(w);
+  if (fdWord && typeof unq === 'string' && new RegExp(`(?:^|[\\s;&|(){}])${escapeRe(w)}(?=[<>])`).test(unq)) {
+    const like = (n) => typeof n === 'string' && n.startsWith(`{${fdWord[1]}`) && n.endsWith('}');
+    if (bases.some((d) => (ctx.readDir(d) ?? []).some((n) => like(n) && Array.isArray(ctx.readDir(pathsFor().join(d, n)))))) return true;
+    return makerOps(cmds).some((ops, k) => k !== ci && ops !== null && ops.some((q) => like(String(q).replace(/^(?:\.\/)+/, '').split('/')[0])));
+  }
   // (d) a run-time word, and a double-quoted word with no reference in it is literal text (`"a[@]"`)
   const rawWord = (c.raw ?? '').trim();
   const quotedLiteral = /^"[^"$`\\]*"$/.test(rawWord) || /^'[^']*'$/.test(rawWord);
@@ -3102,7 +3111,7 @@ function isReadOnly(cmd, ctx) {
   if (!argv.length) return false;
   const name = baseOf(argv[0]);
   const shadow = ctx.shadowed?.get(cmd);
-  if (shadow !== undefined && (shadow === 'all' ? !CD_CMDS.has(name) : !PATH_BUILTINS.has(name))) return false; // (#265 e)
+  if (shadow !== undefined && (shadow === 'all' ? !CD_CMDS.has(name) : !(PATH_BUILTINS.has(name) || (name === 'print' && ctx.selfZsh)))) return false; // (#265 e; zsh's print is a builtin a PATH change does not move, bash has none)
   const judged = judgedWords(name, argv.slice(1), ctx);
   if (judged.unknown) return false;
   if (evaluatesSubscript(name, argv.slice(1), ctx, cmd.raw)) return false;
@@ -3118,6 +3127,20 @@ function readOnlyWith(name, args, cmd, ctx, argv) {
   if (READ_ONLY.has(name)) {
     if (name === 'rg' && args.some((a) => a === '--pre' || a.startsWith('--pre='))) return false;
     return !(['less', 'more', 'bat', 'rg'].includes(name) && toolEnvTouched(cmd, ctx, GIT_TOOL_ENV));
+  }
+  // (#352 merge of main: zsh's print writes its words to standard output like echo; an option cluster before the first operand that binds a name (-v), feeds the history (-s / -S) or the
+  // edit buffer (-z), writes to a numbered descriptor (-u, -p) or prompt-expands its words (-P) is not read-only. A word after `-` / `--` or the first operand ends the options.
+  // R28-F2: an option that takes a value (-C -f -u -v -x -X) takes the rest of its cluster (`-C2`), or the next word when it ends the cluster (`-C 1`), and the scan goes on after it.)
+  if (name === 'print') {
+    for (let i = 0; i < args.length; i++) {
+      const a = args[i];
+      if (a === '-' || a === '--' || !/^[-+]/.test(a)) break;
+      for (let k = 1; k < a.length; k++) {
+        if ('vsSzuPp'.includes(a[k])) return false;
+        if ('CfxX'.includes(a[k])) { if (k === a.length - 1) i++; break; }
+      }
+    }
+    return true;
   }
   if (name === 'find') return !args.some((a) => FIND_UNSAFE.test(a));
   if (name === 'git') return gitReadOnly(args) && !toolEnvTouched(cmd, ctx, GIT_TOOL_ENV);
@@ -3327,6 +3350,9 @@ function collectVars(cmds, ctx) {
     if (k !== '*' && ws.includes(UNKNOWN_WORD) && raw !== undefined && !/\$\(|`/.test(raw) && (raw.startsWith('(') || /\$\{[^}]*[^\w}]/.test(raw))) unknown.add(name);
   }
   // Defensive (mutation check): with more assignments than the scan follows, the target is still judged by rawHit / pathHit on the expanded values (expandRefs) as on main.
+  // (#352 R23-F2: a line whose shape the parser cannot follow (cmds.ctlBroken: a bare { or } argument splits the word groups, so `echo { F=x }` reads as an assignment that never runs; a zsh form,
+  // a {fd} word) may or may not run what it assigns: every name it gives is only known at run time)
+  if (cmds.ctlBroken) for (const k of given.keys()) unknown.add(k);
   if (ctx.assigned?.has('*')) for (const k of given.keys()) unknown.add(k); // (more assignments than the scan follows: every name the line gives is only known at run time)
   if (aPins === null) for (const [k, r] of raws) if (r.size > 1) unknown.add(k);
   // Why (#76 / #81 t7 and the security follow-up): a name an arithmetic assigns (or appends to) holds a value the text does not give (see arithAssignedNames), whether or not the line gave it one
@@ -4282,7 +4308,10 @@ function sourcedEffects(text, ctx, depth = 0, seenFiles = new Set(), rep = false
   const out = { vars: new Map(), cds: [], all: false, unknownCd: false, bareCd: false, cdpath: cdpSeed || mentionsCdpath(text) }; // (#385: cdpSeed: the file that sources this one already had CDPATH in play)
   const cdpNow = () => ctx.cdpath === true || out.cdpath; // (R20-F1: read at each cd, a nested file may set it after this point; R19: a file that mentions CDPATH may set it: its plain cd names are not followed)
   const cmds = simpleCommands(text, { bashState: ctx.bashState, expired: () => ctx.budget.now() > ctx.budget.deadline });
-  if (cmds.truncated || cmds.dynamic) out.all = true;
+  // (#352 R23-F2: a script line whose shape the parser cannot follow (ctlBroken: a bare { or } argument that splits the word groups, `echo { F=x }`, a zsh condition-then-body form, a {fd} word) may or may
+  // not run the commands read from it: what it binds, and the directory it ends in, are unknown)
+  if (cmds.truncated || cmds.dynamic || cmds.ctlBroken) out.all = true;
+  if (cmds.ctlBroken) out.unknownCd = true; // (`echo { cd d }`: the cd may not run either)
   if (cmds.some((_, i) => dirLikeWord(cmds, i, ctx, [ctx.cwd], true))) out.unknownCd = true; // (R17: AUTO_CD: a command word that could be a directory runs a cd)
   const from = flowStart(cmds);
   const seen = new Map();
@@ -4298,7 +4327,7 @@ function sourcedEffects(text, ctx, depth = 0, seenFiles = new Set(), rep = false
   };
   for (const [i, c] of cmds.entries()) {
     const sure = !(inFlow(from, i) || c.depth > 0 || c.sep === '&&' || c.sep === '||' || c.sep === '|' || cmds[i + 1]?.sep === '|' || cmds[i + 1]?.sep === '&');
-    if (!c.argv.length) { for (const [k, v] of Object.entries(c.env ?? {})) set(k, v, sure); continue; }
+    if (!c.argv.length) { for (const [k, v] of Object.entries(c.env ?? {})) set(k, v, sure); for (const k of implicitBindsOf(c)) set(k, null, false); continue; } // (#352 R21-F1: a lone `{k}>f` binds k)
     const name = baseOf(c.argv[0]);
     const again = rep || repeats(cmds, i); // (R18: this command can run again: from a loop / function / trap of the line, or of the file itself)
     // Why: a function or alias the LINE defines may stand behind a name that looks harmless (`ls() { read F; }`), and a nameref (`declare -n r=F`) binds F through another name
@@ -4805,7 +4834,8 @@ function evaluateBashForFilesFrame(command, opts) {
   const markBound = (c) => {
     // (#56, Codex review of 8b86e2b; on main too: zsh `${(P)N::=~/.claude/settings.json}` / a bash `${!N…}` may set any name, like `export $N=…`)
     if (lineIndirect) { ctx.unknownAll = true; for (const k of Object.keys(ctx.vars)) { ctx.pickUnknown.add(k); ctx.unknownVars.add(k); ctx.srcChanged.add(k); } }
-    if (!c.argv.length) return;
+    // (#352 R21-F1: a lone `{k}>f` redirect has no argv and still binds k)
+    if (!c.argv.length) { for (const k of implicitBindsOf(c)) { ctx.pickUnknown.add(k); if (Object.hasOwn(ctx.vars, k)) ctx.unknownVars.add(k); } return; }
     const cn = baseOf(c.argv[0]);
     const names = [];
     // Why (#56, a live bypass on main): `F=/tmp/x; printf -v $N ~/.claude/settings.json; cp a $F` and `declare "$N=~/.claude"; cp a $HOME/settings.json`
@@ -5055,7 +5085,7 @@ function evaluateBashForFilesFrame(command, opts) {
     const at = ctx.frames.indexOf(frame);
     for (const d of unique([...assumedCwds(ctx), ...below])) {
       countCdRun(ctx.budget);
-      const r = evaluateBashForFiles(command, { ...opts, cwd: d, _assumedCwd: true, _writesOnly: true, _unknownCwd: false, _frames: ctx.frames.slice(0, at).map((f) => ({ ...f, recs: [...f.recs] })) });
+      const r = evaluateBashForFiles(command, { ...opts, cwd: d, _assumedCwd: true, _writesOnly: true, _unknownCwd: false, _selfZsh: ctx.selfZsh, _frames: ctx.frames.slice(0, at).map((f) => ({ ...f, recs: [...f.recs] })) });
       if (r.decision === 'deny') return deny(`after a cd into a directory known only at run time, ${r.reason} (judged as if the directory were ${d})${ctx.bareCd ? BARE_CD_HINT : ''}`);
     }
   }

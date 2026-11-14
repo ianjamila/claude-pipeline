@@ -868,14 +868,20 @@ export function binIsProgram(text, site = null) {
 // PATH are every node_modules/.bin from either of them upward. exists: file test.
 export function binSite(bin, runDir, exists, p = nodePath) {
   // (R3-B2: the PATH order is the run directory and its parents FIRST -- the manager puts the nearest node_modules/.bin of where it runs ahead of the others -- then the bin's own package directory)
-  const roots = [runDir, p.dirname(p.dirname(p.dirname(bin)))].filter((x) => typeof x === 'string');
+  const pkgRoot = p.dirname(p.dirname(p.dirname(bin)));
+  const roots = [runDir, pkgRoot].filter((x) => typeof x === 'string');
   // (compared in POSIX form: a Windows root is `D:\dir`, a shebang names `D:/dir/x` or `/dir/x` -- no drive: the current one --, and Windows names ignore case)
   const win = isWinModule(p); // (a drive letter is a drive on Windows only)
   const fold = (x) => { const s = toPosix(x); return win ? s.toLowerCase() : s; };
   const bare = (x) => (win ? x.replace(/^[A-Za-z]:(?=\/|$)/, '') : x);
   const under = (a, r) => a === r || a.startsWith(r.endsWith('/') ? r : `${r}/`);
+  // (#352: the file system root is not the project. The bin is also judged as run from every directory the line may be in, and from / every path -- /usr/bin/env too -- lies 'inside', so a plain
+  // `#!/usr/bin/env node` program was opened as a shell script. It still counts when it is the only root there is: a bin that really lives under /)
+  const atFsRoot = (r) => typeof r === 'string' && p.dirname(r) === r;
+  // (only a GUESSED run directory of / is dropped; the bin's own package directory is always kept, / included: a bin /node_modules/.bin/tool run from /sub is a project at /)
+  const insideRoots = roots.filter((r) => r === pkgRoot || !atFsRoot(r));
   return {
-    inside: (abs) => { const a = fold(abs); return roots.some((r) => { const q = fold(r); return under(a, q) || (win && !/^[A-Za-z]:/.test(a) && under(a, bare(q))); }); },
+    inside: (abs) => { const a = fold(abs); return insideRoots.some((r) => { const q = fold(r); return under(a, q) || (win && !/^[A-Za-z]:/.test(a) && under(a, bare(q))); }); },
     hasBin: (name) => findBin(name) !== null,
     findBin,
     resolve: (w) => (runDir ? p.resolve(runDir, w) : null),
