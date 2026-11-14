@@ -175,3 +175,4 @@ full record.
 - 2026-11-13 · #425 · Guard follow-ups: inherited tool settings, shadowed names, long scripts, cd &#124;&#124; {…}, CDPATH/quoting fixes, 15% faster (#265 #372 #379 #380 #383–#386 #393 #410–#412) · risk high · rounds 1 · arbiter 0 · blocked
 - 2026-11-13 · #426 · Trusted pipeline.yml keys: default branch, effort lanes and Codex model come from the base config (#377 #389 #394 #398) · risk high · rounds 1 · arbiter 0 · blocked
 - 2026-11-14 · #422 · Merge preview shows the items digest the real merge checks; hermetic gate-CLI tests (#417) · risk high · rounds 2 · arbiter 2 · awaiting-owner-merge
+- 2026-11-14 · #425 · Guard follow-ups: inherited tool settings, shadowed names, long scripts, cd &#124;&#124; {…}, CDPATH/quoting fixes, 15% faster (#265 #372 #379 #380 #383–#386 #393 #410–#412) · risk high · rounds 3 · arbiter 3 · awaiting-owner-merge
