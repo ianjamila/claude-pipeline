@@ -80,6 +80,7 @@ export function validateRulings(json, itemIds, { review = false } = {}) {
     if (!oneOf(r.confidence, CONFIDENCES)) errors.push(`${r.id}: confidence must be one of ${CONFIDENCES.join('|')}`);
     if (typeof r.reasoning !== 'string') errors.push(`${r.id}: reasoning must be a string`);
     if (r.scope !== undefined && r.scope !== OUT_OF_MODEL) errors.push(`${r.id}: scope must be "${OUT_OF_MODEL}" when given`);
+    else if (r.scope !== undefined && r.ruling !== 'FOLLOW-UP') errors.push(`${r.id}: scope is only allowed with ruling FOLLOW-UP`);
   }
   if (review) errors.push(...findingErrors(json.findings));
   else if (json.findings !== undefined) errors.push('findings are only accepted in a Fable review round');
@@ -140,6 +141,7 @@ function findingErrors(findings) {
     if (!oneOf(f.ruling, FINDING_DECISIONS)) errors.push(`${at}.ruling must be one of ${FINDING_DECISIONS.join('|')}`);
     if (!oneOf(f.confidence, CONFIDENCES)) errors.push(`${at}.confidence must be one of ${CONFIDENCES.join('|')}`);
     if (f.scope !== undefined && f.scope !== OUT_OF_MODEL) errors.push(`${at}.scope must be "${OUT_OF_MODEL}" when given`);
+    else if (f.scope !== undefined && f.ruling !== 'FOLLOW-UP') errors.push(`${at}.scope is only allowed with ruling FOLLOW-UP`);
   });
   return errors;
 }

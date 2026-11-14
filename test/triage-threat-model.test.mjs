@@ -96,13 +96,18 @@ test('applyRulings: F3(b) every path of the entry, old and new, must match the m
   assert.deepEqual([ok.final.needsHuman, ok.final.outOfModel], [false, 'guards']);
 });
 
-test('applyRulings: REJECT with scope out-of-model is still a human decision; an ACCEPT ignores the scope', () => {
-  const rej = item();
-  const [r] = apply([rej], [rule(rej, { ruling: 'REJECT' })]);
-  assert.deepEqual([r.final.decision, r.final.needsHuman, r.final.cause, r.final.outOfModel], ['REJECT', true, 'security-dismissal', undefined]);
-  const acc = item();
-  const [a] = apply([acc], [rule(acc, { ruling: 'ACCEPT' })]);
-  assert.deepEqual([a.final.decision, a.final.needsHuman, a.final.outOfModel], ['ACCEPT', false, undefined]);
+test('R1-F2 validateRulings: scope out-of-model is an error on a REJECT or an ACCEPT, on a ruling and on a Fable finding (only FOLLOW-UP may carry it)', () => {
+  for (const ruling of ['REJECT', 'ACCEPT']) {
+    const r = validateRulings({ rulings: [{ id: 'R1-B1', ruling, confidence: 'high', reasoning: 'r', scope: 'out-of-model' }] }, ['R1-B1']);
+    assert.equal(r.ok, false, ruling);
+    assert.match(r.errors.join(';'), /R1-B1: scope is only allowed with ruling FOLLOW-UP/, ruling);
+  }
+  const finding = { bucket: 'SUGGESTION', category: 'security', title: 't', file: 'a', line: 1, detail: 'd', ruling: 'ACCEPT', confidence: 'high', reasoning: 'r', scope: 'out-of-model' };
+  const f = validateRulings({ rulings: [], findings: [finding] }, [], { review: true });
+  assert.equal(f.ok, false);
+  assert.match(f.errors.join(';'), /findings\[0\]\.scope is only allowed with ruling FOLLOW-UP/);
+  assert.equal(validateRulings({ rulings: [], findings: [{ ...finding, ruling: 'FOLLOW-UP' }] }, [], { review: true }).ok, true);
+  assert.equal(validateRulings({ rulings: [{ id: 'R1-B1', ruling: 'REJECT', confidence: 'high', reasoning: 'r' }] }, ['R1-B1']).ok, true, 'no scope: unchanged');
 });
 
 test('applyRulings: low confidence and an unproven answer still park for a human', () => {
