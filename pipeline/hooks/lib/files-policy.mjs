@@ -3295,7 +3295,7 @@ function rsyncNamesSure(cmds, idx, ctx) {
     const out = [];
     if (/`|\$\(|\$\{?[^A-Za-z_{]|\$\{[A-Za-z_]\w*[^\w}]|\$$/.test(w)) return null;
     for (const m of w.matchAll(/\$\{?([A-Za-z_]\w*)/g)) out.push(m[1]);
-    return out;
+    return [...new Set(out)]; // (#483: a name repeated in one value is walked once)
   };
   const names = new Set();
   for (const w of cmds[idx].argv.slice(1)) {
@@ -3307,7 +3307,19 @@ function rsyncNamesSure(cmds, idx, ctx) {
   if (!names.size) return true;
   if (cmds.truncated || cmds.ctlBroken || ctx.unknownAll === true) return false;
   // is the name given its value once, by a command that surely runs before `limit`, whose value holds no name that is not itself sure before that command?
+  // #483: each (name, limit, hops) is worked out once (a value that repeats a dependency many times, level after level, would otherwise be walked exponentially often; hops is part of the key because the
+  // depth cap makes the answer depend on it), the deadline is polled on every step (a GuardLimit denies), and the flow start is worked out once
+  const memo = new Map();
+  const from = flowStart(cmds);
   const nameSure = (k, limit, hops) => {
+    if (ctx.budget) checkDeadline(ctx.budget);
+    const key = `${k}\0${limit}\0${hops}`;
+    if (memo.has(key)) return memo.get(key);
+    const ok = nameSureOnce(k, limit, hops);
+    memo.set(key, ok);
+    return ok;
+  };
+  const nameSureOnce = (k, limit, hops) => {
     if (SKIP_READING.has(k)) return true;
     if (ctx.unknownVars?.has(k) || ctx.pickUnknown?.has(k) || ctx.srcChanged?.has(k) || ctx.srcTouched?.has(k) || ctx.arith?.names?.has(k)) return false;
     const sites = [];
@@ -3324,7 +3336,7 @@ function rsyncNamesSure(cmds, idx, ctx) {
     const c = cmds[site];
     const sure = site < limit && (c.argv.length === 0 || SURE_BINDERS.has(baseOf(c.argv[0]))) && c.depth === 0
       && c.sep !== '&&' && c.sep !== '||' && c.sep !== '|' && c.sep !== '&' && cmds[site + 1]?.sep !== '|' && cmds[site + 1]?.sep !== '&'
-      && !mayNotRun(cmds, flowStart(cmds), site);
+      && !mayNotRun(cmds, from, site);
     if (!sure) return false;
     // (#478 R2-B2: a value that holds a name is only as sure as that name was before this site: `[ -n "$DRY" ] && N=-n; OPTS="-a --delete $N"`)
     const raw = Object.hasOwn(c.env ?? {}, k) ? c.env[k] : declAttrs(c.argv).assigns.find(([n]) => n === k)?.[1];
