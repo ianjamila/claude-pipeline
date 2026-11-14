@@ -874,6 +874,7 @@ export function implicitBindsOf(c) {
   const el = /^([A-Za-z_]\w*)\[[^\]]*\]\+?=/.exec(argv[0] ?? '');
   if (el) out.push(el[1]);
   for (const a of argv) { const fd = /^\{([A-Za-z_]\w*)\}$/.exec(a); if (fd) out.push(fd[1]); }
+  for (const m of String(c.raw ?? '').matchAll(/\{([A-Za-z_]\w*)\}(?=[<>])/g)) out.push(m[1]); // (R19-F2b: the `{fd}>f` word is not in argv any more; the segment text names it. Over-reading is the safe side: more names bound)
   if (/^\s*coproc\b/.test(String(c.raw ?? ''))) {
     out.push('COPROC', 'COPROC_PID');
     if (/^[A-Za-z_]\w*$/.test(argv[0] ?? '')) out.push(argv[0], `${argv[0]}_PID`);
@@ -3099,11 +3100,13 @@ class Parser {
 
   // Returns the command object that was emitted for this group of words (or null).
   finalizeGroup(words, seg) {
+    // (#352 R19-F2b: a `{fd}>file` redirect prefix is no word wherever it stands: `X=1 {fd}>f git push`, `command {fd}>f git push`, `git {fd}>f push` run git push. implicitBindsOf reads the names from the segment text)
+    words = words.filter((w) => w.fdRedir !== true);
     let i = 0;
     for (;;) {
       const w = words[i];
       if (!w || w.qa >= 0) break;
-      if (KEYWORDS.has(w.text) || w.fdRedir === true) i++; // (#352 R19-F2: `{fd}>/dev/null git push` runs git, not a command named `{fd}`)
+      if (KEYWORDS.has(w.text)) i++;
       else if (w.text === 'function' && i + 1 < words.length) i += 2;
       else break;
     }
