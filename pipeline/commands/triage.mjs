@@ -489,6 +489,16 @@ const packetItem = (i) => ({
 // and its final, and no verdict yet (secondReviewCheck again).
 const askedSnapshot = (items) => ({ digest: rulingContentDigest(items), finals: JSON.stringify(items.map((i) => [i.id, i.final ?? null])) });
 
+// The next step a refused-model second review gives once its packet is prepared (R2-F1). A reused attempt (handed back, or its tag already in a transcript) may already have run, so
+// the proof (--apply) comes FIRST and a new agent only on exit 2 not-found; a fresh one is one agent call and then --apply. Both name the call protocol (see the help text above).
+function substituteNextStep({ substitute, pr }) {
+  const apply = `\`pipeline triage second-review --apply --pr ${pr} --tag "${substitute.tag}"\``;
+  const call = `The call: description = \`${substitute.tag}\`, no model argument; prompt = the \`substitute.promptHeader\` text verbatim, then a new line \`Read ${substitute.inputPath} and verify the findings it lists.\``;
+  return substitute.reused === true
+    ? `run ${apply} FIRST (an agent may already have run under this tag; exit 2 not-found = none did), and only then call ${substitute.agent} once on the prepared packet (${substitute.inputPath}) and run ${apply} again. ${call}`
+    : `call ${substitute.agent} once on the prepared packet (${substitute.inputPath}), then ${apply}. ${call}`;
+}
+
 function secondReviewNext(verdicts) {
   const forced = verdicts.filter((v) => v.decision === 'ACCEPT').map((v) => v.id);
   const high = verdicts.filter((v) => v.decision !== 'ACCEPT' && v.confidence === 'high').map((v) => v.id);
@@ -646,7 +656,7 @@ async function secondReview(rest, ctx) {
       ...(ran.retried ? { retried: ran.retried } : {}),
       ...(modelNote === undefined ? {} : { modelNote }),
       ...(ran.reason === 'quota' && ran.quota ? { quota: { proof: ran.quota.proof, resetAt: ran.quota.resetAt, resetText: ran.quota.resetText } } : {}),
-      ...(ran.reason === 'model' ? { modelStop: { proven: modelStopProven, proof: ran.modelStop?.proof ?? null, model, ...(ran.modelStop?.unproven ? { unproven: ran.modelStop.unproven } : {}) }, message: modelRefusalMessage({ model, verdict: substitute, defaultBranch: dflt, next: `call ${substitute.agent} once on the prepared packet (${substitute.inputPath}), then \`pipeline triage second-review --apply --pr ${pr} --tag "${substitute.tag}"\`` }) } : {}),
+      ...(ran.reason === 'model' ? { modelStop: { proven: modelStopProven, proof: ran.modelStop?.proof ?? null, model, ...(ran.modelStop?.unproven ? { unproven: ran.modelStop.unproven } : {}) }, message: modelRefusalMessage({ model, verdict: substitute, defaultBranch: dflt, next: substituteNextStep({ substitute, pr }) }) } : {}),
       substitute,
       ...(warnings.length + usageWarnings.length > 0 ? { warnings: [...warnings, ...usageWarnings] } : {}),
     });

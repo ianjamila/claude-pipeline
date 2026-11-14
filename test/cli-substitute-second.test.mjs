@@ -642,6 +642,25 @@ test('model stop: exit 3 reason model with the substitute packet; route-2nd hold
   assert.match(triageComment(solo.state()), /Codex refused the configured model gpt-6-astra/);
 });
 
+test('R2-F1: a second-review re-run after a proven model stop hands the open attempt back (reused true): the message says --apply FIRST and names the call protocol', (t) => {
+  const w = world(t);
+  const first = w.second('R1-B1', modelRun(w));
+  assertExit(first, 3, first.stdout + first.stderr);
+  assert.equal(first.json.substitute.reused, false);
+  assert.ok(first.json.message.includes('then `pipeline triage second-review --apply --pr 7'), first.json.message);
+  assert.ok(first.json.message.includes(`description = \`${first.json.substitute.tag}\``) && first.json.message.includes('promptHeader'), first.json.message);
+  const again = w.second('R1-B1', modelRun(w));
+  assertExit(again, 3, again.stdout + again.stderr);
+  const sub = again.json.substitute;
+  assert.deepEqual([sub.eligible, sub.reused, sub.tag], [true, true, first.json.substitute.tag]);
+  const applyCmd = `\`pipeline triage second-review --apply --pr 7 --tag "${sub.tag}"\``;
+  const msg = again.json.message;
+  assert.ok(msg.includes(`run ${applyCmd} FIRST`), msg);
+  assert.ok(msg.includes('exit 2 not-found = none did'), msg);
+  assert.ok(msg.indexOf('FIRST') < msg.indexOf('call substitute-opus'), 'apply comes before starting the agent: ' + msg);
+  assert.ok(msg.includes('promptHeader') && msg.includes(sub.inputPath), msg);
+});
+
 test('a refused model that cannot be proven, or with the substitute off, gives no packet: eligible false with the reason in the message', (t) => {
   const unproven = world(t);
   const a = unproven.second('R1-B1', modelRun(unproven, { main: { error: 'unexpected status 401 Unauthorized' } }));
