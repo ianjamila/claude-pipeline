@@ -197,6 +197,8 @@ test('origin is unreachable and the content has no covering round: review-comple
   w.prHead(w.head);
   // A fixture clone made by hand has no refs/remotes/origin/HEAD, so with the remote unreachable nothing anchors the default branch except the working tree's own config, which a PR can edit (#377, S1):
   // the base config is untrusted, the PR needs the Fable pass and the substitute is off. That is intended, not a regression of the cached-ref behaviour.
+  // git >= 2.48 creates origin/HEAD on fetch (remote.origin.followRemoteHEAD), so delete it to get the unanchored state on every git version.
+  w.repo.git(['update-ref', '-d', 'refs/remotes/origin/HEAD']);
   const unanchored = w.cli(['review-complete', '--pr', '7']);
   assertExit(unanchored, 1, unanchored.stderr + unanchored.stdout);
   assert.match(unanchored.json.reason, /needs the Fable review pass.*could not be anchored on the remote/);
