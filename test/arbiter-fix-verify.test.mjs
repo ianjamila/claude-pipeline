@@ -38,7 +38,7 @@ const GH = [
 // Every Fable round here comes from src/a.js being a path the config sends to Fable each round; src/b.js is the "fix" file.
 const YML = (extra = '') => `${pipelineYml()}review:\n  arbiter_always_paths: [src/a.js]\n${extra}`;
 
-function world(t, { yml = YML(), initFiles = {} } = {}) {
+function world(t, { yml = YML(), initFiles = {}, parentYml } = {}) {
   const repo = createTmpRepo({ highEffort: true });
   t.after(() => repo.cleanup());
   repo.write('.claude/pipeline.yml', yml);
@@ -46,14 +46,23 @@ function world(t, { yml = YML(), initFiles = {} } = {}) {
   repo.write('src/a.js', aFile(false));
   repo.write('src/b.js', bFile(false));
   for (const [p, c] of Object.entries(initFiles)) repo.write(p, c);
-  const base = repo.commit('init');
+  const initial = repo.commit('init');
+  // A stacked PR: an unmerged parent branch (not the default branch) carries its own pipeline.yml, and the PR targets it, so the review base is the parent's head.
+  let base = initial;
+  let prBase = 'main';
+  if (parentYml !== undefined) {
+    repo.branch('parent');
+    repo.write('.claude/pipeline.yml', parentYml);
+    base = repo.commit('parent');
+    prBase = 'parent';
+  }
   repo.branch('feat/x');
   repo.write('src/a.js', aFile(true));
   repo.write('src/big.js', Array.from({ length: 60 }, (_, i) => `export const big${i} = ${i};`).join('\n') + '\n');
   const head = repo.commit('feature');
   const scratch = realpathSync.native(mkdtempSync(join(tmpdir(), 'cp-fixverify-')));
   t.after(() => rmSync(scratch, { recursive: true, force: true }));
-  const withHead = (sha) => GH.map((e) => (e.match === '^pr view 7' ? { ...e, stdoutJson: { baseRefName: 'main', headRefOid: sha, ...e.stdoutJson } } : e));
+  const withHead = (sha) => GH.map((e) => (e.match === '^pr view 7' ? { ...e, stdoutJson: { baseRefName: prBase, headRefOid: sha, ...e.stdoutJson } } : e));
   const fake = createFakeGh(withHead(head));
   const w = {
     repo, base, head, scratch, headNow: head,
@@ -289,6 +298,18 @@ test('arbiter needed: a sensitive file the BASE side config lists is the full br
   assertExit(r, 0, r.stdout + r.stderr);
   assert.deepEqual([r.json.scope, r.json.brief], ['round', 'full']);
   assert.match(r.json.briefReason, /sensitive path .*base config/);
+});
+
+test('R2-B1 stacked PR: a parent branch that drops a sensitive path from its own config cannot admit fix-verify: the trusted default-branch config still lists it, so the round is full (no late lane involved)', (t) => {
+  const trusted = YML().replace('[src/a.js]', '[src/a.js, src/b.js]');
+  const w = fixWorld(t, { yml: trusted, parentYml: YML() });
+  const r = w.needed(2);
+  assertExit(r, 0, r.stdout + r.stderr);
+  assert.deepEqual([r.json.scope, r.json.brief, r.json.agent], ['round', 'full', 'arbiter']);
+  assert.match(r.json.briefReason, /sensitive path .*trusted config/);
+  // the same stack with a parent that agrees with the trusted config stays on the narrow brief
+  const same = fixWorld(t, { yml: YML(), parentYml: `${YML()}# parent branch, same settings\n` });
+  assert.equal(same.needed(2).json.brief, 'fix-verify');
 });
 
 test('arbiter needed: a base-side hard-stop rule the working-tree config dropped is the full brief', (t) => {
