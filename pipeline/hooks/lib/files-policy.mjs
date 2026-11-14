@@ -2757,7 +2757,7 @@ function sourcedEffects(text, ctx, depth = 0, seenFiles = new Set()) {
   };
   for (const [i, c] of cmds.entries()) {
     const sure = !(inFlow(from, i) || c.depth > 0 || c.sep === '&&' || c.sep === '||' || c.sep === '|' || cmds[i + 1]?.sep === '|' || cmds[i + 1]?.sep === '&');
-    if (!c.argv.length) { for (const [k, v] of Object.entries(c.env ?? {})) set(k, v, sure); continue; }
+    if (!c.argv.length) { for (const [k, v] of Object.entries(c.env ?? {})) set(k, v, sure); for (const k of implicitBindsOf(c)) set(k, null, false); continue; } // (#352 R21-F1: a lone `{k}>f` binds k)
     const name = baseOf(c.argv[0]);
     // Why: a function or alias the LINE defines may stand behind a name that looks harmless (`ls() { read F; }`), and a nameref (`declare -n r=F`) binds F through another name
     if (ctx.lineDefs?.has(name) || (['declare', 'typeset', 'local'].includes(name) && c.argv.slice(1).some((a) => /^[-+][A-Za-z]*n/.test(a)))) { out.all = true; continue; }
@@ -3195,7 +3195,8 @@ function evaluateBashForFilesFrame(command, opts) {
   const markBound = (c) => {
     // (#56, Codex review of 8b86e2b; on main too: zsh `${(P)N::=~/.claude/settings.json}` / a bash `${!N…}` may set any name, like `export $N=…`)
     if (lineIndirect) { ctx.unknownAll = true; for (const k of Object.keys(ctx.vars)) { ctx.pickUnknown.add(k); ctx.unknownVars.add(k); ctx.srcChanged.add(k); } }
-    if (!c.argv.length) return;
+    // (#352 R21-F1: a lone `{k}>f` redirect has no argv and still binds k)
+    if (!c.argv.length) { for (const k of implicitBindsOf(c)) { ctx.pickUnknown.add(k); if (Object.hasOwn(ctx.vars, k)) ctx.unknownVars.add(k); } return; }
     const cn = baseOf(c.argv[0]);
     const names = [];
     // Why (#56, a live bypass on main): `F=/tmp/x; printf -v $N ~/.claude/settings.json; cp a $F` and `declare "$N=~/.claude"; cp a $HOME/settings.json`

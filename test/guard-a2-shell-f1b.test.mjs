@@ -106,7 +106,24 @@ test('F1b 88: a named descriptor redirection rebinds the script-directory name; 
   for (const pre of ['ls {HERE}>/dev/null', 'ls {HERE}</dev/null', 'ls {HERE}>>/dev/null', 'ls {HERE} >/dev/null', 'ls {HERE}>&2', 'cat <&0 {HERE}</dev/null', 'HERE+=x', 'ls >/dev/null {HERE}>/dev/null']) {
     assert.equal(files(`${CC}/scripts/restart.sh`, ccFs(pre)).decision, 'deny', pre);
   }
-  assert.equal(files(`${CC}/scripts/restart.sh`, ccFs('ls {OTHER}>/dev/null; ls >/dev/null')).decision, 'allow');
+  // (#352 R21-F2: any non-leading {fd} word now refuses the line it is on, another name too; a script without one is still allowed)
+  assert.equal(files(`${CC}/scripts/restart.sh`, ccFs('ls {OTHER}>/dev/null; ls >/dev/null')).decision, 'deny');
+  assert.equal(files(`${CC}/scripts/restart.sh`, ccFs('ls >/dev/null; ls >/dev/null')).decision, 'allow');
+});
+
+// (#352 R21-F1: a LEADING `{F}>file` word is a redirect with no command word, so it is in no argv: the name it binds is still read, also by files-policy, which has no ctlBroken fallback)
+test('#352 R21-F1: a leading named descriptor redirection rebinds the name for files-policy and for a script git-policy judges', () => {
+  const fs = fakeFs(PROJ, {}, [...DIRS, '.review']);
+  for (const pre of ['{F}>/dev/null true', '{F}>/dev/null', '{F}>/dev/null X=1', '{F}\\\n>/dev/null true', '{F}</dev/null true']) {
+    assert.equal(files(`F=x; ${pre}; echo '{}' > .review/round-$F/arbiter-output.json`, fs).decision, 'deny', pre);
+  }
+  assert.equal(files("F=x; true; echo '{}' > .review/round-$F/arbiter-output.json", fs).decision, 'allow');
+  const CL = 'cl' + 'ose';
+  const labels = (n) => (n === '5' ? [] : ['pipeline-pause']);
+  for (const body of [`{k}>/dev/null true; gh issue ${CL} $k\n`, `{k}>/dev/null; gh issue ${CL} $k\n`, `exec {k}>/dev/null; gh issue ${CL} $k\n`]) {
+    assert.equal(git('export k=5; zsh run.sh', { 'run.sh': body }, { issueLabels: labels }).decision, 'deny', body);
+  }
+  assert.equal(git('export k=5; zsh run.sh', { 'run.sh': `true; gh issue ${CL} $k\n` }, { issueLabels: labels }).decision, 'allow');
 });
 
 // ---- the second pass of a stale line spends what the first one left ------------------------------------------------------------------------------------------

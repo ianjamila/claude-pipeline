@@ -874,6 +874,8 @@ export function implicitBindsOf(c) {
   const el = /^([A-Za-z_]\w*)\[[^\]]*\]\+?=/.exec(argv[0] ?? '');
   if (el) out.push(el[1]);
   for (const a of argv) { const fd = /^\{([A-Za-z_]\w*)\}$/.exec(a); if (fd) out.push(fd[1]); }
+  // (#352 R21-F1: a LEADING `{k}>f` word is a redirect with no command word and is in no argv: read the names from the command's text too, line continuations removed (a match in a quote only makes this stricter))
+  for (const m of String(c.raw ?? '').replace(/\\\r?\n/g, '').matchAll(/(?<!\$)\{([A-Za-z_]\w*)\}[^\S\n]*[<>]/g)) out.push(m[1]);
   if (/^\s*coproc\b/.test(String(c.raw ?? ''))) {
     out.push('COPROC', 'COPROC_PID');
     if (/^[A-Za-z_]\w*$/.test(argv[0] ?? '')) out.push(argv[0], `${argv[0]}_PID`);
@@ -3113,8 +3115,8 @@ class Parser {
       else break;
     }
     // (#352 R20-F2: `{x}>f` is a redirect in zsh / bash >= 4.1 and the plain word {x} in sh / dash / bash 3.2 (macOS /bin/bash): the two readings run different commands (a leading word is the command, an option value
-    // moves). No cd or branch switch on a line with such a word is certain (ctlBroken); one that is not leading is refused (truncated) when a word follows it, or it ends a git / gh command, except before `exec`
-    // (`exec {fd}>f` opens a descriptor). Narrowed: `ls {x}>f` ends the command and shifts nothing; a lone `{fd}>f` right after the `)` of a subshell (`(cmd) {fd}>f`) or the `]]` of a [[ ]] is zsh's
+    // moves). No cd or branch switch on a line with such a word is certain (ctlBroken); one that is not leading is refused (truncated), except in a pure `exec {fd}>f [{fd2}>g …]`
+    // (it opens descriptors and runs nothing). Narrowed: a lone `{fd}>f` right after the `)` of a subshell (`(cmd) {fd}>f`) or the `]]` of a [[ ]] is zsh's
     // redirect on that command and a syntax error elsewhere, so it runs nothing the other reading could run)
     if (words.some((w) => w.fdRedir === true)) {
       if (!(seg.afterParen === true && words.every((w) => w.fdRedir === true))) this.ctx.ctlBroken = true;
@@ -3122,8 +3124,12 @@ class Parser {
       while (j < words.length && assignOf(words[j])) j++;
       // (push security review of 5f7cdd12: only a pure `exec {fd}>f [{fd2}>g …]` runs nothing; `exec {fd}>f CMD` runs CMD in zsh and a command named {fd} in sh: refused below)
       const execCmd = j < words.length && words[j].qa < 0 && words[j].text === 'exec' && words.slice(j + 1).every((w) => w.fdRedir === true);
-      const gitish = j < words.length && words[j].qa < 0 && ['git', 'gh'].includes(base(words[j].text));
-      if (words.some((w, k) => w.fdRedir === true && k >= i && !(execCmd && k > j) && (k < words.length - 1 || gitish))) this.ctx.truncated = true;
+      // (#352 R21-F2: the two readings differ by one operand for ANY command (`git push origin {x}>f` pushes the current branch in zsh, `… | bash {x}>f` runs stdin), whatever wraps or quotes it: every non-leading one is refused)
+      // (the trailing `{fd}>f` words right after the `]]` of a [[ ]] command stay narrowed: see above)
+      let tail = words.length;
+      while (tail > i && words[tail - 1].fdRedir === true) tail--;
+      const afterDbl = words[i]?.qa < 0 && words[i].text === '[[' && tail > i + 1 && words[tail - 1].qa < 0 && words[tail - 1].text === ']]';
+      if (words.some((w, k) => w.fdRedir === true && k >= i && !(execCmd && k > j) && !(afterDbl && k >= tail))) this.ctx.truncated = true;
     }
     if (words.slice(0, i).some((w) => w.text === '!' && w.qa < 0)) seg.negated = true; // (`! cmd`: its status is inverted, so a command chained with && after it runs when cmd FAILED. R9-F3: never taken back by the next group of the segment: `! { cmd; }`)
     const env = {};

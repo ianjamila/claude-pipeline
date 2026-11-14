@@ -560,6 +560,26 @@ test('#352 push security review: exec {fd}>f followed by a command is refused; a
   denies('twin: exec {fd}>/dev/null; push (main)', `exec {fd}>/dev/null; ${SHIP}`, {}, MAIN_DIR);
 });
 
+// (#352 R21-F2: a `{x}>f` word that is not the first word of its command is a redirect in zsh / bash >= 4.1 and an operand in sh / bash 3.2, so the two readings differ by one operand for ANY command
+// (`git push origin {x}>f` pushes the current branch in zsh; `… | bash {x}>f` runs stdin), whatever wraps or quotes the head: every such word refuses the line, except a pure `exec {fd}>f …`)
+test('#352 R21-F2: a non-leading {fd}>f word refuses the line whatever the command, wrapper or quoting', () => {
+  for (const [what, cmd] of [
+    ['command git push origin {x}>f', `command git ${PUSH} origin {x}>/dev/null`],
+    ['env git push origin {x}>f', `env git ${PUSH} origin {x}>/dev/null`],
+    ['exec git push origin {x}>f', `exec git ${PUSH} origin {x}>/dev/null`],
+    ['\\git push origin {x}>f', `\\git ${PUSH} origin {x}>/dev/null`],
+    ["'git' push origin {x}>f", `'git' ${PUSH} origin {x}>/dev/null`],
+    ['git push origin {x}>f', `git ${PUSH} origin {x}>/dev/null`],
+  ]) refuses(what, cmd, {}, MAIN_DIR);
+  refuses('echo text | bash {x}>f', `echo 'git ${PUSH} origin HEAD:${MAIN}' | bash {x}>/dev/null`, {}, GIT_ROOT);
+  refuses('echo text | sh {x}>f', `echo 'git ${PUSH} origin HEAD:${MAIN}' | sh {x}>/dev/null`, {}, GIT_ROOT);
+  refuses('ls {x}>f; push', `ls {x}>/dev/null; ${SHIP}`, {}, GIT_ROOT);
+  // unchanged: no {fd} word, a pure exec, a lone {fd}>f after a subshell
+  allows('twin: exec {fd}>/dev/null; push', `exec {fd}>/dev/null; ${SHIP}`, {}, GIT_ROOT);
+  allows('twin: ls >/dev/null; push', `ls >/dev/null; ${SHIP}`, {}, GIT_ROOT);
+  allows('twin: (true) {fd}>/dev/null; push', `(true) {fd}>/dev/null; ${SHIP}`, {}, GIT_ROOT);
+});
+
 // (#352 R19: the R18 watch for a word after `]]` was tied to one segment and to the single next word: an inner && of the [[ ]] split the segment (B1), a reserved word right after `]]` hid the same-line body in
 // the argv of `[[` (F1), and a `{fd}` redirect prefix disarmed it (F2))
 test('#352 R19-B1, R19-F1, R19-F2: the ]] watch survives a && inside [[ ]], a same-line body after ]] then / ]] do is refused, a {fd} redirect does not disarm it', () => {
