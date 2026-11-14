@@ -2890,7 +2890,7 @@ function evalString(str, startDir, ctx, level, child = false) {
   // the subshells open at the command being walked, outermost first: { id, dir, uncertain } as they were when it started (null: marks not trusted, see subshellsTrusted)
   const subs = subshellsTrusted(cmds) ? [] : null;
   // #478 R1-B1: the commands of a failure group `cd X || { …; exit 1; }` run only when the cd (or a git checkout / switch) FAILED, in the old directory on the old branch, so they are walked with the state unknown
-  // (`to`: the index of the group's exit; `snap`: the state the cd / checkout left, put back for the commands after the group)
+  // (`to`: the index of the group's exit; `snap`: the state the cd / checkout left, put back for the commands after the group unless `doubt`: the cd / checkout itself may not have run)
   let failGroup = null;
   let chdirBase; // (the list's own directory while one command runs in its wrapper's -C / --chdir directory)
   try {
@@ -2902,7 +2902,12 @@ function evalString(str, startDir, ctx, level, child = false) {
       forgetState();
     } else if (failGroup && i > failGroup.to) {
       dir = failGroup.snap.dir;
-      for (const [k, name] of failGroup.snap.names) { const e = ctx.branches.get(k); if (e) e.name = name; }
+      // (#478 R2-F1: when the cd / checkout was itself uncertain, the snapshot is an optimistic state: forgotten, not put back; R2-B1: an entry first made in the group is not in the snapshot: unknown)
+      if (failGroup.doubt) forgetState();
+      else {
+        const was = new Map(failGroup.snap.names);
+        for (const [k, e] of ctx.branches) e.name = was.has(k) ? was.get(k) : null;
+      }
       failGroup = null;
     }
     const argv = c.argv;
@@ -2936,8 +2941,9 @@ function evalString(str, startDir, ctx, level, child = false) {
       const orExits = cmds[i + 1]?.sep === '||' && plainExit(cmds[i + 1]) && cmds[i + 2]?.sep !== '|' && cmds[i + 2]?.sep !== '&'
         && !(cmds[i + 2] !== undefined && cmds[i + 2].argv.length === 0 && (cmds[i + 2].redirects ?? []).length > 0)
         || (changesState && exitsAsGroup(i));
-      if (changesState && !failGroup && exitsAsGroup(i)) failGroup = { to: exitOfGroup(i), snap: null };
+      if (changesState && !failGroup && exitsAsGroup(i)) failGroup = { to: exitOfGroup(i), snap: null, doubt: false };
       if (changesState && (inFlow(from, i) || c.depth > 0 || c.sep === '&&' || c.sep === '||' || ranInSubshell(cmds, i) || (cmds[i + 1]?.sep === '||' && !orExits))) uncertain = true;
+      if (failGroup && failGroup.snap === null) failGroup.doubt = uncertain; // (the doubt about this cd / checkout, carried or new: it is consumed inside the group)
     }
     // (Phase 3b, Fable attacker pass: `env -C D gh pr merge …` / `sudo -D D …` run the command in D, which the merge check never saw from a
     // cwd outside the repository: it is judged there, or in an unknown directory (null: a chat repo whose repository is unknown) when D cannot be read)

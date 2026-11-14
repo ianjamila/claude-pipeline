@@ -201,3 +201,25 @@ describe('#478 R1-B2 / R1-F1 / R1-F2: the --delete dry-run exemption trusts only
     ['a plain assignment after a && chain that ended', 'true && true; N=-n; rsync -a --delete $N /tmp/x/ ~/'],
   ]);
 });
+
+// ---- PR #478 round 2 ----
+// R2-F1 / R2-B1: the restore after a failure group puts back the state the cd / checkout left, but not when the cd / checkout itself may not have run, and it drops every branch entry the group created.
+describe('#478 R2-F1 / R2-B1: the state after a failure group is forgotten when the cd / checkout was itself uncertain, and the group leaves no branch entry behind', () => {
+  const gitRun2 = (command) => evaluateGitCommand(command, {
+    cwd: '/work/repo',
+    home: HOME,
+    currentBranch: (dir) => ({ [resolve('/work/repo')]: 'agent/x', [resolve('/other')]: 'agent/y', [resolve('/protected')]: 'main' })[dir] ?? null,
+    pushDestination: () => null,
+    issueLabels: () => [],
+    readText: () => null,
+    pathExists: () => false,
+  });
+  const DENY = (name, line) => test(`deny: ${name}`, () => assert.equal(gitRun2(line).decision, 'deny', line));
+  const ALLOW = (name, line) => test(`allow: ${name}`, () => assert.equal(gitRun2(line).decision, 'allow', line));
+  DENY('a checkout after a || that may skip it (R2-F1 1)', 'true || git checkout agent/y || { echo no; exit 1; }; git push');
+  DENY('a second cd after a || (R2-F1 2)', 'cd /other || cd /work/repo || { echo no; exit 1; }; git push');
+  DENY('a cd in an if (R2-F1 3)', 'if [ -d /other ]; then cd /other || exit 1; echo in; fi; git push');
+  DENY('a branch entry first made in the group (R2-B1)', 'cd /other || { echo no; git -C /protected checkout agent/y; exit 1; }; git -C /protected push');
+  ALLOW('the plain group form is still narrowed', 'cd /other || { echo no; exit 1; }; git push');
+  ALLOW('the checkout group is still narrowed', 'git checkout agent/y || { echo no; exit 1; }; git push');
+});
