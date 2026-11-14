@@ -179,3 +179,4 @@ full record.
 - 2026-11-14 · #426 · Trusted pipeline.yml keys: default branch, effort lanes and Codex model come from the base config (#377 #389 #394 #398) · risk high · rounds 6 · arbiter 6 (fix-verify 1) · substitute 2 · awaiting-owner-merge
 - 2026-11-14 · #269 · Click to approve: merge, extra round and rulings as a choice dialog (#261) · risk high · rounds 36 · arbiter 36 · substitute 1 · awaiting-owner-merge
 - 2026-11-14 · #450 · Trusted default branch for content hashes and the merge gate; unsupported default_branch reported (#448 #430) · risk high · rounds 4 · arbiter 3 · awaiting-owner-merge · Codex 7d: 6324 runs (6168 high)
+- 2026-11-14 · #420 · fix(review): one default-branch anchor, resolved fully qualified; follow-ups #367 #368 #387 #388 #392 #396 #407 · risk high · rounds 5 · arbiter 5 · awaiting-owner-merge · Codex 7d: 6327 runs (6168 high)
