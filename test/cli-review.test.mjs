@@ -1843,6 +1843,19 @@ test('review-complete: a gh failure while removing the label is exit 3, not succ
   assertExit(w.cli(['review-complete', '--pr', '7']), 3);
 });
 
+test('review-complete: the marker\'s fallback codexModel (a newest round that recorded none) is the trusted model, not a working-tree review.codex_model edit (#389, R1-F2)', (t) => {
+  const w = world(t, { yml: withModel('gpt-test-1'), gh: [...GH, REMOVE_LABEL, ...REVIEW_COMMENT] });
+  assertExit(w.codex(1, findingsOf()), 0);
+  const s = w.state();
+  delete s.rounds[0].codexModel; // a round that never recorded its model: only the configured default can name it
+  writeFileSync(join(w.repo.dir, '.review', 'state.json'), JSON.stringify(s, null, 2));
+  writeFileSync(join(w.repo.dir, '.claude', 'pipeline.yml'), withModel('gpt-evil-2'));
+  const r = w.cli(['review-complete', '--pr', '7']);
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.equal(r.json.review.codexModel, 'gpt-test-1');
+  assert.equal(reviewJson(postedBodies(w)[0]).codexModel, 'gpt-test-1');
+});
+
 test('review-complete: posts the marker comment with {contentHash, base, head, rounds, codexModel, modelProofDigest, stateHash}; an identical one is reused', (t) => {
   const w = world(t, { gh: [...GH, REMOVE_LABEL, ...REVIEW_COMMENT] });
   assertExit(w.codex(1, findingsOf()), 0);
