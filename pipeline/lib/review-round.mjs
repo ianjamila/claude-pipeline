@@ -92,10 +92,15 @@ export const checkRound = (st, { pr, round }) => {
 
 // Round 1 starts at the PR's merge base; every later round starts where the previous one ended.
 // When a whole-PR round is owed (review-route.mjs#wholePrOwed: an Opus substitute round came before the PR's risk rose to high) it starts at the merge base too.
+// The base a round must use: the single rule checkBase enforces and `pipeline round codex` defaults to.
+export const requiredBase = (st, forkPoint) => {
+  const last = st?.rounds.at(-1);
+  return last && !wholePrOwed(st) ? last.toHead : forkPoint;
+};
 export const checkBase = (st, { round, base, forkPoint }) => {
   const last = st?.rounds.at(-1);
   const owed = last !== undefined && wholePrOwed(st);
-  const required = last && !owed ? last.toHead : forkPoint;
+  const required = requiredBase(st, forkPoint);
   if (base !== required) {
     throw new Fail(EXIT.USAGE, {
       ok: false, error: 'base-mismatch',
@@ -148,6 +153,42 @@ export const checkCap = (c, st, flags, { already = false } = {}) => {
   return admission;
 };
 
+// The merge base of the whole PR: where the PR forked from the branch it targets (origin/<base> when it exists). GitHub's answer wins; without one the PR is read as
+// targeting the TRUSTED default branch (risk.mjs#prBaseBranch), never the working-tree config's default_branch, which the PR can edit (#398). When that fallback is needed and the
+// default branch could not be anchored on the remote (an origin remote that did not answer), the working tree's value is the PR's to choose: exit 3 rather than let it set the range (S1).
+// `view` is the PR as GitHub names it ({baseRefName}); `head` a full SHA. -> { prBase, forkPoint }. Shared by admitRound and `pipeline round codex` (the base it defaults to).
+export function resolveForkPoint({ root, config, view, head }) {
+  const o = { cwd: root };
+  const { branch: prBase, untrusted: prBaseUntrusted } = prBaseBranch(view, root, config);
+  if (prBaseUntrusted !== null) {
+    throw unavailable('github', { error: 'unanchored-base', message: `GitHub did not name the PR's base branch, and ${prBaseUntrusted}` });
+  }
+  // Best effort: a fresh origin/<base> is what "merged in from the base branch" is measured against. Offline, no remote or a
+  // slow one just means the cached ref is used.
+  try {
+    git(['fetch', '--no-tags', 'origin', `+refs/heads/${prBase}:refs/remotes/origin/${prBase}`], { ...o, timeoutMs: NETWORK_TIMEOUT_MS });
+  } catch (err) {
+    if (!(err instanceof GitError)) throw err;
+  }
+  // The trusted fork point (rateBranch, the model, the lanes) is measured from origin/<default branch>, which is not the PR's base for a stack: refresh it too (R2-F1).
+  refreshTrustedDefault(root, config, { except: prBase });
+  return { prBase, forkPoint: mergeBase(reviewBaseRef(root, config, prBase), head, o) };
+}
+
+// The range a round uses when the caller names none: the base the admission would demand and the checked-out HEAD. Reads the PR from GitHub (exit 3 `github` when unreachable).
+export function defaultRoundRange({ root, config, ctx, pr, state }) {
+  let view;
+  try {
+    view = createGitHub({ cwd: root, env: ctx.env }).prView(pr, ['baseRefName']);
+  } catch (err) {
+    if (err instanceof GhError) throw unavailable('github', { error: 'unavailable', message: err.message });
+    throw err;
+  }
+  const head = headSha({ cwd: root });
+  const { forkPoint } = resolveForkPoint({ root, config, view, head });
+  return { base: requiredBase(state, forkPoint), head };
+}
+
 // Phase one. `base` and `head` are full SHAs (head is the checked-out HEAD). Returns the admitted round (opaque to the caller except
 // for these fields): { state, view, slug, ghRepo, forkPoint, level, rated, lane, fable, lightLane, review: {base, kind}, resolution,
 // resolutionOnly, resolutionView, resolutionIneligible, baseOnly, patch, largeBinaries, preAdmission, priorRulings, confirmItems,
@@ -172,23 +213,7 @@ export async function admitRound({ root, config, ctx, pr, round, base, head }) {
     throw err;
   }
 
-  // The merge base of the whole PR: where the PR forked from the branch it targets (origin/<base> when it exists). GitHub's answer wins; without one the PR is read as
-  // targeting the TRUSTED default branch (risk.mjs#prBaseBranch), never the working-tree config's default_branch, which the PR can edit (#398). When that fallback is needed and the
-  // default branch could not be anchored on the remote (an origin remote that did not answer), the working tree's value is the PR's to choose: exit 3 rather than let it set the range (S1).
-  const { branch: prBase, untrusted: prBaseUntrusted } = prBaseBranch(view, root, config);
-  if (prBaseUntrusted !== null) {
-    throw unavailable('github', { error: 'unanchored-base', message: `GitHub did not name the PR's base branch, and ${prBaseUntrusted}` });
-  }
-  // Best effort: a fresh origin/<base> is what "merged in from the base branch" is measured against. Offline, no remote or a
-  // slow one just means the cached ref is used.
-  try {
-    git(['fetch', '--no-tags', 'origin', `+refs/heads/${prBase}:refs/remotes/origin/${prBase}`], { ...o, timeoutMs: NETWORK_TIMEOUT_MS });
-  } catch (err) {
-    if (!(err instanceof GitError)) throw err;
-  }
-  // The trusted fork point (rateBranch, the model, the lanes) is measured from origin/<default branch>, which is not the PR's base for a stack: refresh it too (R2-F1).
-  refreshTrustedDefault(root, config, { except: prBase });
-  const forkPoint = mergeBase(reviewBaseRef(root, config, prBase), head, o);
+  const { prBase, forkPoint } = resolveForkPoint({ root, config, view, head });
   c.forkPoint = forkPoint;
   checkBase(state, c);
   const wholePr = state !== null && state.rounds.length > 0 && wholePrOwed(state);
