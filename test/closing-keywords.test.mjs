@@ -9,6 +9,7 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
 import { createFakeGh, pipelineYml, REPO_VIEW } from './helpers/fakegh-env.mjs';
+import { floorEnv } from './helpers/floor-env.mjs';
 import { assertExit } from './helpers/assert-exit.mjs';
 import { closingKeywordProblem, multiIssueClosingLines } from '../pipeline/lib/closing-keywords.mjs';
 import { preMergeProblems } from '../pipeline/lib/finalgate.mjs';
@@ -167,7 +168,7 @@ function world(t, body, { review = true } = {}) {
   const cli = (args, env = {}) => {
     const r = spawnSync(process.execPath, [bin, ...args], {
       cwd: repo.dir, encoding: 'utf8',
-      env: { ...process.env, ...fake.env, PIPELINE_CODEX: `node "${fakeCodex}"`, PIPELINE_LOCK_DIR: join(scratch, 'locks'), ...env },
+      env: { ...process.env, ...fake.env, PIPELINE_CODEX: `node "${fakeCodex}"`, PIPELINE_LOCK_DIR: join(scratch, 'locks'), ...floorEnv(), ...env }, // floorEnv: an empty Codex home (#429)
     });
     let json = null;
     try { json = r.stdout ? JSON.parse(r.stdout) : null; } catch { /* the assertion on json will say so */ }

@@ -10,6 +10,7 @@ import { Fail } from './cmd-common.mjs';
 import { GitError, NETWORK_TIMEOUT_MS, git, reviewBaseRef as gitReviewBaseRef, reviewContentHash } from './git.mjs';
 import { LockTimeoutError, withLock } from './locks.mjs';
 import { parseRemote } from './remote-url.mjs';
+import { trustedDefaultBranch } from './risk.mjs';
 import { loadState } from './state.mjs';
 
 export const EXCERPT_RADIUS = 20;
@@ -43,6 +44,22 @@ export function refreshBaseRef(root, config) {
   }
   const usesRemoteRef = reviewBaseRef(root, config) === `origin/${branch}`;
   return { refreshed, ...(reason === undefined ? {} : { reason }), usesRemoteRef };
+}
+
+// Best-effort refresh of origin/<TRUSTED default branch> (risk.mjs#trustedDefaultBranch: what the remote calls its default, never the working-tree config's value), for the readers of the
+// trusted fork point = mergeBase(origin/<that>, head), which picks the Codex model, the effort lanes and the substitute gates (admitRound, review-complete, triage second-review): a local
+// ref behind the remote would name an older config. `except`: a branch the caller already fetched. A clone with no origin remote or an anchor only the working tree gives has nothing to
+// fetch; a failed fetch is not an error (the cached ref is used). -> true when it was fetched now.
+export function refreshTrustedDefault(root, config, { except } = {}) {
+  const { branch, anchor, untrusted } = trustedDefaultBranch(root, config);
+  if (anchor === 'config' || untrusted !== null || branch === except) return false;
+  try {
+    git(['fetch', '--no-tags', 'origin', `+refs/heads/${branch}:refs/remotes/origin/${branch}`], { cwd: root, timeoutMs: NETWORK_TIMEOUT_MS });
+    return true;
+  } catch (err) {
+    if (!(err instanceof GitError)) throw err;
+    return false;
+  }
 }
 
 // What the branch changes relative to where it forked, minus the agent log. One definition, in git.mjs, shared with the

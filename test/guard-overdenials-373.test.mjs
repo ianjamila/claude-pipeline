@@ -210,8 +210,8 @@ describe('#373 review round 1 (R1-B1, R1-B2, R1-B3, R1-F1, R1-F2, R1-F3)', () =>
   const fsOf = (files) => ({ existsSync: (p) => Object.hasOwn(files, p), readText: (p) => files[p] ?? null });
   const repoAtHome = fsOf({ '/home/u/.git': null, '/home/u/.git/config': '[core]\n' });
   const dotsDir = (extra = {}) => ({ '/home/u/proj/.git': null, '/home/u/proj/.git/config': '[core]\n', ...extra });
-  test('R1-B1: a brace group entered by || | or & exports no chain through its }', () => {
-    for (const line of ['true || { true; cd /tmp; } && find . -delete', 'true || { true && cd /tmp; } && find . -delete', 'a | { true; cd /tmp; } && find . -delete', 'a & { true; cd /tmp; } && find . -delete']) {
+  test('R1-B1: a brace group entered by || or | exports no chain through its }', () => { // (#411: not one entered by &, see test/guard-followups-410-412.test.mjs)
+    for (const line of ['true || { true; cd /tmp; } && find . -delete', 'true || { true && cd /tmp; } && find . -delete', 'a | { true; cd /tmp; } && find . -delete']) {
       assert.equal(run(line).decision, 'deny', line);
     }
   });
@@ -262,9 +262,9 @@ describe('#373 review round 1 (R1-B1, R1-B2, R1-B3, R1-F1, R1-F2, R1-F3)', () =>
     }
   });
   test('R1-F3: an ancestor that is itself a git directory makes the root unknown', () => {
-    const ex = fsOf({ '/home/u/.git': 'gitdir: /home/u/sep.git\n', '/home/u/sep.git/config': '[core]\n\tbare = false\n', '/home/u/sep.git/HEAD': 'ref: refs/heads/main\n', '/home/u/sep.git/objects': null });
+    const ex = fsOf({ '/home/u/.git': 'gitdir: /home/u/sep.git\n', '/home/u/sep.git/config': '[core]\n\tbare = false\n', '/home/u/sep.git/HEAD': 'ref: refs/heads/main\n', '/home/u/sep.git/objects': null, '/home/u/sep.git/refs': null });
     assert.equal(run(`git -C ${TOP} clean -fd`, { ...ex, cwd: '/home/u/sep.git/refs' }).decision, 'deny');
-    assert.equal(run(`git -C ${TOP} clean -fd`, { ...fsOf({ '/work/r.git/HEAD': null, '/work/r.git/objects': null }), cwd: '/work/r.git/refs' }).decision, 'deny');
+    assert.equal(run(`git -C ${TOP} clean -fd`, { ...fsOf({ '/work/r.git/HEAD': null, '/work/r.git/objects': null, '/work/r.git/refs': null }), cwd: '/work/r.git/refs' }).decision, 'deny');
   });
 });
 

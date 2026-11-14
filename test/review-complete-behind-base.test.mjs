@@ -11,6 +11,7 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
 import { createFakeGh, pipelineYml, REPO_VIEW } from './helpers/fakegh-env.mjs';
+import { floorEnv } from './helpers/floor-env.mjs';
 import { assertExit } from './helpers/assert-exit.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -96,7 +97,7 @@ function world(t, { view = {}, queue = false, disjoint = false } = {}) {
   writeFileSync(out, JSON.stringify({ summary: 'Reviewed.', blocking: [], suggestions: [], worth_considering: [] }));
   const r = spawnSync(process.execPath, [bin, 'codex-review', '--pr', '7', '--round', '1', '--base', base, '--head', head, '--effort', 'high'], {
     cwd: repo.dir, encoding: 'utf8',
-    env: { ...process.env, ...fake.env, PIPELINE_CODEX: `node "${fakeCodex}"`, PIPELINE_LOCK_DIR: lockDir, FAKE_CODEX_OUTPUT: out },
+    env: { ...process.env, ...fake.env, PIPELINE_CODEX: `node "${fakeCodex}"`, PIPELINE_LOCK_DIR: lockDir, ...floorEnv(), FAKE_CODEX_OUTPUT: out }, // floorEnv: an empty Codex home (#429)
   });
   assert.equal(r.status, 0, r.stderr + r.stdout);
   return w;
@@ -172,6 +173,9 @@ test('review-complete: a behind draft whose base ref could not be refreshed (off
   const w = world(t);
   w.mainMovesOn();
   w.repo.git(['fetch', '-q', 'origin']); // the cached origin/main is already behind-making ...
+  // A real clone has origin/HEAD (git clone sets it); this hand-made fixture does not. Without that cached anchor an offline run
+  // cannot anchor the default branch at all, and the PR needs the Fable pass (#377, S1: covered in review-complete-fetch.test.mjs).
+  w.repo.git(['remote', 'set-head', 'origin', 'main']);
   w.repo.git(['remote', 'set-url', 'origin', join(tmpdir(), 'cp-rcbehind-does-not-exist.git')]); // ... and the refresh fails
   const r = w.cli(['review-complete', '--pr', '7']);
   assertExit(r, 0, r.stderr + r.stdout);

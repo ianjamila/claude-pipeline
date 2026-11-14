@@ -328,6 +328,11 @@ const MORE_DENY = [
   ['find . -name x -exec git push origin main ;'],
   // cwd tracking
   ['cd /other && git push', { byDir: { '/work/repo': 'agent/x', '/other': 'main' } }],
+  ['chdir /other && git push', { byDir: { '/work/repo': 'agent/x', '/other': 'main' } }], // (#372: zsh's chdir is cd)
+  // #425 R1-F2: chdir is a zsh builtin only (bash: command not found, the line goes on in the old directory), so the directory after it is unknown
+  ['chdir /wt; git push', { byDir: { '/work/repo': 'main', '/wt': 'agent/x' } }],
+  ['chdir /wt && git push', { byDir: { '/work/repo': 'main', '/wt': 'agent/x' } }],
+  ['chdir /other && git push', { byDir: { '/work/repo': 'main', '/other': 'agent/x' } }],
   ['git -C /other push', { byDir: { '/work/repo': 'agent/x', '/other': 'master' } }],
   ['git -C ../other push', { cwd: '/work/repo', byDir: { '/work/other': 'main' } }],
   ['git -C a -C b push', { cwd: '/w', byDir: { '/w/a/b': 'main' } }],
