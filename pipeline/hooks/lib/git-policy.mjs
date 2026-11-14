@@ -2928,7 +2928,7 @@ function evalString(str, startDir, ctx, level, child = false) {
       }
     } else if (name === 'for' && pinsAt(ctx, level)?.get(argv[1])?.expand) verdict = loopWordAt(argv[1], ctx);
     else if (name === 'for' && computedLoopWord(c) !== null) setVar(ctx, argv[1], computedLoopWord(c), level);
-    else if (name === 'cd' || name === 'chdir' || name === 'pushd' || name === 'popd') dir = nextDir(dir, name === 'chdir' ? 'cd' : name, argv, ctx, cdp, c.env ?? {});
+    else if (name === 'cd' || name === 'chdir' || name === 'pushd' || name === 'popd') dir = name === 'chdir' ? null : nextDir(dir, name, argv, ctx, cdp, c.env ?? {}); // (#425 R1-F2: chdir is zsh only, in bash the line goes on in the old directory: the directory after it is unknown, as after popd)
     else if (name === 'git' || name === 'gh') {
       // (Fable attacker pass: a remote or gh's default repository changed on the line: see directMergeVerdict)
       if (name === 'git' && argv.includes('remote') && argv.some((w) => ['add', 'set-url', 'rename', 'remove', 'rm'].includes(w))) ctx.ghRepoDirty = true;
