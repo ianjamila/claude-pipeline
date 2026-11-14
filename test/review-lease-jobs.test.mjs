@@ -197,6 +197,11 @@ test('R1-F1: a plain terminal (no CLAUDECODE, no ancestor) never becomes the ses
 // ---- R1-F1: `job start` itself ----------------------------------------------------------------------------------------------------------
 
 test('R1-F1: `job start` run in a session passes the session identity to the job (env PIPELINE_LEASE_HOLDER); a plain terminal passes nothing', async (t) => {
+  // Hermetic: when the suite itself runs inside a `P job` (started from a Claude Code session) this process already carries the session's PIPELINE_LEASE_HOLDER,
+  // and `job start` builds the job's environment on top of process.env: the "plain terminal" job would inherit it and read as handed an identity.
+  const ambientHolder = process.env[HOLDER_ENV];
+  delete process.env[HOLDER_ENV];
+  t.after(() => { if (ambientHolder !== undefined) process.env[HOLDER_ENV] = ambientHolder; });
   const repo = tmp(t);
   const git = (...a) => spawnSync('git', a, { cwd: repo, encoding: 'utf8', env: { ...process.env, HOME: repo, USERPROFILE: repo } });
   git('init', '-q');

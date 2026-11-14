@@ -14,7 +14,7 @@ import { createFakeGh, pipelineYml } from './helpers/fakegh-env.mjs';
 import { LOCK_DIR, PR, ME, REPO, cli, scenario } from './helpers/gate-env.mjs';
 import { addRound, emptyState, saveState } from '../pipeline/lib/state.mjs';
 import { repoLockKey, reviewLockName } from '../pipeline/lib/review-context.mjs';
-import { acquireAdmission, blocking, releaseAdmission, scanLeases } from '../pipeline/lib/review-lease.mjs';
+import { HOLDER_ENV, acquireAdmission, blocking, releaseAdmission, scanLeases } from '../pipeline/lib/review-lease.mjs';
 import { tryAcquire, release } from '../pipeline/lib/locks.mjs';
 import { LEASED_COMMANDS, leaseArgs, leasesOffForTests } from '../pipeline/lib/review-lease-wiring.mjs';
 import { assertExit } from './helpers/assert-exit.mjs';
@@ -46,6 +46,8 @@ function world({ session = true, extra = {} } = {}) {
   const env = {
     ...withFakePs(), HOME: home, USERPROFILE: home, CLAUDE_CONFIG_DIR: undefined, PIPELINE_MACHINE_ID: MACHINE,
     PIPELINE_REVIEW_LEASE_DIR: dir, [SESSION_VAR]: session ? '1' : undefined, ...extra,
+    // Hermetic: a suite run inside a `P job` carries the launching session's PIPELINE_LEASE_HOLDER; handed to the child CLI it would make the lease a job-scoped one of that session (live only while a job runs).
+    [HOLDER_ENV]: undefined,
   };
   return { root, home, dir, env };
 }
