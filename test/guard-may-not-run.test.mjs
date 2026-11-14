@@ -569,6 +569,23 @@ test('#352 R19-B1, R19-F1, R19-F2: the ]] watch survives a && inside [[ ]], a sa
   allows('twin: [[ ]] 2>/dev/null && push', `[[ -n x ]] 2>/dev/null && ${SHIP}`, {}, '/work/other2');
 });
 
+// (#352 R20: dropping every {fd}> word (R19-F2b) made the parser read what no shell reads. F1: a reserved word after a leading {fd}> word is a plain command word in zsh / bash >= 4.1 (not found), so the cd after it
+// never runs; F2: in sh / dash / macOS bash 3.2 `{x}>f` is the word {x}, so dropping it shifts option values and lets a cd look certain. The rule now: any {fd} word makes the line's cd / branch switch uncertain,
+// a {fd} word that is not leading (and not before exec) or a leading one followed by a reserved word refuses the line)
+test('#352 R20-F1, R20-F2: a {fd} redirect word before a reserved word, in sh / dash / bash 3.2 reading, or mid-command never makes a cd certain', () => {
+  for (const kw of ['then', 'else', 'elif', 'do', 'fi', 'done', 'while', 'until', '!', 'esac', 'if']) {
+    denies(`R20-F1: {fd}>/dev/null ${kw} cd other; push (main)`, `{fd}>/dev/null ${kw} cd /work/other2; ${SHIP}`, {}, MAIN_DIR);
+  }
+  denies('R20-F1: {fd}>/dev/null function f cd other; push (main)', `{fd}>/dev/null function f cd /work/other2; ${SHIP}`, {}, MAIN_DIR);
+  denies('R20-F2: sh -c {fd}>/dev/null cd other; push (main)', `sh -c '{fd}>/dev/null cd /work/other2; ${SHIP}'`, {}, MAIN_DIR);
+  denies('R20-F2: bash -c {fd}>/dev/null cd other; push (main)', `bash -c '{fd}>/dev/null cd /work/other2; ${SHIP}'`, {}, MAIN_DIR);
+  denies('R20-F2: {fd}>/dev/null cd other; push (main)', `{fd}>/dev/null cd /work/other2; ${SHIP}`, {}, MAIN_DIR);
+  denies('R20-F2: sh -c git --namespace {x}>/dev/null push (main)', `sh -c 'git --namespace {x}>/dev/null ${PUSH} origin HEAD:${MAIN}'`, {}, MAIN_DIR);
+  denies('R20-F2: bash -c git --namespace {x}>/dev/null push (main)', `bash -c 'git --namespace {x}>/dev/null ${PUSH} origin HEAD:${MAIN}'`, {}, MAIN_DIR);
+  denies('R20-F2: git --work-tree {x}>/dev/null push (main)', `git --work-tree {x}>/dev/null ${PUSH} origin HEAD:${MAIN}`, {}, MAIN_DIR);
+  denies('R20-F2: git --namespace {x}>/dev/null push (main)', `git --namespace {x}>/dev/null ${PUSH} origin HEAD:${MAIN}`, {}, MAIN_DIR);
+});
+
 // (#352 R17-F5: the zsh condition-then-body forms are not followed, so EVERY line of this cross product that holds a push is refused. No shell model is needed: the generator of the differential test has no
 // "unknown" verdict to compare with, so the forms are enumerated here instead. The condition enders and the bodies are those the rounds 15..17 found by hand, one spelling at a time)
 test('#352 R17-F5: every zsh condition-then-body line (if / until / while + condition ender + redirect + body, case W { }, repeat N) that holds a push is refused', () => {
