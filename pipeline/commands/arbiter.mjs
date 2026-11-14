@@ -233,8 +233,11 @@ function reviewSection(state, round, diff, fix = null) {
       `Brief: FIX-VERIFY. Round ${fix.round} (the previous counted round) accepted the items under "Fixes to verify" below; the diff above is what changed in round ${round.n}, mostly to fix them.`,
       'Verify each fix is correct and complete. Then look for bugs or regressions the round diff introduces, and raise any finding in the round diff as usual (same JSON, `findings`).',
       'Do not re-review code outside the round diff unless a fix depends on it.',
-      'Your own review is fix-specific: verify each listed fix, then look for regressions in the round diff; raise nothing about code outside the round diff. If the round adds a mechanism none of the accepted items asked for (a new option, helper module or code path), raise ONE finding, bucket SUGGESTION, category design.',
-      ...(fix.scope ? [`Fix scope: ${fix.scope.nonTestLines} non-test added line(s) (limit ${fix.scope.limit}), ${fix.scope.newFiles.length} new non-test file(s), ${fix.scope.newExports} new export(s)${fix.scope.flagged ? ' - FLAGGED' : ''}.`] : []),
+      // The late lane (review.fix_verify_after_round, fix.late) narrows the brief further; an ordinary fix round's input is what it was before the lane existed.
+      ...(fix.late ? [
+        'Your own review is fix-specific: verify each listed fix, then look for regressions in the round diff; raise nothing about code outside the round diff unless a listed fix is incomplete or wrong because of it. If the round adds a mechanism none of the accepted items asked for (a new option, helper module or code path), raise ONE finding, bucket SUGGESTION, category design.',
+        ...(fix.scope ? [`Fix scope: ${fix.scope.nonTestLines} non-test added line(s) (limit ${fix.scope.limit}), ${fix.scope.newFiles.length} new non-test file(s), ${fix.scope.newExports} new export(s)${fix.scope.flagged ? ' - FLAGGED' : ''}.`] : []),
+      ] : []),
     );
   }
   // File names, reasons and earlier titles come from the change author or a model that read the change: data in a fence
@@ -357,19 +360,19 @@ async function chooseBrief(state, round, diff, root, { forceFull = false, truste
     if (!loaded.ok) return full(`config unreadable: ${loaded.errors?.[0] ?? 'unknown'}`);
     const base = baseConfigAt(round.forkPoint, root);
     if (!base.ok) return full(base.reason);
-    // The same config twice is checked once (the usual case: nobody touched pipeline.yml). The trusted default-branch config joins when it is readable.
+    // The late lane (review.fix_verify_after_round): every config sets it (the trusted one must be readable) and the counted ordinal is above the largest.
+    const afters = [loaded.config, base.config, ...(trusted === null ? [] : [trusted])].map((c) => c.review?.fix_verify_after_round);
+    const ordinal = countedOrdinal(state, round.n);
+    const late = trusted !== null && afters.every((a) => Number.isInteger(a)) && ordinal > Math.max(...afters);
+    // The same config twice is checked once (the usual case: nobody touched pipeline.yml). The trusted default-branch config joins only for the late lane, which relaxes the checks: an ordinary round is checked exactly as before the lane existed.
     const configs = [];
-    for (const [label, config] of [['working-tree', loaded.config], ['base', base.config], ...(trusted === null ? [] : [['trusted', trusted]])]) {
+    for (const [label, config] of [['working-tree', loaded.config], ['base', base.config], ...(late ? [['trusted', trusted]] : [])]) {
       const seen = configs.find((c) => JSON.stringify(c[1]) === JSON.stringify(config));
       if (seen) { if (label !== 'trusted') seen[0] += ` and ${label}`; }
       else configs.push([label, config]);
     }
     const files = givenFiles ?? diffFiles(diff.from, round.toHead, { cwd: root });
-    // The late lane (review.fix_verify_after_round): every config sets it (the trusted one must be readable) and the counted ordinal is above the largest.
-    const afters = [loaded.config, base.config, ...(trusted === null ? [] : [trusted])].map((c) => c.review?.fix_verify_after_round);
-    const ordinal = countedOrdinal(state, round.n);
-    const late = trusted !== null && afters.every((a) => Number.isInteger(a)) && ordinal > Math.max(...afters);
-    scope = fixRoundScope({ files, configs: configs.map((c) => c[1]) });
+    if (late) scope = fixRoundScope({ files, configs: configs.map((c) => c[1]) });
     if (late && scope.flagged) return full(`late fix round: the fix scope is flagged (${scope.reasons.join('; ')})`);
     for (const [label, config] of configs) {
       const hits = await collectHardStops({ base: diff.from, head: round.toHead, cwd: root, config });
@@ -387,7 +390,7 @@ async function chooseBrief(state, round, diff, root, { forceFull = false, truste
     return full(`could not assess the round range: ${msgOf(err)}`);
   }
   return {
-    expectation: BRIEFS[BRIEF_FIX_VERIFY], fix: { ...candidate.previous, scope },
+    expectation: BRIEFS[BRIEF_FIX_VERIFY], fix: { ...candidate.previous, scope, late: lateReason !== null },
     reason: lateReason ?? `fix round: round ${candidate.previous.round} accepted ${candidate.previous.accepted.length} item(s) and the round's own range is clean and low risk`,
   };
 }

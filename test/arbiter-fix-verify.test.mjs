@@ -170,6 +170,8 @@ test('arbiter needed: the fix-verify input lists the previous round\'s ACCEPT it
   assert.match(text, /verify each fix is correct and complete/i);
   assert.match(text, /bugs or regressions the round diff introduces/i);
   assert.match(text, /do not re-review code outside the round diff unless a fix depends on it/i);
+  // R1-F3: the defaults change nothing, so an ordinary fix round carries none of the late lane's added text
+  assert.doesNotMatch(text, /Fix scope:|fix-specific|raise nothing about code outside|raise ONE finding/);
   assert.match(text, /findings/);
   // the ACCEPT item: id, title, file:line, detail, the ruling's reason
   assert.match(text, /R1-S1/);
@@ -582,6 +584,9 @@ test('late lane: counted round 2 > fix_verify_after_round 1 on sensitive paths g
   assert.match(r.json.briefReason, /late fix round: counted round 2 > review\.fix_verify_after_round 1; sensitive paths allowed/);
   assert.match(w.inputText(2), /Fix scope: \d+ non-test added line\(s\) \(limit 150\), 0 new non-test file\(s\)/);
   assert.match(w.inputText(2), /verify each listed fix, then look for regressions in the round diff/);
+  // R1-F3: the narrowing keeps the exception, so an incomplete fix whose evidence lies outside the round diff can still be raised
+  assert.match(w.inputText(2), /raise nothing about code outside the round diff unless a listed fix is incomplete or wrong because of it/);
+  assert.doesNotMatch(w.inputText(2), /raise nothing about code outside the round diff\. /);
 });
 
 test('late lane: round 2 is NOT late when fix_verify_after_round is 2 (round 3 is the first); an unset key, or a sensitive path without it, stays full', (t) => {
