@@ -125,3 +125,17 @@ export function substituteEligibility({ reason, timedOut = false, quota, modelSt
   if (resetNear({ resetAt, minWaitMinutes, now })) return out(false, 'reset-near', { waitUntil: resetAt });
   return out(true, 'quota');
 }
+
+// The message a refused-model stop gives (codex-review and triage second-review): what happened, where review.codex_model is read from and how to fix it, then the ACTUAL substitute
+// verdict (proof is not permission: R1-3). \`model\` is the trusted review.codex_model string, never a name from the provider's message. An unreadable base config (R3-4) says to repair it.
+export function modelRefusalMessage({ model, verdict, defaultBranch }) {
+  const head = `Codex refused the configured model ${model} (model_not_found: retired, renamed, or not available to this Codex login). review.codex_model is read from the pipeline.yml at ${defaultBranch}'s fork point: fix it on ${defaultBranch}, then bring that fix into this branch (merge/update-branch) so its fork point moves.`;
+  if (verdict.eligible) return `${head} A substitute (${verdict.agent}) may stand in: \`pipeline substitute prepare\`.`;
+  if (verdict.why === 'mode-off') {
+    const unreadable = /could not be read \((.*)\); an unreadable base config/.exec(verdict.modeOffFrom ?? '');
+    if (unreadable) return `${head} No substitute may stand in: the pipeline.yml at ${defaultBranch}'s fork point is not a valid config (${unreadable[1]}): repair .claude/pipeline.yml on ${defaultBranch} with an owner commit; no PR can get a substitute until then.`;
+    return `${head} No substitute may stand in: ${verdict.modeOffFrom ?? 'review.substitute.mode is off'}.`;
+  }
+  if (verdict.why === 'model-unproven') return `${head} No substitute may stand in: the refusal could not be proven (${verdict.unproven ?? 'unproven'}); run codex-review again once review.codex_model is fixed on ${defaultBranch}.`;
+  return `${head} No substitute may stand in (${verdict.why}).`;
+}

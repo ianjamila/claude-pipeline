@@ -33,8 +33,8 @@ import {
 import {
   currentContentHash, ensureRoundDir, findItem, findRound, readFileOrFail, refreshBaseRef, refreshTrustedDefault, requireState, reviewBaseRef, roundDir, sha256, withRouteLock, withStateLock, writeFileAtomic, writeJson,
 } from '../lib/review-context.mjs';
-import { assertCurrentAttempt, finishAttempt, readRoute, startAttempt, substituteEligibility, superseded, writeFinalRoute } from '../lib/route-record.mjs';
-import { headMoved, routeConfigFor } from '../lib/review-round.mjs';
+import { assertCurrentAttempt, finishAttempt, modelRefusalMessage, readRoute, startAttempt, substituteEligibility, superseded, writeFinalRoute } from '../lib/route-record.mjs';
+import { headMoved, modelNoteFor, routeConfigFor } from '../lib/review-round.mjs';
 import { noteCodexAnswered, noteQuotaStop, recordCodexRun } from '../lib/codex-usage.mjs';
 import { floorOutput, judgeAndPublish } from '../lib/floor-proof.mjs';
 import { PROOF_EFFORT, proveSubstituteRun, refuseTestOnlyFlags } from '../lib/substitute-proof.mjs';
@@ -503,6 +503,8 @@ function secondReviewNext(verdicts) {
 // What a second review's verdict adds when a Claude substitute gave it instead of Codex: who, on what evidence, and the proof (substituteInventory reads by / evidence / models).
 const substituteVerdictFields = ({ agent, route, proof, transcript }) => ({
   by: agent, evidence: route.evidence, models: proof.models, proof: { transcript, models: proof.models, effort: PROOF_EFFORT },
+  // the refused Codex model (the trusted review.codex_model the evidence was recorded for), distinct from `models` (the substitute's own): the published comment names it (render.mjs)
+  ...(route.evidence === 'model' && typeof route.model === 'string' ? { codexModelRefused: route.model } : {}),
 });
 
 // The output of a recorded second review, the same for Codex and for a substitute.
@@ -530,7 +532,7 @@ async function secondReview(rest, ctx) {
   const ids = [...new Set(requireOption(values, 'ids').split(/[\s,]+/).filter(Boolean))].sort();
   if (ids.length === 0) throw new UsageError('--ids must name at least one item');
   const root = resolveRepo(values, ctx);
-  const { config } = await requireConfig(root);
+  const { config, path: configPath } = await requireConfig(root);
   const refuse = (reason, extra = {}) => ({ exitCode: EXIT.FAILED, output: { ok: false, round: n, reason, ...extra } });
   if (config.owner_approval !== 'chat') {
     return refuse('a second review is run only with owner_approval: chat in pipeline.yml; in label mode the owner clears needs-human by label');
@@ -539,6 +541,7 @@ async function secondReview(rest, ctx) {
   refreshTrustedDefault(root, config); // the trusted model is read at the fork point from origin/<the remote's default branch>: best effort, a failed fetch keeps the cached ref
   const sub = routeConfigFor(root, config); // the stricter of the working tree's and the trusted base config's review.substitute
   const model = sub.codexModel; // the trusted model (the base config's, else the built-in default), never the working tree's (#389)
+  const modelNote = modelNoteFor({ config, configPath, trustedModel: model, codexModelFrom: sub.codexModelFrom }); // #445: the working tree names another model than the one that runs
 
   // Check under the lock; the packet is built from the state and git right here.
   const asked = await withStateLock(root, ctx, () => {
@@ -597,7 +600,7 @@ async function secondReview(rest, ctx) {
 
   // Codex runs WITHOUT the lock (it can take minutes). The prompt is kept before it starts, so a crashed run still leaves what it was asked.
   writeFileAtomic(path.join(dir, `second-review-${ids[0]}.md`), promptBytes);
-  const ran = await execCodex({ root, env: ctx.env, args, promptBytes, outPath });
+  const ran = await execCodex({ root, env: ctx.env, args, promptBytes, outPath, requestedModel: model });
   // The weekly Codex figure (codex-usage.mjs): one ledger line per real run; a ledger that cannot be written is only a warning.
   const logged = recordCodexRun({
     kind: 'second-review', repo: asked.repo || repoSlug(), pr, round: n, effort: SECOND_REVIEW_EFFORT, model, ok: ran.ok,
@@ -605,10 +608,17 @@ async function secondReview(rest, ctx) {
   const usageWarnings = logged.ok ? [] : [logged.warning];
   if (!ran.ok) {
     const verdict = substituteEligibility({
-      reason: ran.reason, timedOut: ran.timedOut === true, quota: ran.quota, mode: sub.mode, modeOffFrom: sub.modeOffFrom, minWaitMinutes: sub.minWaitMinutes, agent: asked.agent,
+      reason: ran.reason, timedOut: ran.timedOut === true, quota: ran.quota, modelStop: ran.modelStop, mode: sub.mode, modeOffFrom: sub.modeOffFrom, minWaitMinutes: sub.minWaitMinutes, agent: asked.agent,
     });
     const quotaStop = ran.reason === 'quota' && ran.quota?.eligible === true;
-    await failAttempt(quotaStop
+    // A refused model (cp #431), proven by the session log and a confirmation run: the evidence names the TRUSTED model string, never one from the provider's message.
+    const modelStopProven = ran.reason === 'model' && ran.modelStop?.eligible === true;
+    await failAttempt(modelStopProven
+      ? {
+        evidence: 'model', outcome: 'failed', reason: 'model', model, provider: ran.modelStop.provider,
+        errorEvent: { type: 'turn.failed', message: ran.modelStop.message }, threadId: ran.modelStop.threadId ?? null, promptSha256: inputDigest, proof: ran.modelStop.proof, confirm: ran.modelStop.confirm,
+      }
+      : quotaStop
       ? {
         evidence: 'quota', outcome: 'failed', reason: 'quota', resetAt: ran.quota.resetAt, resetText: ran.quota.resetText,
         errorEvent: { type: 'turn.failed', message: ran.quota.message }, threadId: ran.quota.threadId ?? null, promptSha256: inputDigest, proof: ran.quota.proof,
@@ -622,7 +632,8 @@ async function secondReview(rest, ctx) {
     let substitute = verdict;
     if (verdict.eligible) {
       const prepared = await withStateLock(root, ctx, () => prepareSecondAttempt({
-        root, round: n, packetId, ids, agent: asked.agent, prompt, head: asked.head, evidence: 'quota', resetText: ran.quota.resetText, resetAt: ran.quota.resetAt, minWaitMinutes: sub.minWaitMinutes, env: ctx.env ?? process.env,
+        root, round: n, packetId, ids, agent: asked.agent, prompt, head: asked.head, minWaitMinutes: sub.minWaitMinutes, env: ctx.env ?? process.env,
+        ...(modelStopProven ? { evidence: 'model', model } : { evidence: 'quota', resetText: ran.quota.resetText, resetAt: ran.quota.resetAt }),
       }), pr);
       substitute = prepared.ok
         ? { ...verdict, packetId, attempt: prepared.k, tag: prepared.tag, promptHeader: prepared.header, inputPath: prepared.inputPath, digest: prepared.digest, reused: prepared.reused }
@@ -632,7 +643,9 @@ async function secondReview(rest, ctx) {
     throw new Fail(EXIT.UNAVAILABLE, {
       ok: false, unavailable: true, reason: ran.reason, code: ran.code, timedOut: ran.timedOut, detail: ran.detail,
       ...(ran.retried ? { retried: ran.retried } : {}),
+      ...(modelNote === undefined ? {} : { modelNote }),
       ...(ran.reason === 'quota' && ran.quota ? { quota: { proof: ran.quota.proof, resetAt: ran.quota.resetAt, resetText: ran.quota.resetText } } : {}),
+      ...(ran.reason === 'model' ? { modelStop: { proven: modelStopProven, proof: ran.modelStop?.proof ?? null, model, ...(ran.modelStop?.unproven ? { unproven: ran.modelStop.unproven } : {}) }, message: modelRefusalMessage({ model, verdict: substitute, defaultBranch: config.default_branch }) } : {}),
       substitute,
       ...(warnings.length + usageWarnings.length > 0 ? { warnings: [...warnings, ...usageWarnings] } : {}),
     });
@@ -683,7 +696,7 @@ async function secondReview(rest, ctx) {
       return { saved, settled };
     });
     const { next: publishNext, ...published } = publishRuling({ ctx, root, pr, state: saved });
-    return secondReviewOutput({ n, settled, published, publishNext });
+    return secondReviewOutput({ n, settled, published, publishNext, ...(modelNote === undefined ? {} : { extra: { modelNote } }) });
   }, pr);
   // Codex answered: the PR is no longer waiting for it and its last outage is over (best effort, as after a first review).
   if (recorded.exitCode !== EXIT.OK) return recorded;
@@ -722,7 +735,11 @@ async function secondReviewApply(values, ctx) {
       throw fail(EXIT.FAILED, 'route-mismatch', `${file} does not describe a second review of round ${n}`);
     }
     if (!SECOND_EVIDENCE_KINDS.includes(route.evidence)) {
-      throw fail(EXIT.FAILED, 'no-evidence', `${file} holds evidence ${JSON.stringify(route.evidence ?? null)}, not quota | budget | governor: Codex was not refused (or is still being asked): run \`pipeline triage second-review\` again`, { evidence: route.evidence ?? null });
+      throw fail(EXIT.FAILED, 'no-evidence', `${file} holds evidence ${JSON.stringify(route.evidence ?? null)}, not quota | model | budget | governor: Codex was not refused (or is still being asked): run \`pipeline triage second-review\` again`, { evidence: route.evidence ?? null });
+    }
+    // A refused model is evidence about the trusted review.codex_model it was recorded for: when the fork point has moved on (the owner fixed it, or changed it again) it says nothing about the model now trusted (R3-2).
+    if (route.evidence === 'model' && route.model !== gates.codexModel) {
+      throw fail(EXIT.FAILED, 'route-mismatch', `the trusted Codex model is now ${gates.codexModel}, not the refused ${route.model}: run \`pipeline triage second-review\` again`);
     }
     const record = readSecondAttempts(root, n, route.packetId);
     const open = record.attempts.find((a) => a.status === 'prepared');

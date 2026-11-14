@@ -135,6 +135,8 @@ hard_stops:                    # project extras on top of the universal list
   report_only_paths: []        # globs like `paths` whose match is listed but never blocking (a path in both lists blocks)
 
 review:
+  # Reviews use codex_model and effort as committed on the default branch: a higher effort in your working copy applies at once; a lower effort or another codex_model
+  # applies once it is on the default branch and this branch includes it. codex_model is a model id (letters, digits, . _ -).
   codex_model: gpt-6-astra
   effort: {low: medium, medium: medium, high: high, followup: medium, small_fix: low, small_fix_lines: 40}
                                 # low/medium/high: round 1 by the PR's risk; followup: later rounds. small_fix: the effort of a fix-check round whose reviewed

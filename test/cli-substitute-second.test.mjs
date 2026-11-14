@@ -14,6 +14,9 @@ import { assertExit } from './helpers/assert-exit.mjs';
 import { readResultText } from './helpers/read-result.mjs';
 import { floorEnv } from './helpers/floor-env.mjs';
 import { readStatus } from '../pipeline/lib/codex-usage.mjs';
+import { PROBE_MODEL, modelStopEnv } from './helpers/model-stop.mjs';
+import { DEFAULTS } from '../pipeline/lib/config.mjs';
+import { triageComment } from '../pipeline/lib/render.mjs';
 import { rulingsDigest, rulingsInventory, substituteDigest, substituteInventory } from '../pipeline/lib/triage.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -589,4 +592,79 @@ test('R13-F1: a second review whose quota reset is within the BASE config\'s min
   const r = w.second('R1-B1', { ...w.quota(), FAKE_CODEX_TURN_FAILED: "You've hit your usage limit. Upgrade to Pro, or try again in 10 minutes." });
   assertExit(r, 3, r.stdout + r.stderr);
   assert.deepEqual([r.json.substitute.eligible, r.json.substitute.why], [false, 'reset-near']);
+});
+
+// ---------- a refused Codex model (cp #431): evidence kind `model` for a second review ----------
+
+const MODEL = DEFAULTS.review.codex_model; // the trusted model of a world with no review.codex_model of its own
+const modelRun = (w, opts = {}) => modelStopEnv(w.scratch, { model: MODEL, ...opts });
+
+test('model stop: exit 3 reason model with the substitute packet; route-2nd holds the model evidence with the trusted model; the input names it; apply stores secondReview.evidence model + codexModelRefused', (t) => {
+  const w = world(t);
+  const r = w.second('R1-B1,R1-B2', modelRun(w));
+  assertExit(r, 3, r.stdout + r.stderr);
+  assert.equal(r.json.reason, 'model');
+  assert.deepEqual(r.json.modelStop, { proven: true, proof: 'session-log', model: MODEL });
+  assert.ok(r.json.message.includes(`Codex refused the configured model ${MODEL} (model_not_found`), r.json.message);
+  assert.ok(r.json.message.includes('A substitute (substitute-opus) may stand in'), r.json.message);
+  const sub = r.json.substitute;
+  assert.deepEqual([sub.eligible, sub.why, sub.agent], [true, 'model', 'substitute-opus']);
+  const id8 = sub.tag.split(' ')[2];
+  const route = w.route(id8);
+  assert.deepEqual([route.kind, route.evidence, route.outcome, route.reason, route.model, route.provider, route.proof], ['second-review', 'model', 'failed', 'model', MODEL, 'openai', 'session-log']);
+  assert.ok(!JSON.stringify(route).includes(PROBE_MODEL), 'only the trusted model string is recorded');
+  const input = readFileSync(sub.inputPath, 'utf8');
+  assert.ok(input.includes(`Why a substitute reviews this: Codex refused the configured model ${MODEL} (model_not_found)`), 'the packet names the trusted model');
+
+  const done = w.apply(sub.tag, install(w, sub, ['R1-B1', 'R1-B2'], { answer: answerOf(['R1-B1', 'REJECT', 'high'], ['R1-B2', 'ACCEPT', 'medium']) }));
+  assertExit(done, 0, done.stdout + done.stderr);
+  assert.equal(done.json.evidence, 'model');
+  for (const id of ['R1-B1', 'R1-B2']) {
+    const sr = w.item(id).secondReview;
+    assert.deepEqual([sr.by, sr.evidence, sr.codexModelRefused], ['substitute-opus', 'model', MODEL], id);
+  }
+  // R2-1: the published comment names the refusal whatever the item's final is: the REJECT leaves the arbiter's final, the ACCEPT is Claude's, one line for the one model
+  assert.equal(w.item('R1-B1').final.by, 'arbiter');
+  assert.equal(w.item('R1-B2').final.by, 'claude');
+  const comment = triageComment(w.state());
+  assert.match(comment, /^#### Codex model refusals$/m);
+  assert.equal(comment.split(`Codex refused the configured model ${MODEL} (model_not_found)`).length - 1, 1, 'deduplicated');
+  assert.ok(comment.includes('fix review.codex_model on the default branch'), comment);
+  // only the REJECT: the arbiter keeps the final, no claude-ruling exists, and the block is still there
+  const solo = world(t);
+  const s = solo.second('R1-B1', modelRun(solo));
+  assertExit(s, 3, s.stdout);
+  const only = solo.apply(s.json.substitute.tag, install(solo, s.json.substitute, ['R1-B1'], { answer: answerOf(['R1-B1', 'REJECT', 'high']) }));
+  assertExit(only, 0, only.stdout + only.stderr);
+  assert.equal(solo.item('R1-B1').final.by, 'arbiter');
+  assert.match(triageComment(solo.state()), /Codex refused the configured model gpt-6-astra/);
+});
+
+test('a refused model that cannot be proven, or with the substitute off, gives no packet: eligible false with the reason in the message', (t) => {
+  const unproven = world(t);
+  const a = unproven.second('R1-B1', modelRun(unproven, { main: { error: 'unexpected status 401 Unauthorized' } }));
+  assertExit(a, 3, a.stdout);
+  assert.deepEqual([a.json.reason, a.json.substitute.eligible, a.json.substitute.why, a.json.modelStop.proven], ['model', false, 'model-unproven', false]);
+  assert.match(a.json.message, /could not be proven/);
+  assert.equal(a.json.substitute.tag, undefined);
+  const off = world(t, { yml: MODE_OFF_YML });
+  const b = off.second('R1-B1', modelRun(off));
+  assertExit(b, 3, b.stdout);
+  assert.deepEqual([b.json.substitute.eligible, b.json.substitute.why], [false, 'mode-off']);
+  assert.match(b.json.message, /No substitute may stand in: the working-tree pipeline.yml sets review.substitute.mode off/);
+});
+
+test('apply refuses a refused-model record whose trusted model has changed since (R3-2: route-mismatch)', (t) => {
+  const w = world(t);
+  const r = w.second('R1-B1', modelRun(w));
+  assertExit(r, 3, r.stdout);
+  const sub = r.json.substitute;
+  const id8 = sub.tag.split(' ')[2];
+  const file = join(w.dir(), `route-2nd-${id8}.json`);
+  writeFileSync(file, JSON.stringify({ ...w.route(id8), model: 'gpt-older-1' }));
+  const applied = w.apply(sub.tag, install(w, sub, ['R1-B1']));
+  assertExit(applied, 1, applied.stdout);
+  assert.equal(applied.json.error, 'route-mismatch');
+  assert.match(applied.json.message, /the trusted Codex model is now gpt-6-astra, not the refused gpt-older-1/);
+  assert.equal(w.item('R1-B1').secondReview, undefined, 'nothing recorded');
 });
