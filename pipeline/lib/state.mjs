@@ -27,12 +27,16 @@ const STRAY_TMP_MAX_AGE_MS = 60 * 60 * 1000;
 // Codex while its quota was spent) or a budget / governor decision: a pipeline from before the substitute would read it as an ordinary Codex review.
 // Every other state stays 1. (The plan 2026-11-11-codex-substitute-reviewer called this "3"; main had already used 3 for the deferral.)
 // Version 5: an arbiter ruling or Fable finding carries `final.outOfModel` (a FOLLOW-UP ruled outside a review.threat_models model: an older installation would not hold the
-// review back until its issue is filed). A writer picks the HIGHEST version any feature of the state needs (requiredStateVersion).
-export const SUPPORTED_STATE_VERSION = 5;
+// review back until its issue is filed). Version 6: a final carries `postMax` (an ACCEPT turned into a FOLLOW-UP past review.max_rounds, #374 PR B): a pipeline of version 5 has no filing gate for it.
+// A writer picks the HIGHEST version any feature of the state needs (requiredStateVersion).
+export const SUPPORTED_STATE_VERSION = 6;
 export const STATE_VERSION_CLAUDE = 2;
 export const STATE_VERSION_DEFERRAL = 3;
 export const STATE_VERSION_SUBSTITUTE = 4;
 export const STATE_VERSION_OUT_OF_MODEL = 5;
+export const STATE_VERSION_POST_MAX = 6;
+// Does any final of the state carry the post-max marker? Then the writer lifts the state to STATE_VERSION_POST_MAX (and only then: a plain state keeps its version and round-trips unchanged).
+export const stateNeedsPostMaxVersion = (state) => (Array.isArray(state?.rounds) ? state.rounds : []).some((r) => (Array.isArray(r?.items) ? r.items : []).some((i) => isPlainObject(i?.final?.postMax)));
 // Does any final of the state carry the out-of-model marker? Then the writer lifts the state to STATE_VERSION_OUT_OF_MODEL (and only then: ordinary PRs stay readable by old CLIs).
 export const stateNeedsOutOfModelVersion = (state) => (Array.isArray(state?.rounds) ? state.rounds : []).some((r) => (Array.isArray(r?.items) ? r.items : []).some((i) => typeof i?.final?.outOfModel === 'string' && i.final.outOfModel !== ''));
 // The state at (at least) `version`: a writer never lowers the version a state already carries.
@@ -47,9 +51,10 @@ export const isSubstituteRound = (round) => round?.firstReviewer === 'substitute
 // Who gave a second review: 'codex' (no `by`, the first kind), or the pinned Claude substitute that did (R5-5). Anything else that starts with `substitute` reads as plain `substitute`.
 export const secondReviewerOf = (sr) => (typeof sr?.by !== 'string' || !sr.by.startsWith('substitute') ? 'codex' : sr.by === 'substitute-opus' || sr.by === 'substitute-fable' ? sr.by : 'substitute');
 const isSubstituteSecondReview = (item) => typeof item?.secondReview?.by === 'string' && item.secondReview.by.startsWith('substitute');
-// The lowest version that may hold this state, the HIGHEST any feature in it needs: 5 when a final carries the out-of-model marker (stateNeedsOutOfModelVersion), else
+// The lowest version that may hold this state, the HIGHEST any feature in it needs: 6 when a final carries the post-max marker, 5 when a final carries the out-of-model marker (stateNeedsOutOfModelVersion), else
 // 4 when it holds a substitute round / second review or a governor / budget decision, else 1.
 export function requiredStateVersion(state) {
+  if (stateNeedsPostMaxVersion(state)) return STATE_VERSION_POST_MAX;
   if (stateNeedsOutOfModelVersion(state)) return STATE_VERSION_OUT_OF_MODEL;
   const rounds = Array.isArray(state?.rounds) ? state.rounds : [];
   const needs = rounds.some((r) => isSubstituteRound(r) || isPlainObject(r?.governor) || isPlainObject(r?.budget) || (Array.isArray(r?.items) && r.items.some(isSubstituteSecondReview)));

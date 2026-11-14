@@ -487,7 +487,8 @@ export function claudeRulingRefusal(item, decision, { secondReview } = {}) {
       ? `${id} is already ACCEPT`
       : `${id} is ACCEPT by Claude or a second review: Claude cannot loosen it; only the owner's typed ruling can`;
   }
-  if (!finalIsReopenable(item)) {
+  // A post-limit FOLLOW-UP (applyPostMaxDefault) may be tightened back to ACCEPT, never any other way (secondReviewRefusal keeps finalIsReopenable: a second review does not reopen it).
+  if (!finalIsReopenable(item) && !(decision === 'ACCEPT' && isPostMaxFinal(item))) {
     return `${id} is not waiting for a human decision and is not a Claude dismissal (settled finals are not reopened)`;
   }
   if (decision === 'ACCEPT') return null;
@@ -926,6 +927,11 @@ const issueNumber = (issue) => /\/issues\/(\d{1,9})$/.exec(typeof issue === 'str
 // The "why" of a row. A deferral Claude's CLI wrote says what happened in the CLI's own words (never the agent's reason, which stays in the state and the triage
 // comment): who accepted the fix, that it is out of this merge, and the issue. Anything else, and a deferral the owner re-ruled, shows the final's reason.
 function rowWhy(item) {
+  if (isPostMaxFinal(item)) {
+    const pmx = item.final.postMax;
+    const issue = issueNumber(item.followupIssue);
+    return `accepted by ${pmx.by === 'judge' ? 'judge' : 'arbiter'} in round ${asciiLine(pmx.ordinal, 6)} past limit ${asciiLine(pmx.max, 6)}; NOT fixed in this merge; ${issue ? `issue #${issue}` : 'issue not filed yet'}`;
+  }
   if (!(isRoundCapDeferral(item) && isDeferralFinal(item))) return item.final.reason;
   const accepted = item.final.claude.overruled?.by;
   const issue = issueNumber(item.followupIssue);
@@ -946,7 +952,7 @@ const byIdAsc = (a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
 // that was carried into later rounds is one dismissal, not several).
 function inventoryEntries(state) {
   const dismissed = allItems(state)
-    .filter((i) => (i.final?.decision === 'REJECT' || i.final?.decision === 'FOLLOW-UP') && i.final.needsHuman !== true && (isCriticalItem(i) || isRoundCapDeferral(i)))
+    .filter((i) => (i.final?.decision === 'REJECT' || i.final?.decision === 'FOLLOW-UP') && i.final.needsHuman !== true && (isCriticalItem(i) || isRoundCapDeferral(i) || isPostMaxFinal(i)))
     .map((i) => ({ item: i, id: String(i.id) }))
     .sort(byIdAsc);
   const listed = new Set();
@@ -957,8 +963,8 @@ function inventoryEntries(state) {
     if (fp !== null) listed.add(fp);
     kept.push(entry);
   }
-  // Deferral rows (a fix taken out at the round limit) are their own group, after the critical rows; within a group by id.
-  const group = (item) => (isRoundCapDeferral(item) ? 1 : 0);
+  // Deferral rows (a fix taken out at the round limit, an ACCEPT turned into a FOLLOW-UP past it) are their own group, after the critical rows; within a group by id.
+  const group = (item) => (isRoundCapDeferral(item) || isPostMaxFinal(item) ? 1 : 0);
   return kept.sort((a, b) => group(a.item) - group(b.item) || byIdAsc(a, b)).map(({ item, id }) => ({ item, id, row: [
     id, item.final.decision, item.bucket, asciiLine(item.category, 40) || '-', `by ${byLabel(item)}`, `content ${rulingContentDigest([item])}`,
     `"${asciiLine(String(item.title ?? '').replace(/"/g, "'"), TITLE_MAX)}"`, `why: ${asciiLine(rowWhy(item), WHY_MAX)}`,
@@ -1150,6 +1156,9 @@ export function reviewEligibilityProblems(state) {
   // An arbiter FOLLOW-UP ruled outside a threat model (final.outOfModel) leaves the merge only through its issue, like the Claude-ruled one above (#374). Only here: roundOutcome is untouched.
   const noModelIssue = allItems(state).filter((i) => typeof i.final?.outOfModel === 'string' && i.final.decision === 'FOLLOW-UP' && !i.followupIssue).map((i) => i.id);
   if (noModelIssue.length > 0) problems.push(`out-of-model follow-up(s) without a filed issue: ${noModelIssue.join(', ')} (run followups create)`);
+  // A post-limit FOLLOW-UP (final.postMax: an ACCEPT the judge or arbiter made, turned into a follow-up by review.post_max_suggestions) leaves the merge only through its issue. Only here: roundOutcome is untouched.
+  const noPostMaxIssue = allItems(state).filter((i) => isPostMaxFinal(i) && !i.followupIssue).map((i) => i.id);
+  if (noPostMaxIssue.length > 0) problems.push(`post-limit follow-up(s) without a filed issue: ${noPostMaxIssue.join(', ')} (run followups create)`);
   const unconfirmed = rounds.flatMap((r) => (r.items ?? [])
     .filter((i) => i.implementedVia === 'other-files' && !rounds.some((later) => later.n > r.n && Array.isArray(later.confirmFixed) && later.confirmFixed.includes(i.id)))
     .map((i) => i.id));
@@ -1287,4 +1296,45 @@ export function deferEligibility(state, config, files, { grants, grantGap, baseC
     if (problems.length > 0) refusals.push(problems.join('; '));
   }
   return { eligible: refusals.length === 0, refusals, ids, severities };
+}
+
+// ---- past the limit, a low-severity ACCEPT becomes a FOLLOW-UP (#374 PR B, review.post_max_suggestions) ------------------------------------------------
+// 'follow-up' only when EVERY config given (working tree, fork point) says so: 'review' in either, a config that cannot be read (null) or one without the key, is off.
+export const postMaxPolicy = (configs) => (Array.isArray(configs) && configs.length > 0 && configs.every((c) => c?.review?.post_max_suggestions === 'follow-up') ? 'follow-up' : 'review');
+
+// A settled FOLLOW-UP that applyPostMaxDefault made (final.postMax), still the judge's / arbiter's word (or a cached copy of it): not the owner's, not Claude's, not waiting for a human.
+export const isPostMaxFinal = (item) => isObject(item?.final?.postMax) && item.final.decision === 'FOLLOW-UP' && item.final.needsHuman !== true && !isProtectedFinal(item) && !isOwnerRuled(item);
+
+// `ordinal`: the counted ordinal of the round these items belong to (fix-verify.mjs#countedOrdinal; an uncounted round gets the counted rounds before it); `max`: review.max_rounds.
+// Only a round past max + 1 is touched: the round the owner granted (max + 1) keeps its ACCEPTs. Only an ACCEPT the judge or arbiter made on a SUGGESTION / WORTH_CONSIDERING item of a
+// low-severity category, not yet implemented; never a bug, security item or BLOCKING one, a test result, a cached copy, Claude's, the owner's or a forced final.
+export function applyPostMaxDefault(items, { policy, ordinal, max } = {}) {
+  if (policy !== 'follow-up' || !Number.isInteger(ordinal) || !Number.isInteger(max) || ordinal <= max + 1) return items;
+  return items.map((item) => {
+    const final = item?.final;
+    if (!isObject(final) || final.decision !== 'ACCEPT' || final.needsHuman === true || !DEFERRABLE_BY.includes(final.by)) return item;
+    if (item.implemented === true || isProtectedFinal(item) || isOwnerRuled(item)) return item;
+    if (item.bucket !== 'SUGGESTION' && item.bucket !== 'WORTH_CONSIDERING') return item;
+    if (!LOW_SEVERITY_CATEGORIES.includes(item.category)) return item;
+    return { ...structuredClone(item), final: { ...structuredClone(final), decision: 'FOLLOW-UP', postMax: { from: 'ACCEPT', by: final.by, ordinal, max }, reason: `past review.max_rounds (round ${ordinal}, limit ${max}): ${final.reason}` } };
+  });
+}
+
+// ---- the round trip-wire (#374 PR B): a prompt, not a gate ---------------------------------------------------------------------------------------------
+// New ACCEPTs (not cached copies) per COUNTED round, in order. Trips when the PR has reviewed max + extraRounds counted rounds, or when at least `notFalling` past-limit rounds accepted
+// at least as many new items as the round before AND some (zero accepts is not "not falling": nothing was found). Past the limit only; no finite maxRounds never trips.
+// -> { tripped, reviewed, max, acceptsByRound, reasons }
+export function roundTripWire(state, { extraRounds, notFalling }) {
+  const counted = (state?.rounds ?? []).filter(countsTowardCap);
+  const acceptsByRound = counted.map((r) => (r.items ?? []).filter(isNewAccept).length);
+  const reviewed = counted.length;
+  const max = state?.maxRounds;
+  const reasons = [];
+  if (Number.isFinite(max)) {
+    if (reviewed >= max + extraRounds) reasons.push(`${reviewed} counted rounds reached review.max_rounds ${max} + ${extraRounds} (review.trip_wire_extra_rounds)`);
+    let flat = 0;
+    for (let k = max; k < reviewed; k += 1) if (k >= 1 && acceptsByRound[k] > 0 && acceptsByRound[k] >= acceptsByRound[k - 1]) flat += 1;
+    if (flat >= notFalling) reasons.push(`${flat} past-limit round(s) accepted at least as many new items as the round before (review.trip_wire_not_falling ${notFalling}): ${acceptsByRound.join(', ')}`);
+  }
+  return { tripped: reasons.length > 0, reviewed, max: Number.isFinite(max) ? max : null, acceptsByRound, reasons };
 }

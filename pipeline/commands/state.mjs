@@ -19,7 +19,7 @@ import { wholePrOwed } from '../lib/review-route.mjs';
 import { roundStats } from '../lib/round-stats.mjs';
 import { hashBranch, prBaseBranch } from '../lib/risk.mjs';
 import { addRound, loadState, saveState, updateItems } from '../lib/state.mjs';
-import { arbiterFailures, countsTowardCap, finalIsReopenable, isOwnerRuled, isProtectedFinal, reviewedRoundCount, roundOutcome, staleFableRounds, staleSubstituteFableRounds } from '../lib/triage.mjs';
+import { arbiterFailures, countsTowardCap, finalIsReopenable, isOwnerRuled, isPostMaxFinal, isProtectedFinal, reviewedRoundCount, roundOutcome, staleFableRounds, staleSubstituteFableRounds } from '../lib/triage.mjs';
 import { pastRoundHistoryProblem, publishTriage, readBaseline, readPublished, reviewContentHash, writeBaseline } from '../lib/review-publish.mjs';
 import {
   allItems, canonicalJson, currentContentHash, decidedItemsKey, findItem, findRound, followupsPending, newStaleDir, quarantineReviewDir, refreshBaseRef, requireState, reviewBaseRef,
@@ -144,7 +144,8 @@ function savedRulingIsAhead(i, before) {
   // The writers never reopen a settled final (triage.mjs secondReviewRefusal / claudeRulingRefusal), so neither a verdict nor a ruling over one is saved work.
   if (canonicalJson(i.final) === canonicalJson(before.final)) return verdictAdded && finalIsReopenable(before);
   if (continuesPublished(i, before)) return true;
-  if (!isProtectedFinal(i) || isProtectedFinal(before) || isOwnerRuled(before) || !finalIsReopenable(before)) return false;
+  // (a Claude ACCEPT over a post-limit FOLLOW-UP is reopening it on purpose: claudeRulingRefusal allows exactly that)
+  if (!isProtectedFinal(i) || isProtectedFinal(before) || isOwnerRuled(before) || !(finalIsReopenable(before) || (i.final.decision === 'ACCEPT' && isPostMaxFinal(before)))) return false;
   const overruled = i.final.claude?.overruled;
   if (overruled !== undefined && canonicalJson(overruled) !== canonicalJson(before.final)) return false;
   return i.final.forcedBy === undefined || verdictAdded;
