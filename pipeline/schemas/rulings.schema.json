@@ -14,7 +14,8 @@
           "id": { "type": "string", "minLength": 1, "description": "Codex finding id the ruling is about." },
           "ruling": { "enum": ["ACCEPT", "FOLLOW-UP", "REJECT"], "description": "ACCEPT: fix in this PR. FOLLOW-UP: real but out of scope. REJECT: not a real problem or not worth doing." },
           "confidence": { "enum": ["high", "medium", "low"], "description": "low sends the item to a human. medium is accepted and stands like high; prefer high or low." },
-          "reasoning": { "type": "string", "description": "At most three sentences, citing file:line." }
+          "reasoning": { "type": "string", "description": "At most three sentences, citing file:line." },
+          "scope": { "const": "out-of-model", "description": "Optional, only with ruling FOLLOW-UP: the input's Threat model section is present and this security finding lies outside the model stated for its file. Omit it otherwise. A Fable review finding takes the same optional key." }
         }
       }
     }

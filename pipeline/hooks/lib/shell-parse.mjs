@@ -220,6 +220,10 @@ const ALT_CAP = 16; // other readings of unknown `env` options judged per line (
 const ENV_LONG = ['ignore-environment', 'null', 'unset', 'chdir', 'split-string', 'argv0', 'block-signal', 'default-signal', 'ignore-signal', 'list-signal-handling', 'debug', 'help', 'version'];
 // (GNU getopt takes any unambiguous prefix of a long option: `--uns GH_REPO`, `--ignore-e`)
 const envLong = (name) => (ENV_LONG.includes(name) ? name : (ENV_LONG.filter((o) => o.startsWith(name)).length === 1 ? ENV_LONG.find((o) => o.startsWith(name)) : null));
+// Does this command surely LEAVE the shell when it runs (so what follows a `cd DIR || <it>` ran after a cd that worked)? Only a plain `exit`, alone or with ONE literal number (#425 R1, #427): `return` at top level is an error
+// and the shell goes on; a redirection on the exit may fail before it runs (the caller reads a redirection on a group's closer); `exit 1 2` is refused ("too many arguments") and a run-time word may split into two.
+// One rule for the files guard (cd narrowing) and the git guard (orExits).
+export const plainExit = (c) => c.argv[0] === 'exit' && (c.redirects ?? []).length === 0 && (c.argv.length === 1 || (c.argv.length === 2 && /^\d+$/.test(c.argv[1])));
 // true: the env wrappers in front of the command removed NAME (and none set it again); null: one may have (an option not understood); false: not removed.
 export function envUnset(env, name) {
   const u = env?.[ENV_UNSET];

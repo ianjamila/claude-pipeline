@@ -161,5 +161,14 @@ review:
                                 # The three knobs above, small_fix_lines, codex_round_budget and codex_budget are also read as committed at the default branch's fork point,
                                 # and the STRICTER of the two wins (lower small_fix_lines / max_packet_mb, higher budgets / min_wait_minutes, mode off if either says off), so a PR
                                 # cannot loosen its own routing. A fork-point config that cannot be read counts as mode off.
+  # threat_models: []          # up to 10 {name: guards, paths: ["hooks/**"], text: "who attacks, what they can reach, what is NOT merge-blocking"}. For a PR touching a
+  #                              # matching path the Fable arbiter's input carries the model, and so does the Codex prompt on a Fable-lane round only (read from the default branch's config,
+  #                              # never the PR's own): a security finding outside it is ruled FOLLOW-UP (an issue is filed), not merge-blocking. Bugs and broken behaviour are unaffected.
+  #                              # A judge or light round never sees the model, so a modelled path should also be listed in risk.high_risk_paths or review.arbiter_always_paths if the model
+  #                              # is meant to apply to every PR touching it. name /^[a-z0-9-]{1,40}$/, text <= 4000 chars.
+  #                              # Like every new key, set it only after the installed pipeline and the vendored CI runner know it (`pipeline vendor --check`). Empty = off.
+  # fix_verify_after_round: null  # null (off) | 1..10: counted review rounds past this one may use the narrow fix-verify brief even on sensitive / high-risk paths (never on a hard-stop hit
+  #                              # other than an ignored P-path/R4-config, a size driver or a flagged fix). Honoured only when the fork-point config sets it too.
+  # fix_round_max_lines: 150     # non-test added lines a late-lane fix round may add (or one new non-test source file) before it falls back to the full brief
 
 agent_log: docs/agent-log.md   # one line per run; kept on the orphan branch `pipeline-agent-log` (`pipeline agent-log publish`), never committed to a PR branch
