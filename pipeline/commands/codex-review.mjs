@@ -56,7 +56,7 @@ export const meta = {
     '    committed at the fork point of the default branch (lower small_fix_lines and max_packet_mb, higher budgets and min_wait_minutes, mode off when either says off), so a PR cannot loosen them; an unreadable base config means mode off;',
     '    a mode-off plan or substitute verdict carries modeOffFrom: which config said off (the working tree, the base at the fork point, or an unreadable base with the reason)',
     '  review.effort.low|medium|high|followup|small_fix are each read as the HIGHER effort (low < medium < high < xhigh) of the working-tree config and the config at the fork point of the default branch (an unreadable base: held against the built-in lanes; a base config that names another default_branch than the working tree\'s, under a trusted anchor, still counts: the stricter of the working tree, that config and the built-in lanes), so a PR cannot lower its own review effort;',
-    '    review.codex_model is the base config\'s (an unreadable base or an untrusted anchor: the built-in default), never the working tree\'s, and --model must name it, else exit 2 {error:model-mismatch, expected}; it is read at the fork point admission fetched, so this check follows admission',
+    '    review.codex_model is the base config\'s (an unreadable base or an untrusted anchor: the built-in default), never the working tree\'s, and --model must name it, else exit 2 {error:model-mismatch, expected}; it is read at the fork point admission fetched (origin/<default branch>, refreshed best effort even when the PR\'s base is another branch, a stack), so this check follows admission',
     '  when GitHub names no base branch and the default branch cannot be anchored on the remote (an origin remote that answered neither origin/HEAD nor ls-remote: the working tree\'s default_branch is the PR\'s to edit), exit 3 {reason:github, error:unanchored-base}; with such an untrusted anchor the commits merged in from the base branch are never left out of a later round (the range is the previous round\'s head, kind previous)',
     '  a whole-PR round is owed (state outcome wholePrOwed) when an Opus substitute round came before the PR\'s risk rose to high and no whole-PR round has run since: that round must use the PR\'s merge base as --base (else exit 2 base-mismatch),',
     '    reviews the whole PR (reviewBaseKind merge-base, never base-only or resolution-only, counts toward the cap) and records wholePr:true and patchSha256. An all-Codex history owes none',
@@ -140,8 +140,8 @@ export const run = guarded(async (argv, ctx) => {
   const dir = roundDir(root, round);
   // The model is the TRUSTED one (the config at the default branch's fork point, else the built-in default: review-round.mjs#strictestRouteConfig), never the working tree's, which a PR
   // can edit; --model must name it too (#389). The SHAPE of the effort and of a --model is checked first (a usage error before anything runs); which model is the trusted one is only
-  // known once admitRound has fetched the default branch and fixed the trusted fork point (a local origin/<default> behind the remote would name an older model), so the model and the
-  // model-mismatch check come after it (R1-B2).
+  // known once admitRound has fetched the default branch (the PR's base, and the default branch itself when that is another one: a stack) and fixed the trusted fork point (a local
+  // origin/<default> behind the remote would name an older model), so the model and the model-mismatch check come after it (R1-B2, R2-F1).
   const argsFor = (outPath, model) => {
     try {
       return buildCodexArgs({ cwd: root, model, effort, schemaPath: FINDINGS_SCHEMA_PATH, outPath });

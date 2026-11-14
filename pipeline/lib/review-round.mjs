@@ -32,7 +32,7 @@ import { readWeeklyUsage } from './codex-usage.mjs';
 import { linkDeferredFollowups, reuseRuled, reviewedRoundCount, roundAdmission, roundOutcome, ruledCacheFrom } from './triage.mjs';
 import { claimGrantMarkers, grantIdOf, ownerGrantConfigDirHint, ownerGrantedRounds, ownerGrantGap } from '../hooks/lib/owner-go.mjs';
 import {
-  allItems, currentContentHash, ensureRoundDir, excerptWindow, reviewBaseRef, roundDir, withReviewLock, withRouteLock, writeFileAtomic, writeJson,
+  allItems, currentContentHash, ensureRoundDir, excerptWindow, refreshTrustedDefault, reviewBaseRef, roundDir, withReviewLock, withRouteLock, writeFileAtomic, writeJson,
 } from './review-context.mjs';
 
 // What the prompt and the stored round carry of a proven resolution. The lists are cut to 50 (dropped blocks first, so a cut never
@@ -186,6 +186,8 @@ export async function admitRound({ root, config, ctx, pr, round, base, head }) {
   } catch (err) {
     if (!(err instanceof GitError)) throw err;
   }
+  // The trusted fork point (rateBranch, the model, the lanes) is measured from origin/<default branch>, which is not the PR's base for a stack: refresh it too (R2-F1).
+  refreshTrustedDefault(root, config, { except: prBase });
   const forkPoint = mergeBase(reviewBaseRef(root, config, prBase), head, o);
   c.forkPoint = forkPoint;
   checkBase(state, c);
