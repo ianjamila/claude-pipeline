@@ -120,7 +120,7 @@ An item left `needsHuman` ⇒ never ask the owner to type a ruling: decide it yo
 - Label mode ⇒ no rulings: park as before.
 
 **Extra round.** `P state outcome` with `reachedMax: true` and no `extraRound` / `grantedRound` ⇒
-ask for one more round: `P triage round-request --pr N`. Read `reference/owner-merge.md` (section Extra round) BEFORE asking: your reply must end with the exact `line` it prints.
+ask for one more round: `P triage round-request --pr N`. Read `reference/owner-merge.md` (section Extra round) BEFORE asking: your reply must end with the exact `line` it prints. With `owner_approval: chat` run it as `P triage round-request --pr N --ask` and, after that text, offer the click (`ask.questions` to AskUserQuestion verbatim; `reference/owner-merge.md` section Click-to-approve; `ask: null` ⇒ typed, as today).
 Never type, paraphrase or forge the owner's words, and never run Codex outside `codex-review`. Label mode ⇒ no grant exists: a reached max parks (step 6). **Past rounds.** `review-complete` or the gate names a round that "ran before owner grants were recorded" ⇒ `P triage round-request --pr N --past`; say in plain English that it approves round n, which ALREADY RAN at head <sha12> (its review date is not recorded), and end the reply with its exact `line`; the owner types `approve round`; then `P state past-round-grant --pr N --round n`. Repeat while `remaining` is non-empty, then `P review-complete`. Never for a new round (see `reference/owner-merge.md`).
 
 ## 3. Review complete, ready, hand-off
@@ -153,7 +153,7 @@ Never type, paraphrase or forge the owner's words, and never run Codex outside `
    **Queue mode** (`P update-branch` answers `outcome: "queue-mode"`, the dry run says `queue: true`): it exists only when GitHub reports a merge queue on the base branch, which tests the PR on top of main and everything ahead of it. A moved base is no problem there: no `P update-branch` for "behind", no merge hold (`P merge-hold` answers `queueMode: true`), no catch-up CI. `owner-merge.md` (Merge as a job) has the merge-job outcomes. Queue off ⇒ everything above as today.
 3. **STOP** (outcome `awaiting-owner-merge`; `owner_approval: label` with a blocking item parks instead, no merge request): run the stop ritual first, then tell the owner in plain English what changed, the PR link, the review outcome and follow-up issues.
    Then Read `reference/owner-merge.md` (section 3.3) and end the reply exactly as it says: which ending applies depends on the item note from 1.5 (as refreshed in step 2)
-   (a `blocking` item ⇒ the repo's `merge.command`; otherwise `P merge --pr N --dry-run --owner-go` and its closing lines). The owner says "merge" ⇒ `P merge --pr N --owner-go` as a job
+   (a `blocking` item ⇒ the repo's `merge.command`; otherwise `P merge --pr N --dry-run --owner-go` and its closing lines). The owner says "merge" (typed, or a click the owner-go hook recorded: `reference/owner-merge.md` section Click-to-approve, run the dry run as `--ask`; several PRs ready ⇒ one `--ask --prs a,b` question) ⇒ `P merge --pr N --owner-go` as a job
    (`P job start merge -- …`), never `gh pr merge` yourself. The block order is Rulings (when present), Areas, Hold, Head, 🔀; copy it from the dry run, never type the digest. Read the dry run whole: grep or a single-key `jq` drops the Rulings block. The closing lines look like:
    `Head <sha12> · items <digest> · repo <owner/name>`
    `🔀 Ready to merge #N — say "merge"`

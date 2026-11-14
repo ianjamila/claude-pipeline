@@ -459,6 +459,24 @@ const captured = (w) => readFileSync(join(w.scratch, 'capture.jsonl'), 'utf8').t
 const sha256 = (s) => createHash('sha256').update(s).digest('hex');
 const unchanged = (w, before, why) => assert.equal(w.stateText(), before, why);
 
+test('second-review: the Codex run is logged in the usage ledger as kind second-review (also a failed run)', (t) => {
+  const w = world(t);
+  assertExit(w.codex(1, findingsOf([finding()])), 0);
+  w.wait('R1-B1', 'low-confidence');
+  const file = join(w.scratch, 'usage', 'codex-usage.jsonl');
+  const env = { PIPELINE_CODEX_USAGE_FILE: file };
+  const failed = second(w, 'R1-B1', answerOf(['R1-B1']), { env: { ...env, FAKE_CODEX_EXIT: '1', FAKE_CODEX_STDERR: 'segfault' } });
+  assertExit(failed, 3);
+  const r = second(w, 'R1-B1', answerOf(['R1-B1', 'REJECT', 'high']), { env });
+  assertExit(r, 0, r.stdout + r.stderr);
+  const lines = readFileSync(file, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l));
+  assert.deepEqual(lines.map((l) => [l.v, l.kind, l.repo, l.pr, l.round, l.effort, l.ok]), [
+    [1, 'second-review', 'acme/widgets', 7, 1, 'high', false],
+    [1, 'second-review', 'acme/widgets', 7, 1, 'high', true],
+  ]);
+  assert.match(lines[1].model, /^[A-Za-z0-9._-]+$/);
+});
+
 test('second-review: the packet is blind (finding, test evidence, head, title, risk), and Codex runs read-only with a fresh session', (t) => {
   const w = world(t);
   assertExit(w.codex(1, findingsOf([finding()])), 0);

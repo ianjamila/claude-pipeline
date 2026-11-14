@@ -75,6 +75,11 @@ test('parseResultMarkers is strict: unknown key, duplicate key, missing key and 
   assert.equal(parseResultMarkers(`${marker({ run: '1' })}\ntext\n${marker({ run: '2' })}`).length, 2);
 });
 
+test('parseLog: a pending line that ends with the weekly Codex figure is still pending; another suffix is not', () => {
+  const text = [`${pendingLine(5)} · Codex 7d: 12 runs (9 high)`, `${pendingLine(6)} · Codex 7d: 14 runs (9 high, 3 xhigh)`, `${pendingLine(7)} · Codex 7d: 1 run (1 high)`, `${pendingLine(8)} · something else`].join('\n');
+  assert.deepEqual(parseLog(text).pending, ['5', '6', '7']);
+});
+
 test('parseLog: finds pending PRs (unique, file order), ignores other lines, reads resolutions per PR', () => {
   const text = ['# Agent log', '', pendingLine(1420), '- 2026-10-09 · #1411 · feat · risk high · rounds 1 · arbiter 0 · needs-human', pendingLine(1430), pendingLine(1420), resolved(1420), ''].join('\n');
   const p = parseLog(text);

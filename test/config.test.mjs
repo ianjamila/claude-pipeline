@@ -135,6 +135,20 @@ test('owner_approval: defaults to label, accepts label|chat, rejects anything el
   }
 });
 
+test('owner_go.click: defaults to on, accepts on|off, rejects anything else (and unknown keys)', () => {
+  assert.equal(DEFAULTS.owner_go.click, 'on');
+  assert.equal(validateConfig(minimal()).config.owner_go.click, 'on');
+  assert.equal(validateConfig({ ...minimal(), owner_go: { click: 'off' } }).config.owner_go.click, 'off');
+  assert.equal(validateConfig({ ...minimal(), owner_go: {} }).config.owner_go.click, 'on');
+  for (const bad of ['yes', 'On', '', null, true, ['on']]) {
+    const r = validateConfig({ ...minimal(), owner_go: { click: bad } });
+    assert.equal(r.ok, false, JSON.stringify(bad));
+    assert.ok(has(r, 'owner_go.click must be on|off'), JSON.stringify(bad));
+  }
+  assert.ok(has(validateConfig({ ...minimal(), owner_go: { click: 'on', extra: 1 } }), 'unknown key: owner_go.extra'));
+  assert.ok(has(validateConfig({ ...minimal(), owner_go: 'off' }), 'owner_go must be a mapping'));
+});
+
 test('merge.command without {sha} is rejected (and without {pr})', () => {
   const noSha = validateConfig({ ...minimal(), merge: { command: 'gh pr merge {pr} --squash' } });
   assert.equal(noSha.ok, false);

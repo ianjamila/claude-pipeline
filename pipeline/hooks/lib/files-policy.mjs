@@ -17,12 +17,13 @@
 // Backstop for installer runs: the installer itself refuses to run inside a Claude Code process (CLAUDECODE set, or a Claude Code
 // ancestor process); commands that unset or override CLAUDECODE are denied here.
 import fs from 'node:fs';
+import { frontmatterHooksValue } from './frontmatter.mjs';
 import { SQL_UNKNOWN_VAR } from './sql-clients.mjs';
 import { pmCall, pmMoverName, packageScripts, defaultLexists, localBin, nameAtRunTimeIn, markPackageState, pkgOwnWrite, pkgMarkersFor, pmStartDirs, binIsProgram, binSite, binInterpreter, MAX_BIN_INTERPRETERS, lineNames } from './package-scripts.mjs';
 import os from 'node:os';
 import path from 'node:path';
 import { toPosix, expandHome, isInside, samePath, drivePosix, transcriptRes, configDirOf, HOME_CONFIG_DIR_RE } from '../../lib/paths.mjs';
-import { UNDECIDABLE_HEREDOC, simpleCommands, commandName, scriptFileOf, scriptFeedsOf, startupFilesOf, startupVarsOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, sqlShellEscapes, sourcePathSearch, splicesOptions, spliceText, implicitBindsOf, ZSH_NAME_BINDERS, indirectExpansionOnLine, arithAssignedNames } from './shell-parse.mjs';
+import { UNDECIDABLE_HEREDOC, simpleCommands, commandName, scriptFileOf, scriptFeedsOf, startupFilesOf, startupVarsOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, sqlShellEscapes, sourcePathSearch, splicesOptions, spliceText, implicitBindsOf, MATCH_NAMES, ZSH_NAME_BINDERS, indirectExpansionOnLine, arithAssignedNames, refusalAdvice } from './shell-parse.mjs';
 import { flattenProgram, newWriteFrame, exportRecords, writtenTo, writtenCandidates, joinedReadings, writtenNamesIn, writeSignature, unmodelledBefore, sedArgsUnsafe, sedWriteTargets, sedInPlaceArg, awkArgsPure, sortArgsPure, flowStart, inFlow } from './line-writes.mjs';
 import { ZSH_MODIFIED, zshModifiedNames, scriptCandidates, execLineOf, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, countScript, countReading, substitute, GuardLimit, execLinesOf, paramReadings, readingsOf, UNKNOWN_WORD, assigningDefaults, spliceLines } from './script-candidates.mjs';
 import { SETS_BY_NAME } from './git-policy.mjs';
@@ -52,6 +53,10 @@ const PROTECTED_REL = [
   '.claude/agents/substitute-fable.md',
   '.claude/pipeline',
   '.claude/settings.json',
+  // #261 (click-to-approve): a hook that runs on the owner's dialogs (AskUserQuestion) could answer one in the owner's name or hide a refusal, so the user-level hooks folder and the
+  // local settings file (where a hook can be declared) are held like settings.json. Every OTHER account config dir (~/.claude-<name>, $CLAUDE_CONFIG_DIR) gets the same three, see configRoots.
+  '.claude/hooks',
+  '.claude/settings.local.json',
   // #58: the owner's recorded chat "merge" (hooks/lib/owner-go.mjs): only the owner-go hook writes it, P merge and the guard read it
   '.claude/pipeline-state/owner-go',
   // cp #256: the machine-wide Codex outage record (status.json: the last quota stop and the PRs waiting for Codex; only pipeline commands write it) and Codex's own session
@@ -264,7 +269,11 @@ function makeCtx(opts) {
   const darwin = platform === 'darwin';
   const unFirm = (p) => (darwin ? p.replace(FIRMLINK, '') : p);
   const base = homePosix === '/' ? '' : homePosix;
-  const lexRoots = protectedRoots(homePosix);
+  const lexRoots = unique([
+    ...protectedRoots(homePosix),
+    ...configRoots({ base, cfgDir: configDirOf(opts.env ?? process.env, homePosix), readDir: opts.readDir ?? defaultReadDir, home: homeNative }),
+    ...listedDialogScripts(base, (f) => (api.existsSync(f) ? defaultReadText(f) : null)), // (the real file, not opts.readText: a test's fake reader is a script-read counter and clock; no stat where the caller fakes the file system and has no such file: on macOS a stat under /home stalls on autofs)
+  ]);
   const lexAncestors = ANCESTOR_REL.map((r) => `${base}/${r}`);
   const roots = unique([...withWindowsAliases(lexRoots, homePosix, platform), ...lexRoots.map((r) => realResolve(r, api))]);
   const ancestors = unique([...withWindowsAliases(lexAncestors, homePosix, platform), ...lexAncestors.map((r) => realResolve(r, api))]);
@@ -405,6 +414,11 @@ function makeCtx(opts) {
   };
   return {
     platform, homeNative, homePosix, cwd, api, roots, lexRoots, ancestors, lexAncestors, ci,
+    // (R2-B2) the plugin folders outside a .claude*/plugins folder, from the real installed_plugins.json of each account config dir (read once, when a path is first judged)
+    surfaceDirs: (() => {
+      let memo = null;
+      return () => (memo ??= surfaceDirsOf([`${base}/.claude`, ...accountConfigDirs({ base, cfgDir: configDirOf(opts.env ?? process.env, homePosix), readDir: opts.readDir ?? defaultReadDir, home: homeNative })], (f) => (api.existsSync(f) ? defaultReadText(f) : null)));
+    })(),
     hitReviewGlob,
     user: opts.user ?? posix.basename(homePosix),
     selfZero: opts._selfZero ?? null, selfBash: opts._selfBash ?? null, selfAbs: opts._selfAbs === true, selfDirLit: opts._selfDirLit === true, selfZsh: opts._selfZsh === true, // the judged script file's own path (its $0 unless it was sourced; BASH_SOURCE[0])
@@ -492,6 +506,339 @@ function writtenTexts(ti) {
 }
 
 const SETTINGS_RE = /^settings(\.[\w-]+)?\.json$/i;
+
+// ---- #261: the places a hook that runs on AskUserQuestion can be declared, besides the account config dirs the protected set holds -------------------------------------------------
+// A project's .claude/settings.json and settings.local.json, a plugin's hooks/hooks.json under a config dir, and the `hooks:` front matter of a skill or an agent. The agent may edit these files for
+// other reasons (permissions, prose), so a file tool is judged by whether the change adds or alters hooks; a Bash line by its TARGETS (hookSurfaceBashReason), and by the file's name plus the word "hooks"
+// when the name sits inside a program or a quoted string.
+// (R1-B3) also a command file (`.claude*/commands/**.md`), a plugin's skills / agents / commands under a config dir's plugins/ folder, and a plugin manifest (`.claude-plugin/plugin.json`, whose inline `hooks` and
+// component locations are read by the dialog-hook inventory). (R2-B2) The guard reads what the inventory reads: agents and commands at any depth, any .md below a plugin folder, the install paths
+// installed_plugins.json lists (also outside a `.claude*/plugins` folder) and the locations their manifests name (surfaceDirs).
+const HOOK_SURFACE = {
+  settings: /(?:^|\/)\.claude[^/]*\/settings(?:\.local)?\.json$/i,
+  plugin: /(?:^|\/)\.claude[^/]*\/plugins\/(?:[^/]+\/)*hooks\/hooks\.json$/i,
+  manifest: /(?:^|\/)\.claude-plugin\/plugin\.json$/i,
+  frontmatter: /(?:^|\/)\.claude[^/]*\/(?:plugins\/(?:[^/]+\/)*[^/]+\.md|skills\/[^/]+\/SKILL\.md|(?:agents|commands)\/(?:[^/]+\/)*[^/]+\.md)$/i,
+};
+// the same names inside command text (a word that is, or ends in, such a path)
+const HOOK_SURFACE_TEXT = /(?:\.claude[^/\s'"`]*\/(?:settings(?:\.local)?\.json|skills\/[^/\s'"`]+\/SKILL\.md|(?:agents|commands)\/[^\s'"`]*\.md|plugins\/[^\s'"`]*(?:\.md|hooks\/hooks\.json))|\.claude-plugin\/plugin\.json)(?![\w.\-])/i;
+// The shapes of a surface path, from the folder that holds it to the file (a slot: a literal name, 'D' = a `.claude*` folder, 'ANY' = any name, 'MD' = a name ending .md, '*' = any number of folders);
+// the same set as HOOK_SURFACE, for a word that holds a glob or a substitution (maybeSurface).
+const SURFACE_SHAPES = [
+  ['D', 'settings.json'], ['D', 'settings.local.json'], ['.claude-plugin', 'plugin.json'],
+  ['D', 'plugins', '*', 'hooks', 'hooks.json'], ['D', 'plugins', '*', 'MD'],
+  ['D', 'skills', 'ANY', 'SKILL.md'], ['D', 'agents', '*', 'MD'], ['D', 'commands', '*', 'MD'],
+];
+const hookSurfaceKind = (p, ctx) => {
+  const q = String(p);
+  for (const [kind, re] of Object.entries(HOOK_SURFACE)) if (re.test(q)) return kind;
+  const dirs = typeof ctx?.surfaceDirs === 'function' ? ctx.surfaceDirs() : null;
+  if (dirs) {
+    const inside = (d) => isInside(q, d, ctx.platform);
+    if (dirs.installs.some(inside) && /(?:^|\/)hooks\/hooks\.json$/i.test(q)) return 'plugin';
+    if ((dirs.installs.some(inside) || dirs.named.some(inside)) && /\.md$/i.test(q)) return 'frontmatter';
+  }
+  return null;
+};
+// The folders a plugin keeps its components in, outside any `.claude*/plugins` folder: the install paths of the plugins the account config dirs list (installed_plugins.json, read the way the inventory does) and
+// the locations their manifests name (skills, agents, commands: strings or lists of strings, resolved against the install path). Read fail-safe: an unreadable file adds nothing. No entry is dropped for its
+// place in a list (R3-B2): the inventory (dialog-hooks.mjs) walks every one, so the guard holds every one.
+function surfaceDirsOf(configDirs, readText) {
+  const installs = [];
+  const named = [];
+  const json = (file) => { try { return JSON.parse(readText(file) ?? ''); } catch { return null; } };
+  for (const d of configDirs) {
+    const list = json(`${d}/plugins/installed_plugins.json`);
+    if (list === null || typeof list !== 'object' || list.plugins === null || typeof list.plugins !== 'object') continue;
+    for (const entries of Object.values(list.plugins)) {
+      if (!Array.isArray(entries)) continue;
+      for (const e of entries) {
+        const ip = typeof e?.installPath === 'string' ? toPosix(e.installPath) : '';
+        if (!isAbs(ip)) continue;
+        installs.push(pathsFor().normalize(ip));
+      }
+    }
+  }
+  for (const ip of unique(installs)) {
+    const m = json(`${ip}/.claude-plugin/plugin.json`);
+    if (m === null || typeof m !== 'object') continue;
+    for (const key of ['skills', 'agents', 'commands']) {
+      const v = m[key];
+      for (const rel of (typeof v === 'string' ? [v] : Array.isArray(v) ? v : [])) if (typeof rel === 'string' && rel !== '') named.push(pathsFor().normalize(pathsFor().join(ip, toPosix(rel))));
+    }
+  }
+  return { installs: unique(installs), named: unique(named) };
+}
+
+// (R1-B1 / R2-F1) Can this word, which holds a glob or a substitution (so its place is only known at run time), name a hook surface file? Each part that is only known at run time stands for anything (a
+// substitution, a variable, a brace list: any text; `*` `?` `[..]`: a name part); the word's last folders and its file name are compared with every surface shape, slot by slot. A substitution that is a whole
+// folder of the word stands for a `.claude*` folder, and one that is a whole segment stands for a literal folder or file name of a shape, only when the word says `claude` somewhere (`$(echo ~/.claude)/settings.json`, `$(git rev-parse --show-toplevel)/.claude/settings.json`);
+// a bare `$DIR/x.md` names nothing. A word that ends in `/` is a folder a file may land in (cp, mv): its shape lacks the last slot.
+const SUBST = '\u0001';
+function maskRuntime(w) {
+  let out = '';
+  for (let i = 0; i < w.length; i++) {
+    const c = w[i];
+    if (c === '$' && w[i + 1] === '(') {
+      let depth = 0;
+      let j = i + 1;
+      for (; j < w.length; j++) { if (w[j] === '(') depth++; else if (w[j] === ')' && --depth === 0) break; }
+      out += SUBST; i = j; continue;
+    }
+    if (c === '$' && w[i + 1] === '{') { // (braces matched by depth: `${A:-${B}}` is one substitution, R3-F2)
+      let depth = 0;
+      let j = i + 1;
+      for (; j < w.length; j++) { if (w[j] === '{') depth++; else if (w[j] === '}' && --depth === 0) break; }
+      out += SUBST; i = j; continue;
+    }
+    if (c === '$') { const m = /^\$(?:[A-Za-z_][A-Za-z0-9_]*|[@*#?!$0-9-])/.exec(w.slice(i)); if (m) { out += SUBST; i += m[0].length - 1; continue; } }
+    if (c === '`') { const j = w.indexOf('`', i + 1); out += SUBST; i = j < 0 ? w.length : j; continue; }
+    if (c === '{') { const j = w.indexOf('}', i); if (j > i) { out += '*'; i = j; continue; } }
+    out += c;
+  }
+  return out;
+}
+// (#269 CI: a segment of many `*` made `[^/]*[^/]*…` backtrack over every split of the name (`bash ${'*'.repeat(20)}.sh` ran for minutes). A run of `*` is one `*` (the same language); a segment that still holds more than
+// SEG_STAR_CAP separate stars is no pattern worth modelling: it is read as matching anything, the refusing side, like an unreadable one below.)
+const SEG_STAR_CAP = 6;
+function surfaceSegRe(seg, ci) {
+  seg = seg.replace(/\*{2,}/g, '*');
+  let stars = 0;
+  for (const c of seg) if (c === '*' || c === SUBST) stars++;
+  if (stars > SEG_STAR_CAP) return /^.*$/s;
+  let re = '';
+  for (let i = 0; i < seg.length; i++) {
+    const c = seg[i];
+    if (c === '*') re += '[^/]*';
+    else if (c === '?') re += '[^/]';
+    else if (c === SUBST) re += '.*';
+    else if (c === '[') { const j = seg.indexOf(']', i + 2); if (j < 0) re += '\\['; else { re += `[${seg.slice(i + 1, j).replace(/^[!^]/, '^').replace(/\\/g, '\\\\')}]`; i = j; } } else re += c.replace(/[.+^${}()|\\/\]]/g, '\\$&');
+  }
+  try { return new RegExp(`^${re}$`, ci ? 'i' : ''); } catch { return /^.*$/; }
+}
+// the literal text before the first wildcard of a segment, and after its last one ('' when it ends in one)
+function wildParts(seg) {
+  const first = seg.search(/[*?[\u0001]/);
+  if (first < 0) return { pre: seg, suf: seg, wild: false };
+  let last = -1;
+  let end = -1;
+  for (let i = 0; i < seg.length; i++) {
+    if (seg[i] === '*' || seg[i] === '?' || seg[i] === SUBST) { last = i; end = i; } else if (seg[i] === '[') { const j = seg.indexOf(']', i + 2); if (j > 0) { last = i; end = j; i = j; } }
+  }
+  return { pre: seg.slice(0, first), suf: end < 0 ? '' : seg.slice(end + 1), wild: true };
+}
+function slotOk(seg, slot, ci, pureSubstOk, dot) {
+  const low = (t) => (ci ? t.toLowerCase() : t);
+  if (seg === SUBST) return slot === 'ANY' || slot === 'MD' || pureSubstOk;
+  const re = surfaceSegRe(seg, ci);
+  if (slot === 'ANY') return seg !== '.' && seg !== '..';
+  const { pre, suf, wild } = wildParts(seg);
+  if (slot === 'D') {
+    if (['.claude', '.claude-x'].some((x) => re.test(x))) return true;
+    if (!wild) return seg.toLowerCase().startsWith('.claude'); // (a literal folder: any `.claude*` name, as HOOK_SURFACE reads it, R3-F2)
+    const lp = low(pre);
+    if (lp === '') return dot === true;
+    return lp.startsWith('.claude') || '.claude'.startsWith(lp);
+  }
+  if (slot === 'MD') {
+    if (!wild) return low(seg).endsWith('.md');
+    const ls = low(suf);
+    return ls.endsWith('.md') || '.md'.endsWith(ls);
+  }
+  return re.test(slot) || (ci && re.test(slot.toLowerCase()));
+}
+function shapeEndsAt(segs, gi, shape, si, o) {
+  if (si < 0) return true;
+  const slot = shape[si];
+  if (slot === '*') {
+    for (let k = gi; k >= -1; k--) if (shapeEndsAt(segs, k, shape, si - 1, o)) return true;
+    return false;
+  }
+  if (gi < 0) return false;
+  const seg = segs[gi];
+  return slotOk(seg, slot, o.ci, o.claude, o.dot) && shapeEndsAt(segs, gi - 1, shape, si - 1, o);
+}
+// `word` is one word of a command (the parser has removed its quotes); `dirs`: the folders the line may be working in (a relative word is joined to each)
+function maybeSurface(word, { ci, dirs, dot, surfaceDirs }) {
+  const masked = maskRuntime(String(word));
+  const folder = /\/$/.test(masked);
+  const claude = /claude/i.test(String(word));
+  const bare = masked.replace(/\/+$/, '');
+  if (bare === '') return false;
+  if (bare === SUBST) return claude; // (a word that is one substitution and says claude: `$(echo .claude/settings.local.json)`, R3-F2)
+  const fulls = isAbs(bare) || bare.startsWith(SUBST) || bare.startsWith('~') ? [bare] : dirs.map((d) => `${d}/${bare}`);
+  const o = { ci, dot, claude };
+  for (const full of fulls) {
+    const segs = full.split('/').filter((x) => x !== '' && x !== '.');
+    for (const shape of SURFACE_SHAPES) {
+      if (folder && shape.length < 3) continue; // (a folder may be a place a file lands in only when it is inside a `.claude*` folder: a bare `.claud?/` names no file)
+      if (folder ? shapeEndsAt(segs, segs.length - 1, shape.slice(0, -1), shape.length - 2, o) : shapeEndsAt(segs, segs.length - 1, shape, shape.length - 1, o)) return true;
+    }
+    // the folders a plugin's components live in (installed_plugins.json, manifests): a glob that can reach a name ending .md (or a hooks file) inside one
+    const w = full.search(/[*?[\u0001]/);
+    if (w >= 0) {
+      const litDir = full.slice(0, Math.max(0, full.lastIndexOf('/', w))) || '/';
+      const after = full.slice(litDir.length).split('/').filter(Boolean).length;
+      const last = segs[segs.length - 1] ?? '';
+      if (folder || slotOk(last, 'MD', ci, true, dot) || slotOk(last, 'hooks.json', ci, true, dot)) {
+        for (const d of [...(surfaceDirs?.installs ?? []), ...(surfaceDirs?.named ?? [])]) {
+          if (isInside(litDir, d, ci ? 'darwin' : 'linux')) return true;
+          const below = isInside(d, litDir, ci ? 'darwin' : 'linux') ? d.slice(litDir === '/' ? 0 : litDir.length).split('/').filter(Boolean).length : -1;
+          if (below >= 0 && after >= below + 1) return true;
+        }
+      }
+    }
+  }
+  return false;
+}
+const sortedJsonOf = (v) => JSON.stringify(v, (_k, x) => (x && typeof x === 'object' && !Array.isArray(x) ? Object.fromEntries(Object.keys(x).sort().map((k) => [k, x[k]])) : x));
+// The text a file tool would leave in the file (null when it cannot be worked out: an Edit whose old_string is not there is no change the tool will make, judged by its words).
+function textAfter(ti, before) {
+  if (typeof ti.content === 'string') return ti.content;
+  const apply = (text, e) => {
+    if (typeof e?.old_string !== 'string' || typeof e?.new_string !== 'string' || text === null || !text.includes(e.old_string)) return null;
+    return e.replace_all === true ? text.split(e.old_string).join(e.new_string) : text.replace(e.old_string, () => e.new_string);
+  };
+  if (Array.isArray(ti.edits)) { let t = before; for (const e of ti.edits) { t = apply(t, e); if (t === null) return null; } return t; }
+  return apply(before, ti);
+}
+// Does this file-tool call add or alter hooks in a hook surface file? -> a reason, or null.
+function hooksChangeReason(kind, ti, ctx, candidate, shown) {
+  if (kind === 'plugin') return `${shown} is a plugin's hooks file: a hook there could run on the owner's dialogs`;
+  const read = ctx.readText(candidate);
+  // (R31-F2: a file that is there but unread (over 1 MB, no access) is no empty file: an Edit cannot be compared with it; a full Write is compared in full, an absent file is empty)
+  if (read === null && typeof ti.content !== 'string' && ctx.api.existsSync(candidate)) return `${shown} exists but the guard cannot read it (over 1 MB or unreadable), so the change cannot be compared with the file`;
+  const before = read ?? '';
+  const after = textAfter(ti, before);
+  const words = writtenTexts(ti).flatMap(variantsOf).some((x) => /hooks/i.test(x)); // (R31-B2: a JSON / JS escape decoded, as the program-text check does)
+  if (after === null) return words ? `${shown}: the change mentions hooks and cannot be compared with the file` : null;
+  return hooksDifference(kind, before, after, shown, words);
+}
+// What a text that REPLACES a hook surface file's text (`before` -> `after`) does to its hooks: a reason, or null. `words`: the change mentions hooks (decides when the result cannot be read as JSON).
+// A settings file is compared by its `hooks` object, a plugin manifest by `hooks` and the component locations (skills, agents, commands), a front matter by the shared recognizer.
+function hooksDifference(kind, before, after, shown, words) {
+  if (kind === 'frontmatter') return frontmatterHooksValue(before) !== frontmatterHooksValue(after) ? `${shown}: the change adds or alters hooks in the front matter` : null;
+  const keys = kind === 'manifest' ? ['hooks', 'skills', 'agents', 'commands'] : ['hooks'];
+  let a = null;
+  let b = null;
+  try { b = before.trim() === '' ? {} : JSON.parse(before); } catch { b = null; }
+  try { a = JSON.parse(after); } catch { a = null; }
+  if (a === null || typeof a !== 'object') return words ? `${shown}: the change mentions hooks and the result cannot be read as JSON` : null;
+  // (R31-B2: the parsed object's own protected keys, so an escaped key (`"h\u006foks"`) counts; the raw word stays as a second look)
+  if (b === null || typeof b !== 'object') return keys.some((k) => a[k] !== undefined && a[k] !== null) || /"hooks"/.test(after) ? `${shown}: the file could not be compared and now holds ${keys.map((k) => `"${k}"`).join(' / ')}` : null;
+  return keys.some((k) => sortedJsonOf(a[k] ?? null) !== sortedJsonOf(b[k] ?? null)) ? `${shown}: the change adds or alters ${keys.map((k) => `"${k}"`).join(' / ')}` : null;
+}
+const HOOKS_MSG = 'a hook on AskUserQuestion could answer the owner\'s dialog in the owner\'s name or hide a refusal; permission edits stay allowed, hooks are the owner\'s to change, from a terminal';
+
+// The account config dirs besides ~/.claude (a folder directly under the home with the HOME_CONFIG_DIR_RE shape, and $CLAUDE_CONFIG_DIR): hooks/, settings.json and settings.local.json in each.
+function accountConfigDirs({ base, cfgDir, readDir, home }) {
+  const dirs = new Set();
+  const names = readDir(home);
+  if (Array.isArray(names)) for (const n of names) if (typeof n === 'string' && n !== '.claude' && HOME_CONFIG_DIR_RE.test(n)) dirs.add(`${base}/${n}`);
+  if (cfgDir && cfgDir !== `${base}/.claude`) dirs.add(cfgDir);
+  return [...dirs];
+}
+function configRoots(o) {
+  return accountConfigDirs(o).flatMap((d) => ['hooks', 'settings.json', 'settings.local.json'].map((r) => `${d}/${r}`));
+}
+// The scripts of the dialog-hook list the owner approved (<home>/.claude/pipeline-state/owner-go/dialog-hooks.json, written by `P owner-go approve-dialog-hooks`): each one is a hook on
+// AskUserQuestion, so an edit to it changes what runs on the owner's dialogs. Read fail-safe: a missing or unreadable list adds nothing (the folder that holds it is protected already).
+function listedDialogScripts(base, readText) {
+  try {
+    const j = JSON.parse(readText(`${base}/.claude/pipeline-state/owner-go/dialog-hooks.json`) ?? '');
+    return (Array.isArray(j?.hooks) ? j.hooks : []).slice(0, 200).map((h) => (typeof h?.scriptPath === 'string' ? toPosix(h.scriptPath) : '')).filter((p) => isAbs(p)).map((p) => pathsFor().normalize(p));
+  } catch {
+    return [];
+  }
+}
+
+// (R1-B1) A Bash write to a file that can declare hooks is judged by its resolved TARGET, not by whether the line says "hooks": `cp /tmp/c.json <settings>` and `jq … > /tmp/x && mv /tmp/x <settings>` say none.
+// The targets are found with the guard's own reading of a command, as for the protected files: a command that is read-only (isReadOnly), the words of a commit message / PR body / test name (the prose the
+// caller dropped) and the files a copy or move reads are no targets; what is deleted (rm) is none either (deleting removes hooks, never adds them). A copy / move / install names its destination (and a
+// folder a copied file lands in, `cp /tmp/SKILL.md <skills>/x/`); any other command that is not read-only names every word it is given (an unmodelled program handed the file's name is an unknown write,
+// genericAsUnknown); a write redirect names its target. Every such word is a target, none is skipped (R2-F2). A word whose place is only known at run time (a substitution, a variable, a glob in the folder
+// or in the file name) and that can resolve to a surface is refused (R2-F1, maybeSurface). The line's writes to a target are asked of the write model (writtenTo); what lands there must be a text the guard
+// can read (a static text, a file on disk, the file itself) and none may add or change hooks, as for a file tool. A write whose content is only known at run time (a program's output, a rewrite by jq / sed
+// we cannot emulate, an inline program, a copy after a command the guard does not model, R2-F3) is refused: permission edits go through Edit / Write. A plugin's hooks file is never written from Bash.
+// -> a reason or null. `io.wordsOf(c)`: the command's words without its prose (R9-F3: but an interpreter's words are all kept -- `node -e .. -- -t FILE`); `io.dirs`: the folders the line may be working in.
+const DELETERS = new Set(['rm', 'rmdir', 'unlink', 'trash']);
+const MAX_SURFACE_WORDS = 4000;
+// git subcommands that stage, record or delete: they never put new text into a working-tree file (checkout, restore, reset, apply, stash, merge ... do, and stay targets)
+const GIT_NO_CONTENT = new Set(['add', 'rm', 'commit', 'status', 'diff', 'log', 'show', 'blame', 'ls-files', 'grep', 'tag', 'branch', 'notes']);
+const gitSubcommand = (argv) => {
+  for (let i = 1; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === '-C' || a === '-c' || a === '--git-dir' || a === '--work-tree') { i++; continue; }
+    if (a.startsWith('-')) continue;
+    return a;
+  }
+  return '';
+};
+function hookSurfaceBashReason(cmds, frame, ctx, io) {
+  const found = new Map(); // absolute path -> { word, idx: the last command that names it }
+  const unpinned = [];
+  const surfaceKind = (q) => hookSurfaceKind(q, ctx);
+  const stash = frame.i;
+  frame.i = cmds.length; // (judge the file as the WHOLE line leaves it)
+  try {
+    let total = 0;
+    for (const [idx, c] of cmds.entries()) {
+      const redirects = (c.redirects ?? []).filter((r) => WRITE_OPS.has(r.op) && typeof r.target === 'string' && r.target !== '' && !FD_DUP.test(r.target) && r.target !== '/dev/null').map((r) => r.target);
+      const name = c.argv.length > 0 ? baseOf(c.argv[0]) : '';
+      const writer = name !== '' && !NOT_WRITERS.has(name) && !isReadOnly(c, ctx);
+      if (!writer && redirects.length === 0) continue;
+      let words = [];
+      if (writer && !DELETERS.has(name) && !(name === 'git' && GIT_NO_CONTENT.has(gitSubcommand(c.argv)))) {
+        const own = isInterpreterCmd(c.argv) ? [...c.argv, ...Object.values(c.env ?? {})] : io.wordsOf(c); // (R9-F3: an interpreter's `-t VALUE` is a word that can be a target, not prose)
+        words = DEST_ONLY.has(name) || MOVERS.has(name) ? destsOf(own, name) : own.slice(1);
+      } else if (writer && name === 'git' && GIT_NO_CONTENT.has(gitSubcommand(c.argv))) {
+        // (R3-F1) log / show / diff ... write nothing into the tree except through --output: its value is a target
+        const own = io.wordsOf(c);
+        words = own.flatMap((w, i) => (w === '--output' && i + 1 < own.length ? [own[i + 1]] : typeof w === 'string' && w.startsWith('--output=') ? [w] : []));
+      }
+      words = [...words, ...redirects];
+      // an option's attached value (`-ofile`, `--output=file`, `of=file`; after a cluster of flags, `-so.claude/x`: every tail of the word, R3-F1)
+      words = words.flatMap((w) => (typeof w !== 'string' ? [] : /^--?[A-Za-z][\w-]*=./.test(w) || /^[A-Za-z_]+=./.test(w) ? [w, w.slice(w.indexOf('=') + 1)] : /^-[A-Za-z]./.test(w) ? [w, ...Array.from({ length: w.length - 2 }, (_, i) => w.slice(i + 2))] : [w])).filter((w) => w !== '');
+      total += words.length;
+      if (total > MAX_SURFACE_WORDS) return 'the command line has too many words to check for writes to a file that can declare hooks';
+      for (const w of words) {
+        const e = frame.expand(w);
+        if (e === null) {
+          if (maybeSurface(w, { ci: ctx.ci, dirs: io.dirs, dot: ctx.dotGlob === true, surfaceDirs: ctx.surfaceDirs() })) unpinned.push(w);
+          continue;
+        }
+        for (const q of frame.locate(e, idx).filter((x) => isAbs(x))) {
+          const lex = pathsFor().normalize(q);
+          for (const x of new Set([lex, realResolve(lex, ctx.api)])) if (surfaceKind(x) !== null) found.set(x, { word: q, idx });
+        }
+      }
+    }
+    if (unpinned.length > 0) return `the command writes ${unpinned[0]}, which can be a file that can declare hooks, at a place only known at run time`;
+    for (const [P, at] of found) {
+      const w = writtenTo(ctx.frames, P, { exists: (x) => ctx.api.existsSync(x), readText: ctx.readText, ignoreUnmodelled: true, genericAsUnknown: true });
+      if (w === null) continue; // nothing on the line writes it (a read, or a command that only names it)
+      const kind = surfaceKind(P);
+      if (kind === 'plugin') return `the command writes ${P}, a plugin's hooks file: a hook there could run on the owner's dialogs`;
+      // (R2-F3) what a copy brings is read from the file as it is on disk: a command the guard does not model that runs before it may have written or rewritten that file
+      frame.i = at.idx;
+      const unmodelled = unmodelledBefore(ctx.frames);
+      frame.i = cmds.length;
+      if (unmodelled && w.files.length > 0) return `the command copies a file onto ${P}, a file that can declare hooks, after a command the guard cannot model, so what is copied is only known when it runs; run that step first, on its own`;
+      const disk = ctx.readText(P);
+      // a source that is not on disk and that nothing on the line writes cannot be copied: that write fails and changes nothing (the same reading as for a script that is missing)
+      const present = { ...w, files: w.files.filter((x) => ctx.readText(x) !== null || ctx.api.existsSync(x) || writtenTo(ctx.frames, x, { exists: (y) => ctx.api.existsSync(y), readText: ctx.readText, ignoreUnmodelled: true }) !== null) };
+      const cands = writtenCandidates(present, disk, (q) => ctx.readText(q));
+      if (cands === null) return `the command writes ${P}, a file that can declare hooks, with content only known when it runs, so it cannot be compared with the file`;
+      for (const after of cands) {
+        const why = hooksDifference(kind, typeof disk === 'string' ? disk : '', after, P, variantsOf(after).some((x) => /hooks/i.test(x)));
+        if (why !== null) return why;
+      }
+    }
+    return null;
+  } finally {
+    frame.i = stash;
+  }
+}
 
 // ---- file tools -----------------------------------------------------------------------------------
 
@@ -596,6 +943,13 @@ function evaluateMcp(tool, ti, input, opts) {
       }
     }
     if (texts.some((x) => setsAdmin(x, ctx.platform))) return deny('this write sets PIPELINE_ADMIN; only the owner does that, when launching Claude Code');
+    // #261: what the tool will write cannot be compared with the file, so a hook surface file is refused when the content says "hooks" (a plugin's hooks file always)
+    for (const { t, candidates } of targets) {
+      for (const c of candidates) {
+        const kind = hookSurfaceKind(c, ctx);
+        if (kind !== null && (kind === 'plugin' || texts.some((x) => /hooks/i.test(x)))) return deny(`${t} is a file that can declare hooks (${HOOKS_MSG})`);
+      }
+    }
   }
   // 2. anything else a tool that is not clearly read-only was given: a path anywhere, or code that builds one
   const matchers = makeMatchers(ctx);
@@ -632,6 +986,14 @@ function evaluateFileToolUnchecked(input, opts = {}) {
   });
   for (const { t, candidates } of resolved) {
     if (candidates.some((c) => ctx.hit(c) || ctx.hitInode(c))) return deny(`${t} is a protected pipeline file (${PROTECTED_MSG})`);
+  }
+  // #261: a hook declared in a project's settings, a plugin's hooks file or a skill's / agent's front matter
+  for (const { t, candidates } of resolved) {
+    for (const c of candidates) {
+      const kind = hookSurfaceKind(c, ctx);
+      const why = kind === null ? null : hooksChangeReason(kind, ti, ctx, c, t);
+      if (why !== null) return deny(`${why} (${HOOKS_MSG})`);
+    }
   }
   if (texts.some(hasDisableAll)) {
     for (const { t, candidates } of resolved) {
@@ -963,7 +1325,7 @@ function ancestorRegexes(ctx) {
 const SEP = "(?=[ \\t]*[/'\"`,+])[/'\"`,+ \\t]+"; // between pieces of a code-built path: '.claude', 'skills', 'ship'
 function suffixBody(sep, bareCodex = '') {
   const end = '(?![\\w.\\-])';
-  return `(?:${bareCodex}\\.codex${sep}sessions${end}|\\.claude${sep}(?:settings\\.json${end}|pipeline${end}|skills${sep}(?:ship|verify|pipeline-setup)${end}|agents${sep}(?:implementer|verifier|judge|arbiter|arbiter-fix|substitute-opus|substitute-fable)\\.md${end}))`;
+  return `(?:${bareCodex}\\.codex${sep}sessions${end}|\\.claude${sep}(?:settings(?:\\.local)?\\.json${end}|hooks${end}|pipeline${end}|skills${sep}(?:ship|verify|pipeline-setup)${end}|agents${sep}(?:implementer|verifier|judge|arbiter|arbiter-fix|substitute-opus|substitute-fable)\\.md${end}))`;
 }
 // ...preceded by something only known at run time: a variable, a command substitution, a template `${...}`, a call
 // result `)`, a `+` or `,` joining pieces, `~user`, `.join(` / `.joinpath(`.
@@ -1384,6 +1746,90 @@ function makeMatchers(ctx) {
 
 // ---- Bash: command classification -----------------------------------------------------------------
 
+// (#269 R10-F1, R11-F1, R12-F1) The parser ends a segment at every `&&` / `||` with no `[[` state, so zsh's `if [[ -n a && echo == echo ]] cp x FILE` arrives as the pieces `[[ -n a` and
+// `echo == echo ]] cp x FILE`; zsh also takes a command (or a keyword, `{`, an assignment, a wrapper) right after `]]` with no separator. The parser has lost the quotes, so a quoted `]]` argument looks
+// like the closer, and the words after a `]]` do not go through the parser's group handling. Splitting there was tried (R10-F1, R11-F1) and left holes (R12-F1), so the line is REFUSED instead (owner
+// decision 2026-11-12): when it holds a `[[` word and any piece has a `]]` that is not its last word, the guard cannot tell which `]]` closes the test. Without a `[[` a `]]` closes nothing.
+function closeBracketNotLast(cmds) {
+  if (!cmds.some((c) => c.argv.includes('[['))) return false;
+  return cmds.some((c) => c.argv.slice(0, -1).includes(']]'));
+}
+
+// (#269 R13-F1, owner decision 2026-11-12: TEXT-LEVEL refusals) Rounds 11-13 kept finding shapes the parser reads differently from zsh (R13-F1: the number pattern `<->` makes the parser take
+// `]]` for a redirect target, so no argv holds it), so the line is also judged AS WRITTEN. (#269 R14, owner decision 2026-11-12) "As written" is the raw text with the backslash-newline pairs removed (asWritten) and nothing else:
+// no quote, comment or heredoc reading (every earlier reading of those differed from the shell's somewhere and hid a line), so a quoted or heredoc `[[ x ]] y` is refused too. A `[[` that follows a quote or has no
+// blank after it (`echo "[[ a ]]"`, a wiki link `[[note]]`) is no test. On a text with a
+// `[[` word, any `]]` must be followed (after blanks) by `&&` `||` `;` `|` `&` `)` `}` a newline, a comment (`#` after a blank) or the end of the text; `&>` is a redirect, so it is refused.
+// False refusals are accepted (`[[ -f a ]] 2>/dev/null`, `[[ -n ${a[b[1]]} ]]`); the parser-based closeBracketNotLast stays as well.
+const TEST_OPEN = /(?:^|[\s;&|({!])\[\[(?=\s)/;
+// (a backslash-newline is removed -- the shell joins the lines -- but a pair `\\` is skipped as a unit, so `\\` + newline stays two lines; one linear pass)
+const asWritten = (text) => text.replace(/\\(\r?\n|[\s\S])/g, (m, g1) => (g1.endsWith('\n') ? '' : m));
+function closeBracketFollowedByWord(text) {
+  const m = asWritten(text);
+  if (!TEST_OPEN.test(m)) return false;
+  for (let at = m.indexOf(']]'); at >= 0; at = m.indexOf(']]', at + 1)) {
+    let j = at + 2;
+    while (m[j] === ' ' || m[j] === '\t') j++; // (no slice of the rest: a text of many `]]` stays linear)
+    if (j >= m.length || '\n;|)}'.includes(m[j])) continue;
+    if (m[j] === '&') { if (m[j + 1] === '>') return true; continue; }
+    if (m[j] === '#' && j > at + 2) continue;
+    return true;
+  }
+  return false;
+}
+// (#269 R13-F2) A loop name that is a positional parameter (`for 1 in LIST` binds $1, which `$@`, `$*` and `$argv` hold too), `argv`, or a subscripted / odd word cannot be followed by the guard (the
+// writer rule finds names with \w+): refuse any loop header whose name is not a plain identifier. The text pass reads the line as written (asWritten: the keyword, then its names up to `in`, `(`, `;` or a newline);
+// the parser pass reads the header's argv. A C-style `for ((…))` names nothing.
+const PLAIN_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
+const badLoopName = (n) => !PLAIN_NAME.test(n) || n === 'argv' || n === 'ARGV';
+// (a loop keyword is reserved only where a command starts: the line start, after a separator or bracket (`;` `&` `|` `(` `)` `{` `}` `!` a backtick, a newline), or after a reserved word or a
+// precommand word (do then else elif if while until time nocorrect noglob coproc exec builtin command `-`, zsh `repeat N`). Generous on purpose; a `select` that is an ARGUMENT -- `man select 2`, the SQL
+// `select 1::int -- a note` of a psql input read as shell text -- is no loop.)
+const LOOP_HEAD_TEXT = /(?:^|[;&|(){}!`\n]|(?:^|[\s;&|(){}!`])(?:do|then|else|elif|if|while|until|time|nocorrect|noglob|coproc|exec|builtin|command|-|repeat[ \t]+\S+))[ \t]*(?:for|foreach|select)(?=[ \t])/g;
+const LOOP_HEADER_WINDOW = /[^;\n]{0,2000}/y; // (the header: up to the next `;` / newline, at most 2000 characters, found without slicing the rest of the text)
+// (#269 R14, owner decision 2026-11-12) The text the LOOP check reads: as written, except that a here-document body is data (a psql input `select 1;` is no loop). The parser's body spans (heredocSpans) say
+// where each body is: a body whose delimiter was quoted is left out; an unquoted one too, unless it holds `$(`, `${` + a blank, tab, newline or `|` (bash 5.3 / zsh `${ cmd; }`), a backtick or `<(` / `>(` (the only places the shell runs commands in it), which keeps it whole.
+// Any doubt (no spans, a span that overlaps, runs past the text or does not start a line) keeps the whole text. One linear pass; the `]]` check does not use this and reads every body.
+function loopCheckText(text, cmds) {
+  if (!/<</.test(text)) return asWritten(text);
+  const spans = cmds?.heredocSpans;
+  if (!Array.isArray(spans)) return asWritten(text);
+  let out = '';
+  let at = 0;
+  for (const [a, b, quoted] of [...spans].sort((x, y) => x[0] - y[0])) {
+    if (!(a >= at && b >= a && b <= text.length && (a === 0 || text[a - 1] === '\n'))) return asWritten(text);
+    if (!quoted && /\$\(|\$\{[\s|]|`|[<>]\(/.test(asWritten(text.slice(a, b)))) continue; // (kept: the body runs commands)
+    out += text.slice(at, a);
+    at = b;
+  }
+  return asWritten(out + text.slice(at));
+}
+function loopNameRefusedText(text, cmds) {
+  const m = loopCheckText(text, cmds);
+  for (const h of m.matchAll(LOOP_HEAD_TEXT)) {
+    LOOP_HEADER_WINDOW.lastIndex = h.index + h[0].length;
+    const head = LOOP_HEADER_WINDOW.exec(m)[0].trim();
+    if (head.startsWith('((')) continue;
+    const words = head.split(/\s+/).filter(Boolean);
+    for (let i = 0; i < words.length; i++) {
+      if (i > 0 && words[i] === 'in') break;
+      const p = words[i].indexOf('(');
+      const name = p < 0 ? words[i] : words[i].slice(0, p);
+      if (name !== '' && badLoopName(name)) return true;
+      if (p >= 0) break;
+      if (i === words.length - 1 && head.length >= 1990) return true; // (a header longer than the window: its names cannot be read)
+    }
+  }
+  return false;
+}
+function loopNameRefused(cmds) {
+  return cmds.some((c) => {
+    if (!LOOP_HEADS.has(c.argv[0]) || c.argv.length < 2) return false;
+    const inAt = c.argv.indexOf('in', 2);
+    return c.argv.slice(1, inAt < 0 ? undefined : inAt).some(badLoopName);
+  });
+}
+
 const READ_ONLY = new Set(['echo', 'printf', 'cat', 'head', 'tail', 'less', 'more', 'ls', 'stat', 'wc', 'grep', 'rg', 'diff', 'cmp', 'shasum', 'sha256sum', 'sha1sum', 'md5', 'md5sum', 'file', 'readlink', 'realpath', 'test', '[', 'cut', 'du', 'hexdump', 'bat']);
 const PS_READ_ONLY = new Set(['get-content', 'get-childitem', 'gc', 'gci']);
 const GIT_READ_ONLY = new Set(['log', 'show', 'diff', 'status', 'ls-files', 'blame']);
@@ -1539,9 +1985,10 @@ function resolveGlobCd(e, bases, ctx, cmds, idx) {
 // (one rerun of a line per assumed directory, counted across the evaluation: past the allowance the line is refused rather than slow.
 // Phase 3b: 200 → 256 with the two review folders assumedCwds added, which cost a psql line under an unfollowable startup file 168 → 224
 // reruns (guard-false-positives J); the CPU deadline still bounds the line)
+// #261 T3: 256 → 320 with the hooks folder and local settings file (and each other account config dir's) added to the protected set: the same psql line then needs 257 reruns (the CPU deadline still bounds the line)
 // cp #256 R5 regression (guard-false-positives J): the count grows with the SQUARE of the assumed directories (n reruns of the line, each rerunning the unfollowable startup file in n+1 more:
 // 15 directories = 255, 18 = 360 since pipeline-state/codex, .codex/sessions and .codex joined the protected set), so 256 refused every psql line under an unfollowable startup file again.
-// 512 holds 22 directories; a refusal past it stays fail-closed, and the CPU deadline still bounds the time (the J line takes ~0.2 s at 360 reruns).
+// (#261 T3 had meanwhile added the hooks folder and local settings file, and each other account config dir's, to the protected set.) 512 holds 22 directories; a refusal past it stays fail-closed, and the CPU deadline still bounds the time (the J line takes ~0.2 s at 360 reruns).
 const MAX_CD_RERUNS = 512;
 const MAX_DIR_WORD = 4096; // (#288 CI H2: PATH_MAX; a longer lone command word is not an AUTO_CD directory, see dirLikeWord)
 const MAKES_DIRS = new Set(['mkdir', 'cp', 'mv', 'tar', 'bsdtar', 'gtar', 'unzip', 'git', 'rsync', 'ditto', 'install', 'ln', 'curl', 'wget']);
@@ -1561,8 +2008,83 @@ function countCdRun(budget) {
   if (budget.cdRuns > MAX_CD_RERUNS) throw new GuardLimit('too many commands run after a cd into a directory known only at run time (each is checked in every protected directory), so they cannot be verified. Write the directory out.');
 }
 // Does the command run interpreter code that is not a file (`node -e`, `python3 -c`, `perl -e`, a program on stdin, an awk program that is not read-only; every interpreter run that is not `interp FILE`)? It can build any file name at run time.
-const INLINE_RUNNERS = /^(?:node|nodejs|deno|bun|tsx|ts-node|python\d*(?:\.\d+)*|ruby|perl|php|lua|Rscript|awk|gawk|mawk|nawk)$/;
+// (command names are lower-cased by commandName; every family also runs under a version suffix: python3.12, perl5.34, ruby3.3, lua5.4, node22 -- #289)
+const VERSION = '(?:[-_]?\\d+(?:\\.\\d+)*)?';
+const INLINE_RUNNERS = new RegExp(`^(?:node|nodejs|deno|bun|tsx|ts-node|python|pypy|ruby|perl|php|lua|luajit|rscript|awk|gawk|mawk|nawk)${VERSION}$`);
+// (#269 R8, owner decision 2026-11-12) Every program that reads and runs text: the inline runners above, the other scripting languages, and the shells. A generous, fail-closed name list.
+const INTERPRETERS = new RegExp(`^(?:node|nodejs|deno|bun|tsx|ts-node|python|pypy|ruby|perl|php|lua|luajit|rscript|r|awk|gawk|mawk|nawk|wish|osascript|jjs|groovy|julia|sh|bash|zsh|dash|ash|ksh|ksh93|mksh|fish|busybox|csh|tcsh)${VERSION}$|^tclsh`);
+// (#269 R10-F6) Is this command an interpreter? Its NAME is judged, not every word: `brew install node`, `nvm use node`, `git switch bash`, `grep python3 f` and `export P=python3` run no interpreter.
+// The name is argv[0] (a name only known at run time -- `$PY`, `${X}`, a backtick, a glob -- counts as one; the builtins `[` and `[[` are literal names, not a glob), or what a wrapper the parser did not unwrap
+// starts: `timeout 5 python3 -`, `stdbuf -oL node`, `sudo -u root bash -s`, `find . -exec sh {} \;`. Past a wrapper an option may take a value (`sudo -u root`, `nice -n 5`), so any word that is an interpreter's
+// name counts, and so does the first word that is not an option when it is only known at run time. `command -v NAME` / `-V` is a lookup, not a run.
+const WRAPPER_CMDS = new Set(['env', 'command', 'builtin', 'exec', 'eval', 'nohup', 'time', 'timeout', 'stdbuf', 'nice', 'ionice', 'sudo', 'doas', 'su', 'xargs', 'chroot', 'setsid', 'unbuffer', 'caffeinate', 'arch', 'taskset', 'chrt', 'strace', 'ltrace', 'watch', 'parallel', 'flock', 'script']);
+const RUNTIME_NAME = /[$`*?[{]/;
+// (#269 scan S1, owner decision: false refusals over bypasses) Commands known to START no other program. Any other command may be a runner (`uv run`, `pyenv exec`, `mise exec --`, `npx`, `rlwrap`, `valgrind`,
+// `gtimeout`, `nvm exec` ...), so for the wide check below the wrapper rules apply to it, whatever the list of known wrappers says.
+const NON_RUNNERS = new Set([...READ_ONLY, 'export', 'which', 'type', 'whence', 'where', 'hash', 'unset', 'man', 'test', '[', '[[']);
+// the narrow check: argv[0] is an interpreter's name (or a known wrapper starts one) -- it keeps prose such as `git commit -m "... python3 ..."` masked (R9-F3)
+function isInterpreterCmd(argv) { return interpreterCmd(argv, false); }
+// the wide check, for the fed-interpreter rule: also any command that is not a known non-runner (it may start an interpreter)
+function mayRunInterpreter(argv) { return interpreterCmd(argv, true); }
+function interpreterCmd(argv, wide) {
+  const at = argv.findIndex((w) => !/^[A-Za-z_]\w*=/.test(w)); // (an assignment the parser did not take apart -- `LUA_''INIT=@/dev/stdin lua -e ''` -- is no command name)
+  argv = at < 0 ? [] : argv.slice(at);
+  if (!argv.length) return false;
+  const name = baseOf(argv[0]);
+  if (wide) {
+    if (RUNTIME_NAME.test(argv[0]) && argv[0] !== '[' && argv[0] !== '[[') return true;
+    if (INTERPRETERS.test(name)) return true;
+    if (NON_RUNNERS.has(name) || argv[0] === '[' || argv[0] === '[[') return false;
+  }
+  const wrapped = wide || WRAPPER_CMDS.has(name) || (name === 'find' && argv.some((w) => /^-(?:exec|execdir|ok|okdir)$/.test(w)));
+  if (!wrapped) return argv[0] === '[' || argv[0] === '[[' ? false : RUNTIME_NAME.test(argv[0]) || INTERPRETERS.test(name);
+  if (name === 'command' && /^-[pP]*[vV]/.test(argv[1] ?? '')) return false; // (`command -v python3` is a lookup; `command python3 -` still runs it)
+  const rest = argv.slice(1).flatMap((w) => String(w).split(/\s+/)).filter((w) => w !== '');
+  if (rest.some((w) => INTERPRETERS.test(baseOf(w)))) return true;
+  const first = rest.find((w) => !/^-/.test(w) && !/^[A-Za-z_]\w*=/.test(w) && !/^\d+(?:\.\d+)?[smhd]?$/.test(w));
+  return first !== undefined && /^[$`]/.test(first);
+}
+// (R8, owner decision 2026-11-12) The one fed interpreter run that stays allowed: Python's JSON pretty-printer, `python3 -m json.tool` with at most two plain operands (in / out file) and nothing else -- no other option, no operand
+// starting with `-` (`-` is stdin) or holding an expansion -- on a line that mentions no PYTHON* variable, no exec, no coproc and no <( ). It prints what it reads; it never runs it.
+function jsonToolOnly(c, raw) {
+  const [name, m, mod, ...operands] = c.argv;
+  if (!/^python\d*(?:\.\d+)*$/.test(baseOf(name ?? '')) || m !== '-m' || mod !== 'json.tool' || operands.length > 2) return false;
+  if (operands.some((o) => o.startsWith('-') || /[$`*?[{]/.test(o))) return false;
+  return !/PYTHON[A-Z_]/i.test(raw) && !/\bexec\b|\bcoproc\b|<\(/.test(raw) && !Object.keys(c.env ?? {}).some((k) => /^PYTHON/i.test(k));
+}
+const inputRedirect = (c) => (c.redirects ?? []).some((r) => /</.test(r.op ?? ''));
+// (R9-F1) a process substitution in any direction: `<(cmd)`, `>(cmd)` (also as a redirect target: `> >(python3)`), zsh `=(cmd)` (a word of its own)
+const hasProcSub = (c) => c.argv.some((w) => /[<>]\(/.test(w) || w.startsWith('=(')) || (c.redirects ?? []).some((r) => /^[<>=]\(/.test(r.target ?? ''));
+// Is this interpreter FED input on the line? Fail closed: it receives a pipe (`|`, `|&`), has an input redirect (`<`, `<<`, `<<-`, `<<<`, `<&`, `<>`, `0<`), or a word holding `<(`; a coproc or an `exec` that
+// replaces stdin feeds every command of the line; and a command whose place in a pipeline is not known (inside a group, subshell, loop, if / case branch or function, or on a line holding a `{ ` group) is fed when the line has
+// any pipe or input redirect at all.
+function feedInfo(cmds, raw) {
+  const lineFeeds = /<|>\(|(?:^|[\s;&|(])=\(|(?<![|])\|(?![|])/.test(raw) || cmds.some((c) => c.sep === '|' || inputRedirect(c) || hasProcSub(c));
+  const stdinReplaced = /\bcoproc\b/.test(raw) || cmds.some((c) => baseOf(c.argv[0] ?? '') === 'exec' && (inputRedirect(c) || c.argv.slice(1).some((w) => /^\d*</.test(w)))) || /\bexec\b[^;&|\n]*</.test(raw);
+  // (a function definition -- `f() cmd`, `function f ...` -- runs its body wherever the function is called: from a pipe, too)
+  // (R10-F3: any spelling of the name -- `'f'()`, `a,b()`, a non-ASCII one -- is in the parser's own list; the text test is a second signal)
+  const groupOnLine = /(?:^|[\s;&|(])\{(?:\s|$)/.test(raw) || /(?:^|[\s;&|({])(?:function\s+[\w.:@+-]+|[\w.:@+-]+\s*\(\s*\))/.test(raw) || (cmds.fns?.size ?? 0) > 0;
+  return (c) => stdinReplaced || c.sep === '|' || inputRedirect(c) || hasProcSub(c)
+    || (lineFeeds && (groupOnLine || (c.depth ?? 0) > 0 || (c.grp?.length ?? 0) > 0 || Object.values(c.ctl ?? {}).some(Boolean)));
+}
 const BENIGN_INTERP_OPTS = /^(?:--no-warnings|--trace-warnings|--enable-source-maps|--harmony|-B|-u|-O|-OO|-v|-w|-T|-t|-s)$/;
+// (R9-F1) Does the interpreter run on a program of its own (a code option, or a file operand that is not `-`)? `python3`, `python3 -`, `node`, `bash -s` read their program from stdin, wherever it comes from.
+// The same computation as runsInlineCode's last line; a version / help flag alone runs nothing.
+function lacksOwnProgram(argv) {
+  let i = argv.findIndex((w) => INTERPRETERS.test(baseOf(w)));
+  if (i < 0) i = 0; // (a name known only at run time: its words follow it)
+  const rest = argv.slice(i + 1);
+  if (rest.some((a) => /^--(?:eval|print|exec)(?:=|$)/.test(a) || /^-[A-Za-z]*[ecEprR]/.test(a))) return false;
+  // (R10-F6: `node -v`, `python3 -VV` print a version. #269 scan S2: only where the flag is a version / help flag: `-v` is verbose mode for python, bash, sh and zsh and ruby runs stdin after it, `bash -h` is hashall)
+  if (rest.length === 1) {
+    const n = i < 0 || i >= argv.length ? '' : baseOf(argv[i]);
+    if (/^--(?:version|help)$/.test(rest[0])) return false;
+    if (rest[0] === '-v' && new RegExp(`^(?:node|nodejs|deno|bun|php|perl)${VERSION}$`).test(n)) return false;
+    if (/^-(?:VV?|h)$/.test(rest[0]) && new RegExp(`^(?:python|pypy)${VERSION}$`).test(n)) return false;
+  }
+  const file = rest.findIndex((a) => !a.startsWith('-') || a === '-');
+  return file < 0 || rest[file] === '-';
+}
 function runsInlineCode(c, ctx) {
   if (!c.argv.length || isReadOnly(c, ctx)) return false;
   return c.argv.some((w, i) => {
@@ -2696,8 +3218,18 @@ function collectVars(cmds, ctx) {
   };
   const pins = ctx.loopPins; // (see loopReadings: the word each loop variable holds in this reading, or null: every one is only known at run time)
   for (const c of cmds) {
-    if (pins !== undefined && c.argv[0] === 'for' && /^[A-Za-z_][A-Za-z0-9_]*$/.test(c.argv[1] ?? '')) {
-      if (pins === null || !pins.has(c.argv[1])) unknown.add(c.argv[1]); else if (pins.get(c.argv[1]) !== LOOP_NOT_RUN) set(c.argv[1], pins.get(c.argv[1]), true);
+    // (#269 R10-F4) A `select NAME` reads its value at run time, and so does a two-word `for NAME` (the parser ends the header there: zsh's `for f (echo FILE) cp x $f` takes its words from the
+    // list that follows, not from "$@"): the name is only known at run time wherever it is used (ctx.unknownVars: a writer that uses it is refused)
+    // (#269 R11-F2) zsh takes several names per loop (`for a b (LIST)`, `for a b in LIST`: N names take the next N words) and `foreach NAME (LIST)`: EVERY name before `in` (or to the end of the header)
+    // is only known at run time, except the single name of a plain `for NAME in LIST` that loopReadings pins
+    if (LOOP_HEADS.has(c.argv[0])) {
+      // (the first word is always a name, even when it is spelled `in`: `for in (echo FILE) cp x $in`, `for in; do`; the keyword is looked for after it -- #269 scan)
+      const inAt = c.argv.indexOf('in', 2);
+      // (#269 R12-F2) no identifier filter: zsh accepts a digit name (a positional parameter, `for 1 in LIST` binds $1) and a subscripted one (`a[1]` marks `a`)
+      const names = c.argv.slice(1, inAt < 0 ? undefined : inAt).map((w) => w.replace(/\[.*$/s, '') || w);
+      if (c.argv[0] === 'for' && inAt === 2 && names.length === 1 && /^[A-Za-z_][A-Za-z0-9_]*$/.test(c.argv[1])) {
+        if (pins !== undefined) { if (pins === null || !pins.has(names[0])) unknown.add(names[0]); else if (pins.get(names[0]) !== LOOP_NOT_RUN) set(names[0], pins.get(names[0]), true); }
+      } else for (const n of names) unknown.add(n);
     }
     for (const [k, v] of Object.entries(c.env ?? {})) set(k, v);
     // (`set -- ev.sh`: the positional parameters, so `bash $1` is that file)
@@ -3624,7 +4156,7 @@ function linkReachesProtected(cmds, dirs, ctx) {
 
 const VAR_COMMANDS = new Set(['export', 'declare', 'typeset', 'local', 'readonly']);
 // builtins that bind a name without a NAME=value word
-const BINDERS = new Set(['read', 'mapfile', 'readarray', 'getopts', 'unset', 'let', 'printf', 'select', 'for', 'shift', 'wait', 'coproc']);
+const BINDERS = new Set(['read', 'mapfile', 'readarray', 'getopts', 'unset', 'let', 'printf', 'select', 'for', 'foreach', 'shift', 'wait', 'coproc']);
 const RUNS_CODE = new Set(['eval', 'source', '.', 'exec', 'trap', 'alias', 'unalias', 'enable', 'builtin', 'command', 'setopt', 'unsetopt', 'shopt', 'emulate', 'zmodload', 'autoload']);
 const LINE_BINDERS = new Set(['read', 'mapfile', 'readarray', 'getopts', 'printf', 'select', 'wait']);
 const HOME_NAMES = new Set(['HOME', 'USER', 'LOGNAME', 'USERPROFILE', 'USERNAME']);
@@ -3883,7 +4415,7 @@ function evaluateBashForFilesUnchecked(command, opts = {}) {
   // environment (any name the line does not set). A loop variable takes each word of its list in turn: the text is judged once per word ("readings"; a
   // word that expands stands as written, so a `$(…)` or a glob is judged as if it were written where the variable is). Past 64 readings every loop
   // variable is only known at run time (a script or a writer it picks is refused).
-  if (typeof command === 'string' && opts._loopPins?.text !== command && /(?:^|[\s;&|(){])for\s/.test(command)) {
+  if (typeof command === 'string' && opts._loopPins?.text !== command && /(?:^|[\s;&|(){])(?:for|foreach)\s/.test(command)) {
     const readings = loopReadings(command, opts);
     if (readings) {
       for (const pins of readings) {
@@ -3919,6 +4451,8 @@ function evaluateBashForFilesUnchecked(command, opts = {}) {
   }
 }
 const MAX_LOOP_READINGS = 64;
+// (the loop headers whose names are bound at run time)
+const LOOP_HEADS = new Set(['for', 'foreach', 'select']);
 // (a reading where the loop did not run: the name is not set by the line, as main read every loop variable)
 const LOOP_NOT_RUN = Symbol('loop not run');
 // A zsh parameter expansion with flags (`${(P)N::=x}` assigns the variable N names) or a bash indirect one (`${!N}`).
@@ -3927,7 +4461,8 @@ function loopReadings(command, opts) {
   const cmds = simpleCommands(command, { env: opts.env ?? process.env });
   const loops = new Map();
   for (const c of cmds) {
-    if (c.argv[0] !== 'for' || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(c.argv[1] ?? '')) continue;
+    // (only the plain one-name forms are pinned here; a loop with several names is unknown in the header pass: #269 R11-F2)
+    if (c.argv[0] !== 'for' || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(c.argv[1] ?? '') || (c.argv.length > 2 && c.argv[2] !== 'in')) continue;
     const words = c.argv[2] === 'in' ? c.argv.slice(3) : ['$@'];
     loops.set(c.argv[1], [...new Set([...(loops.get(c.argv[1]) ?? []), ...(words.length ? words : ['']), LOOP_NOT_RUN])]);
   }
@@ -3985,9 +4520,13 @@ function evaluateBashForFilesFrame(command, opts) {
   // Truncated means part of the line was never looked at, so nothing on it can be called harmless (500 `true;` then
   // `e''cho x > ~/.cl""aude/settings.json` must not slip through on a text match).
   if (cmds.undecidable) return deny(UNDECIDABLE_HEREDOC);
-  if (cmds.truncated) return deny('the command line is too complex to check (the parser gave up); split it into simpler commands');
+  if (cmds.truncated) return deny(cmds.refused ? `the command line uses ${cmds.refused}, which the guard does not read; ${refusalAdvice(cmds.refused)}` : 'the command line is too complex to check (the parser gave up); split it into simpler commands');
   ctx.shadowed = shadowedCommands(cmds, ctx);
   ctx.heredocPlants = /<</.test(raw) && plantsInText(raw); // (R5-F3: a heredoc body is on no command; the line's text is judged for an assigning expansion, a quoted body included)
+  if (closeBracketNotLast(cmds)) return deny('a command follows a closing ]] on the same piece (zsh\'s short `if [[ … ]] cmd` form), or ]] is an argument next to a [[: the guard cannot tell which ]] closes the test; write `[[ … ]] && cmd` or `if [[ … ]]; then cmd`');
+  // (#269 R13-F1, R13-F2; owner decision 2026-11-12: text-level refusals, on top of the parser-based checks)
+  if (closeBracketFollowedByWord(raw)) return deny('a word follows a closing ]] on a line with a [[ (zsh\'s short `if [[ … ]] cmd` form, `<->` number patterns, a redirect): the guard cannot tell which ]] closes the test; write `[[ … ]] && cmd` or `if [[ … ]]; then cmd`. The check reads quoted text and heredoc bodies too: put such text in a file written with the Write tool (`git commit -F FILE`, `gh … --body-file FILE`)');
+  if (loopNameRefused(cmds) || loopNameRefusedText(raw, cmds)) return deny('a loop variable that is a positional parameter, argv, or a subscripted name cannot be followed by the guard; use a plain name');
   // prose flags: what a commit message, PR body or test name says is not a reference (the values come out of every scan)
   const prose = new Map(cmds.map((c) => [c, proseWords(c.argv)]));
   const proseValues = [...prose.values()].flatMap((p) => p.values);
@@ -3999,6 +4538,37 @@ function evaluateBashForFilesFrame(command, opts) {
     const words = [c.argv.join(' '), ...Object.entries(c.env).map(([k, v]) => `${k}=${v}`)].join(' ');
     if (setsAdmin(words, ctx.platform)) return deny('the command sets PIPELINE_ADMIN; only the owner may set it, when launching Claude Code');
     if (hasDisableAll(words)) return deny('the command mentions disableAllHooks, which would switch the pipeline hooks off');
+  }
+  // #261: a write whose text names a file that can declare a hook on the owner's dialogs inside a program or a quoted string, and whose line says "hooks" (its effect cannot be evaluated). A write whose TARGET is
+  // such a file is judged by the target and what lands in it (R1-B1, hookSurfaceBashReason below, once the line's writes are known)
+  // (R2-F7, R3-B1, R8; owner decision 2026-11-12) Two rules, with no guessing whether an interpreter runs its input as code (rounds 5-8 kept finding ways to make one run its stdin despite a code option):
+  // 1. An interpreter (node, python, ruby, perl, php, lua, R, awk, deno, bun, tclsh, osascript ..., with or without a version suffix, and the shells) that is FED input on the line -- it receives a pipe, has an input
+  //    redirect or here-string or heredoc, holds a <( ) word, or an earlier `exec` / `coproc` replaced stdin, or its place in a pipeline is not known (inside a group, loop, branch or function on a line with a pipe or an
+  //    input redirect) -- is refused when the line names a file that can declare hooks. What it reads may be its program, and it may build the file name at run time, so the line is not scanned further.
+  // 2. An interpreter that is not fed and runs inline code (-e / -c, an awk program) is refused when its own words (or a here-string) name such a file, without the word "hooks" and whatever it does with the file
+  //    (a write word is no gate: os.link, os.sendfile, shutil.copy, fs.linkSync ...). (R4-B1) A read is no exception.
+  // So `cat <settings> | python3 -c '…json.load(sys.stdin)'` is refused too (read the file with the Read tool or jq). An interpreter that is fed on a line naming no such file, and an ordinary `interp FILE` run, are not touched.
+  // Known residual, out of reach of a text check: a program staged in a file by an EARLIER command (R4-F3 follow-up), and a program that is not fed and builds the path at run time.
+  {
+    const hooksWord = /hooks/i.test(scanRaw);
+    const isFed = feedInfo(cmds, raw);
+    // (R9-F2, R9-F3) Read the line as written AND the de-quoted words of every command (so `.cl""aude/settings.local.json` is seen), with no prose masked: a test runner's `-t VALUE` / `--grep` value is
+    // prose only for the protected-file references of a commit message or test name, never for a target or a program text.
+    const namesSurface = HOOK_SURFACE_TEXT.test(raw) || cmds.some((c) => [...c.argv, ...Object.values(c.env ?? {}), ...(c.redirects ?? []).map((r) => r.target ?? '')].some((w) => HOOK_SURFACE_TEXT.test(String(w))));
+    for (const c of cmds) {
+      const text = [...c.argv, ...Object.values(c.env ?? {}), ...(c.redirects ?? []).filter((r) => r.op === '<<<').map((r) => r.target ?? '')].join('\n'); // (R10-F5: `F=.claude/settings.local.json python3 -c '..os.environ["F"]..'`)
+      // (R9-F1) an interpreter with no program of its own reads it from stdin: on a line naming such a file it counts as fed whatever the feed looks like
+      if (mayRunInterpreter(c.argv) && !jsonToolOnly(c, raw) && (isFed(c) || (namesSurface && lacksOwnProgram(c.argv)))) {
+        if (namesSurface || HOOK_SURFACE_TEXT.test(text)) return deny(`input is fed into an interpreter on a line that names a file that can declare hooks; whether the interpreter runs that input as code cannot be checked (${HOOKS_MSG})`);
+      } else if (runsInlineCode(c, ctx)) {
+        if (HOOK_SURFACE_TEXT.test(text)) return deny(`an inline program names a file that can declare hooks, and what it does to it cannot be checked (${HOOKS_MSG})`);
+      }
+      if (!hooksWord) continue;
+      const writes = (c.redirects ?? []).some((r) => WRITE_OPS.has(r.op)) || (c.argv.length > 0 && !isReadOnly(c, ctx));
+      if (writes && [...c.argv, ...(c.redirects ?? []).map((r) => r.target ?? ''), rawOfCmd(c)].some((w) => HOOK_SURFACE_TEXT.test(String(w)))) {
+        return deny(`the command writes a file that can declare hooks and mentions hooks (${HOOKS_MSG})`);
+      }
+    }
   }
   if (changesClaudeCode(cmds, scanRaw)) return deny('the command unsets or overrides CLAUDECODE, the marker the installer uses to refuse to run inside Claude Code; only the owner may change it, from a terminal');
   if (setsSeamForPipeline(cmds)) return deny('the command sets a pipeline test seam (PIPELINE_GH, PIPELINE_CODEX, PIPELINE_VERCEL, PIPELINE_TEST_MODE, PIPELINE_UPDATE_REMOTE) for the pipeline CLI; a fake gh/codex/vercel could satisfy the merge gate, and a foreign update remote would install foreign code, so only the owner does that, from a terminal');
@@ -4034,6 +4604,10 @@ function evaluateBashForFilesFrame(command, opts) {
     tick: () => checkDeadline(ctx.budget),
   });
   ctx.frames.push(frame);
+  {
+    const why = hookSurfaceBashReason(cmds, frame, ctx, { wordsOf, dirs });
+    if (why !== null) return deny(`${why} (${HOOKS_MSG})`);
+  }
   // BASH_ENV / ENV / ZDOTDIR / HOME values this line (and the scripts that run it) assign: shells started by the scripts it runs see them
   const startupEnv = opts.env ?? process.env;
   const inheritedStartup = (n) => opts._startup?.[n] ?? [];
@@ -4176,6 +4750,10 @@ function evaluateBashForFilesFrame(command, opts) {
     if (anyName) { ctx.unknownAll = true; for (const k of Object.keys(ctx.vars)) { ctx.pickUnknown.add(k); ctx.unknownVars.add(k); ctx.srcChanged.add(k); } }
     if (LINE_BINDERS.has(cn) && (cn !== 'printf' || c.argv.some((a) => /^-v/.test(a)))) names.push(...bindsOf(cn, c.argv).names);
     names.push(...implicitBindsOf(c)); // (`[[ x =~ y ]]` sets MATCH, a (#m) pattern flag too: see implicitBindsOf)
+    // (#269 R10-F2) What a match or a `select` binds holds a word of the line (`[[ FILE =~ .+ ]] && cp x $MATCH`): only known at run time, so a writer that uses it is refused (unknownVars)
+    if (cn === '[[' || cn === 'select' || [...c.argv, ...Object.values(c.env ?? {}), ...(c.redirects ?? []).map((r) => r.target ?? '')].some((w) => String(w).includes('(#'))) {
+      for (const k of cn === 'select' ? ['REPLY', 'reply'] : MATCH_NAMES) { ctx.pickUnknown.add(k); ctx.unknownVars.add(k); }
+    }
     if (['declare', 'typeset', 'local'].includes(cn) && c.argv.slice(1).some((a) => /^-[A-Za-z]*n/.test(a))) for (const a of c.argv.slice(1)) { const t = /^[A-Za-z_]\w*=([A-Za-z_]\w*)/.exec(a); if (t) { names.push(t[1]); ctx.declared?.unknown.add(t[1]); } }
     for (const k of names) { ctx.pickUnknown.add(k); if (Object.hasOwn(ctx.vars, k)) ctx.unknownVars.add(k); }
   };

@@ -388,6 +388,47 @@ test('codex-review: quota, auth and a missing binary are exit 3 with unavailable
   assert.ok(!existsSync(join(w.repo.dir, '.review', 'state.json')), 'a failed Codex run must not leave a round behind');
 });
 
+// The weekly Codex figure: every real run (answered or failed) adds one line to the usage ledger (PIPELINE_CODEX_USAGE_FILE moves it into the scratch dir).
+const ledgerOf = (file) => (existsSync(file) ? readFileSync(file, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l)) : []);
+
+test('codex-review: each real Codex run, answered or failed, is logged in the usage ledger; a ledger that cannot be written only warns', (t) => {
+  const w = world(t);
+  const file = join(w.scratch, 'usage', 'codex-usage.jsonl');
+  const env = { PIPELINE_CODEX_USAGE_FILE: file };
+  assert.deepEqual(ledgerOf(file), []);
+
+  const failed = w.codex(1, findingsOf(), { env: { ...env, FAKE_CODEX_EXIT: '1', FAKE_CODEX_STDERR: 'ERROR: You hit your usage limit.' } });
+  assertExit(failed, 3);
+  assert.equal(failed.json.warnings, undefined, 'a written ledger adds no warning');
+  const ok = w.codex(1, standardFindings(), { env });
+  assertExit(ok, 0, ok.stderr + ok.stdout);
+
+  const lines = ledgerOf(file);
+  assert.equal(lines.length, 2);
+  assert.deepEqual(lines.map((l) => l.ok), [false, true]);
+  for (const l of lines) {
+    assert.deepEqual([l.v, l.kind, l.repo, l.pr, l.round, l.effort, l.model], [1, 'review', 'acme/widgets', 7, 1, 'high', 'gpt-6-astra']);
+    assert.ok(Math.abs(Date.parse(l.ts) - Date.now()) < 60_000, 'ts is the run time');
+    assert.equal('resolutionOnly' in l, false);
+  }
+});
+
+test('codex-review: an unwritable usage ledger never fails the round: a warning in the reply (also when Codex fails)', (t) => {
+  const w = world(t);
+  const blocked = join(w.scratch, 'plain-file');
+  writeFileSync(blocked, 'x'); // the ledger's folder is a regular file
+  const env = { PIPELINE_CODEX_USAGE_FILE: join(blocked, 'codex-usage.jsonl') };
+  const failed = w.codex(1, findingsOf(), { env: { ...env, FAKE_CODEX_EXIT: '1', FAKE_CODEX_STDERR: 'segfault' } });
+  assertExit(failed, 3);
+  assert.equal(failed.json.reason, 'error');
+  assert.match(failed.json.warnings[0], /^codex usage ledger not written/);
+  const ok = w.codex(1, standardFindings(), { env });
+  assertExit(ok, 0, ok.stderr + ok.stdout);
+  assert.equal(ok.json.round, 1);
+  assert.match(ok.json.warnings[0], /^codex usage ledger not written/);
+  assert.equal(w.state().rounds.length, 1, 'the round is recorded all the same');
+});
+
 test('codex-review: output that is not valid findings is exit 3 reason malformed, never "no findings"', (t) => {
   const w = world(t);
   const garbage = w.file('garbage.json', 'this is not json {');
