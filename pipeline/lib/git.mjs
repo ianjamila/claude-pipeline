@@ -706,16 +706,16 @@ export function reviewPatch(from, to, o) {
 }
 
 // `refs/remotes/origin/<branch>` is what a PR will be merged into; a repo without that remote ref (a fresh clone of a local fixture,
-// a test) falls back to the local branch. Any other git failure is not swallowed. The remote ref is returned FULLY QUALIFIED: git resolves a short
-// `origin/<branch>` as refs/tags/ and refs/heads/ first, so a tag or a local branch literally named `origin/main` would shadow it (EW #2056). Callers that
-// print the ref show `displayRef(ref)`.
+// a test) falls back to `refs/heads/<branch>`. Both are returned FULLY QUALIFIED: git resolves an abbreviated `origin/<b>` (or a bare `<b>`) through refs/tags and refs/heads
+// first, so a PR that pushes a branch or a tag named `origin/main` would otherwise move the base every hash and fork point measures from (Fable F1, #448). Any other git failure
+// is not swallowed.
 export function reviewBaseRef(branch, o) {
   const remote = `refs/remotes/origin/${branch}`;
   try {
     revParse(remote, o);
     return remote;
   } catch (err) {
-    if (err instanceof GitError) return branch;
+    if (err instanceof GitError) return `refs/heads/${branch}`;
     throw err;
   }
 }
@@ -763,12 +763,6 @@ export function lsRemoteDefaultBranch(o) {
 }
 // For tests that change a repository's remote inside one process.
 export const forgetLsRemoteAnswers = () => lsRemoteAnswers.clear();
-
-// The default branch every trust decision is anchored on, in the order risk.mjs#trustedDefaultBranch uses (#369, #377): what the remote calls its default
-// (refs/remotes/origin/HEAD, else `git ls-remote --symref origin HEAD` when an origin remote exists), else `configBranch` (the working-tree config's default_branch,
-// which a PR can edit: only a clone the remote does not answer for has to rely on it; trustedDefaultBranch reports that case as untrusted).
-export const anchorBranch = (configBranch, o) =>
-  remoteDefaultBranch(o) ?? (hasOriginRemote(o) ? lsRemoteDefaultBranch(o) : null) ?? configBranch;
 
 // THE content hash of "the code that was reviewed": what HEAD changes relative to where it forked from the PR base,
 // minus the agent log the pipeline itself appends to. The review loop (round coverage, review-complete) and the final

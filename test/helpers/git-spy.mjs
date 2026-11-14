@@ -24,7 +24,6 @@ export function gitCalls(logFile) {
   });
 }
 
-// The subcommands that change shared git state; a read-only command must start none of them.
-// (`symbolic-ref -q <ref>` with nothing after the ref is the READ form: origin/HEAD is read to anchor the default branch, #369; `config --get <key>` is the
-// read form too: whether an origin remote exists decides if the remote is asked for its default branch, #377.)
-export const GIT_WRITES = /^(fetch|pull|push|update-ref|checkout|switch|worktree|reset|merge|rebase|commit|branch|tag|gc|prune|clone|remote|config(?!\s+--get\s+\S+$)|add|stash|clean|restore|symbolic-ref(?!\s+-q\s+\S+$)|pack-refs|repack)(\s|$)/;
+// The subcommands that change shared git state; a read-only command must start none of them. Two READ forms are not writes: `config --get <key>` and
+// `symbolic-ref -q <ref>` (one ref, no target): risk.mjs#trustedDefaultBranch reads origin/HEAD and the origin remote's URL with them (#448).
+export const GIT_WRITES = /^(fetch|pull|push|update-ref|checkout|switch|worktree|reset|merge|rebase|commit|branch|tag|gc|prune|clone|remote|config(?!\s+--get(\s|$))|add|stash|clean|restore|symbolic-ref(?!\s+-q\s+\S+$)|pack-refs|repack)(\s|$)/;

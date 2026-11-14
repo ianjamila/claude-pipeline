@@ -422,7 +422,9 @@ test('dry run --owner-go, behind its base: the behindNote names the branch origi
   const tip = mainMoves(s, 'other.txt');
   s.repo.git(['update-ref', 'refs/remotes/origin/develop', tip]);
   s.repo.git(['symbolic-ref', 'refs/remotes/origin/HEAD', 'refs/remotes/origin/develop']); // pipeline.yml still says main
-  s.fake.setScript(script(s, { baseRefOid: tip, baseRefName: 'develop', behindBy: 1, gh: { compareBase: tip, base: 'develop' } }));
+  // GitHub's default is develop too: a local default that is not GitHub's is refused (#430, #448), so the fixture must agree with it.
+  const repoView = { match: '^repo view', stdoutJson: { nameWithOwner: 'acme/widgets', defaultBranchRef: { name: 'develop' }, url: 'https://github.com/acme/widgets' } };
+  s.fake.setScript(script(s, { before: [repoView], baseRefOid: tip, baseRefName: 'develop', behindBy: 1, gh: { compareBase: tip, base: 'develop' } }));
   const d = dry(s, ['--owner-go']);
   assertExit(d.r, 0, `${d.r.stderr}${d.r.stdout}`);
   assert.equal(d.r.json.wouldMerge, true, JSON.stringify(d.r.json.blockers));

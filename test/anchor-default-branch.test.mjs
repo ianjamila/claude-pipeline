@@ -15,13 +15,13 @@ import { setup, judge, ymlWith, ciRow, accepted } from './helpers/ci-proof-env.m
 import { loadConfig, validateConfig } from '../pipeline/lib/config.mjs';
 import { parseYaml } from '../pipeline/lib/yaml.mjs';
 import {
-  anchorBranch as gitAnchorBranch, contentHash, forgetLsRemoteAnswers, mergeBase, remoteDefaultBranch, reviewBaseRef as gitReviewBaseRef, treeFingerprint,
+  contentHash, forgetLsRemoteAnswers, mergeBase, remoteDefaultBranch, reviewBaseRef as gitReviewBaseRef, treeFingerprint,
 } from '../pipeline/lib/git.mjs';
-import { anchorBranch, currentContentHash, refreshBaseRef, reviewBaseRef } from '../pipeline/lib/review-context.mjs';
-import { anchorOf, baseRefFor, behindFreshEnough, localContentHash } from '../pipeline/lib/finalgate.mjs';
+import { currentContentHash, refreshBaseRef, reviewBaseRef } from '../pipeline/lib/review-context.mjs';
+import { baseRefFor, behindFreshEnough, localContentHash } from '../pipeline/lib/finalgate.mjs';
 import { docsExemptFrom } from '../pipeline/lib/docs-exempt.mjs';
 import { laneProblem } from '../pipeline/commands/review-complete.mjs';
-import { prBaseBranch, trustedBase, trustedDefaultBranch } from '../pipeline/lib/risk.mjs';
+import { hashBranch, prBaseBranch, trustedBase, trustedDefaultBranch } from '../pipeline/lib/risk.mjs';
 import { addRound, emptyState } from '../pipeline/lib/state.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -56,21 +56,20 @@ function world(t, { extraYml = '' } = {}) {
 
 // ---- the helpers ---------------------------------------------------------------------------------------------------
 
-test('anchorBranch / reviewBaseRef / currentContentHash follow origin/HEAD, not config.default_branch, and the ref is fully qualified', (t) => {
+test('hashBranch / reviewBaseRef / currentContentHash follow origin/HEAD, not config.default_branch, and the ref is fully qualified', (t) => {
   const w = world(t);
-  assert.equal(anchorBranch(w.root, w.cfg), 'develop');
-  assert.equal(gitAnchorBranch('main', { cwd: w.root }), 'develop');
+  assert.equal(hashBranch(w.root, w.cfg), 'develop');
   assert.equal(reviewBaseRef(w.root, w.cfg), REMOTE_DEVELOP);
   assert.equal(reviewBaseRef(w.root, w.cfg, 'main'), 'refs/remotes/origin/main', 'an explicit (stack) base is still resolved fully qualified');
   assert.equal(currentContentHash(w.root, w.cfg), w.hash(REMOTE_DEVELOP));
   assert.notEqual(currentContentHash(w.root, w.cfg), w.hash('refs/remotes/origin/main'), 'the config branch would have counted develop\'s commit as the PR\'s');
   // no usable origin/HEAD: the config's default_branch is the fallback
   w.repo.git(['symbolic-ref', '--delete', 'refs/remotes/origin/HEAD']);
-  assert.equal(anchorBranch(w.root, w.cfg), 'main');
+  assert.equal(hashBranch(w.root, w.cfg), 'main');
   assert.equal(reviewBaseRef(w.root, w.cfg), 'refs/remotes/origin/main');
 });
 
-test('anchorBranch follows the remote (ls-remote) when origin/HEAD is not set, in the order trustedDefaultBranch uses (#377)', (t) => {
+test('hashBranch follows the remote (ls-remote) when origin/HEAD is not set, in the order trustedDefaultBranch uses (#377)', (t) => {
   const w = world(t);
   const scratch = realpathSync.native(mkdtempSync(join(tmpdir(), 'cp-anchor-ls-')));
   t.after(() => rmSync(scratch, { recursive: true, force: true }));
@@ -82,8 +81,8 @@ test('anchorBranch follows the remote (ls-remote) when origin/HEAD is not set, i
   w.repo.git(['symbolic-ref', '--delete', 'refs/remotes/origin/HEAD']);
   forgetLsRemoteAnswers();
   t.after(() => forgetLsRemoteAnswers());
-  assert.equal(anchorBranch(w.root, w.cfg), 'develop', 'the remote names develop: config.default_branch (main) is not used');
-  assert.equal(trustedDefaultBranch(w.root, w.cfg).branch, anchorBranch(w.root, w.cfg), 'one order for both');
+  assert.equal(hashBranch(w.root, w.cfg), 'develop', 'the remote names develop: config.default_branch (main) is not used');
+  assert.equal(trustedDefaultBranch(w.root, w.cfg).branch, hashBranch(w.root, w.cfg), 'one order for both');
   assert.equal(reviewBaseRef(w.root, w.cfg), REMOTE_DEVELOP);
 });
 
@@ -156,29 +155,7 @@ function gateWorld(t, opts) {
   return s;
 }
 
-test('final-gate pr-open: the PR base must be the remote default branch, and the behind-base remedy names it', (t) => {
-  const onMain = gateWorld(t, {});
-  const bad = onMain.gate();
-  assert.equal(bad.code, 1, bad.stderr + bad.stdout);
-  assert.match(named(bad.json, 'pr-open').detail, /PR base is "main", not develop/);
-
-  const onDevelop = gateWorld(t, { gh: { base: 'develop', mergeStateStatus: 'BEHIND' } });
-  const r = onDevelop.gate();
-  const detail = named(r.json, 'pr-open').detail;
-  assert.match(detail, /behind-base: .*; update the branch from develop and re-verify/);
-  assert.doesNotMatch(detail, /PR base is/, 'a PR on the remote default branch has the right base');
-  // the refusal says where develop came from and how to repoint a stale origin/HEAD (R1-F1)
-  assert.match(detail, /"develop" is the default branch origin\/HEAD names \(pipeline\.yml says default_branch "main"; origin\/HEAD wins\).*git remote set-head origin -a/);
-  assert.match(named(bad.json, 'pr-open').detail, /origin\/HEAD names.*git remote set-head origin -a/);
-});
-
-test('final-gate pr-open: with no origin/HEAD (or one that agrees with pipeline.yml) the refusal carries no origin/HEAD note', (t) => {
-  const s = scenario({ gh: { base: 'release' } }); // no origin/HEAD in the fixture: the anchor is the config's main
-  t.after(() => s.repo.cleanup());
-  const detail = named(s.gate().json, 'pr-open').detail;
-  assert.match(detail, /PR base is "release", not main/);
-  assert.doesNotMatch(detail, /origin\/HEAD|set-head/);
-});
+// pr-open's PR-base / GitHub-default cross-check (#430, #448) is covered by test/trusted-default-gate.test.mjs.
 
 test('final-gate ci proof: the deferral settings come from the anchor branch\'s config (fetched), not config.default_branch\'s', async () => {
   // main (origin's HEAD branch in the config's eyes) lists no deferral; develop does. The PR changes nothing in the config.
@@ -238,10 +215,7 @@ test('a local branch named origin/main does not shadow the anchor either, and a 
 const CONFIG_BRANCH_OK = new Map([
   ['pipeline/lib/risk.mjs', [9, 'trustedDefaultBranch: the config fallback (no origin remote) and the untrusted one (its value + message); trustedBase: the mismatch comparison, its text and remoteDefault; rate\'s laneNotes text']],
   ['pipeline/commands/risk.mjs', [2, 'help text naming config.default_branch (the anchor-config fallback and the laneNotes mismatch), not a read']],
-  ['pipeline/lib/review-context.mjs', [1, 'anchorBranch: the fallback when origin/HEAD is unusable']],
-  ['pipeline/lib/finalgate.mjs', [2, 'anchorOf (the same fallback: the ONE read every gate decision and display text goes through, behindFreshEnough takes it as `branch`) + prOpenCheck\'s "pipeline.yml says" note']],
-  ['pipeline/lib/docs-exempt.mjs', [2, 'anchorBranch input: the same fallback (config?.default_branch ?? DEFAULTS.default_branch)']],
-  ['pipeline/lib/queue-route.mjs', [1, 'the merge-queue rules of the repository\'s configured default branch (not a review anchor)']],
+  ['pipeline/lib/preflight.mjs', [3, 'the unsupported default_branch report (#430): pipeline.yml\'s value compared with, and named next to, GitHub\'s default branch']],
   ['pipeline/lib/guard-provenance.mjs', [2, 'GitHub\'s own .default_branch field of the repository API (a jq path, not the config)']],
   ['pipeline/commands/agent-log.mjs', [6, 'where the agent log is published: the configured default branch (not a review anchor)']],
 ]);
@@ -278,7 +252,7 @@ test('no review-loop or gate file reads the config\'s default_branch except the 
     if (n > 0) found[rel] = n;
   }
   const allowed = Object.fromEntries([...CONFIG_BRANCH_OK].map(([f, [n]]) => [f, n]));
-  assert.deepEqual(found, allowed, 'route it through anchorBranch (review-context.mjs / git.mjs; finalgate: anchorOf), or pin the file and its count here with the reason the config value is intended');
+  assert.deepEqual(found, allowed, 'route it through risk.mjs#hashBranch (trustedDefaultBranch), or pin the file and its count here with the reason the config value is intended');
 });
 
 test('the help texts and docs/cli.md document laneNotes and the origin/HEAD override, and no longer call the mismatch a lane reason or origin/<default_branch> (R1-F2)', async () => {
@@ -309,5 +283,5 @@ test('behindFreshEnough prints the anchor branch (the caller\'s, else origin/HEA
     diff: () => ({ ok: true, mb: w.d1, files: [{ status: 'M', oldPath: 'a.txt', newPath: 'a.txt' }] }) };
   assert.deepEqual(behindFreshEnough(args), { ok: false, reason: 'develop changed 1 file(s) this PR also touches (a.txt)' }, 'the default: the anchor');
   assert.deepEqual(behindFreshEnough({ ...args, branch: 'release' }), { ok: false, reason: 'release changed 1 file(s) this PR also touches (a.txt)' }, 'the caller names the branch it measured from');
-  assert.equal(anchorOf(w.root, w.cfg), 'develop');
+  assert.equal(hashBranch(w.root, w.cfg), 'develop');
 });

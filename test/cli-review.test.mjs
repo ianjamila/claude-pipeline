@@ -222,7 +222,7 @@ test('excerptWindow: +/-20 lines around a line, clamped; line 0 means the whole 
 test('currentContentHash: hashes against origin/<default> when that ref exists, else the local default branch', async (t) => {
   const w = world(t);
   const { config } = await loadConfig(w.repo.dir);
-  assert.equal(reviewBaseRef(w.repo.dir, config), 'main');
+  assert.equal(reviewBaseRef(w.repo.dir, config), 'refs/heads/main');
   const local = currentContentHash(w.repo.dir, config);
   assert.equal(local, contentHash('main', 'HEAD', { cwd: w.repo.dir, exclude: ['docs/agent-log.md'] }));
 
@@ -4046,6 +4046,9 @@ test('resolution round end to end: publish, replay in a fresh clone, arbiter reb
   const clone = join(w.scratch, 'clone');
   const gitIn = (...args) => spawnSync('git', args, { cwd: clone, encoding: 'utf8' });
   assert.equal(spawnSync('git', ['clone', '-q', '--no-local', w.repo.dir, clone], { encoding: 'utf8' }).status, 0);
+  // The fixture's "remote" is a working repo with the PR branch checked out, so the clone's origin/HEAD names feat/x; a real remote's HEAD is its default branch
+  // (the hash is measured from the trusted default branch = origin/HEAD, #448), so point it at main as GitHub's would be.
+  assert.equal(gitIn('remote', 'set-head', 'origin', 'main').status, 0);
   const hasTree = () => gitIn('cat-file', '-e', markerTree).status === 0;
   assert.equal(hasTree(), false, 'precondition: the marker tree exists only where the round was made');
   // The fixture repo has the PR branch checked out, so the clone's origin/HEAD would name feat/x; a real remote's HEAD is its default branch, which is the anchor every

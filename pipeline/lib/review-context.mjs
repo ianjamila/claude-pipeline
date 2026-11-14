@@ -7,10 +7,10 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameS
 import path from 'node:path';
 import { EXIT } from './cli.mjs';
 import { Fail } from './cmd-common.mjs';
-import { GitError, NETWORK_TIMEOUT_MS, anchorBranch as gitAnchorBranch, git, reviewBaseRef as gitReviewBaseRef, reviewContentHash } from './git.mjs';
+import { GitError, NETWORK_TIMEOUT_MS, git, reviewBaseRef as gitReviewBaseRef, reviewContentHash } from './git.mjs';
 import { LockTimeoutError, withLock } from './locks.mjs';
 import { parseRemote } from './remote-url.mjs';
-import { trustedDefaultBranch } from './risk.mjs';
+import { hashBranch, trustedDefaultBranch } from './risk.mjs';
 import { loadState } from './state.mjs';
 
 export const EXCERPT_RADIUS = 20;
@@ -20,15 +20,11 @@ export const oneLine = (s) => String(s ?? '').replace(/\s+/g, ' ').trim();
 
 // ---- content hash ---------------------------------------------------------------------------
 
-// The default branch the review loop measures from: what the remote calls its default (origin/HEAD, else `git ls-remote --symref origin HEAD`), else
-// config.default_branch (git.mjs#anchorBranch, the same order as risk.mjs#trustedDefaultBranch; #369, #377). The branch a PR targets is risk.mjs#prBaseBranch.
-export const anchorBranch = (root, config) => gitAnchorBranch(config.default_branch, { cwd: root });
+// `origin/<branch>` is what the PR will be merged into (the default branch unless the PR names its own base); see
+// git.mjs#reviewBaseRef for the fallback.
+export const reviewBaseRef = (root, config, branch = hashBranch(root, config)) => gitReviewBaseRef(branch, { cwd: root });
 
-// `refs/remotes/origin/<branch>` is what the PR will be merged into (the anchor branch unless the PR names its own base); see
-// git.mjs#reviewBaseRef for the fallback and the fully qualified form.
-export const reviewBaseRef = (root, config, branch = anchorBranch(root, config)) => gitReviewBaseRef(branch, { cwd: root });
-
-// Best-effort refresh of origin/<default_branch>, for the commands that hash the content WITHOUT having fetched (review-complete,
+// Best-effort refresh of origin/<trusted default branch> (GitHub's default), for the commands that hash the content WITHOUT having fetched (review-complete,
 // state outcome, state mark-implemented; codex-review fetches on its own). The hash is the PR's diff against merge-base(origin/<branch>,
 // HEAD): after `update-branch` + `git pull --ff-only` (which fetches the PR branch only) the local origin/<branch> is older than the
 // main that was merged in, so the merge base is older, the diff includes main's new commits and the hash differs from the round's.
@@ -36,7 +32,7 @@ export const reviewBaseRef = (root, config, branch = anchorBranch(root, config))
 // usesRemoteRef: the hash is measured from origin/<branch> (it exists, fetched now or left over), not from the local <branch>. A caller
 // that must not trust a stale ref (mark-implemented) refuses when usesRemoteRef && !refreshed. Anything but a GitError is a bug and throws.
 export function refreshBaseRef(root, config) {
-  const branch = anchorBranch(root, config);
+  const branch = hashBranch(root, config); // the trusted default branch (risk.mjs#trustedDefaultBranch), the one the hash is measured from; `refreshed` says THAT fetch worked
   let refreshed = false;
   let reason;
   try {
@@ -46,7 +42,7 @@ export function refreshBaseRef(root, config) {
     if (!(err instanceof GitError)) throw err;
     reason = String(err.message).split('\n')[0].slice(0, 200);
   }
-  const usesRemoteRef = reviewBaseRef(root, config) === `refs/remotes/origin/${branch}`;
+  const usesRemoteRef = reviewBaseRef(root, config, branch) === `refs/remotes/origin/${branch}`;
   return { refreshed, ...(reason === undefined ? {} : { reason }), usesRemoteRef };
 }
 
@@ -68,8 +64,8 @@ export function refreshTrustedDefault(root, config, { except } = {}) {
 
 // What the branch changes relative to where it forked, minus the agent log. One definition, in git.mjs, shared with the
 // final gate (finalgate.mjs#localContentHash).
-export const currentContentHash = (root, config) =>
-  reviewContentHash({ branch: anchorBranch(root, config), agentLog: config.agent_log }, { cwd: root });
+export const currentContentHash = (root, config, branch = hashBranch(root, config)) =>
+  reviewContentHash({ branch, agentLog: config.agent_log }, { cwd: root });
 
 // ---- .review/ layout ------------------------------------------------------------------------
 

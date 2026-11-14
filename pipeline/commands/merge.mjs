@@ -24,10 +24,14 @@ import { askFields, clickConfigRefusal, clickGate } from '../lib/click-ask.mjs';
 import { listWorktrees } from '../lib/local-branches.mjs';
 import { RESTORE_NOTE, findOrphanedLift, holdTiming, mergeInProgress, parkNoteOf, readEligibleHold, recoverOrphanedLift, withHoldLifted, withMergeLock } from '../lib/hold.mjs';
 import {
-  GATE_FILE, PR_FIELDS, anchorOf, READABLE_MERGE_STATES, abandonMerge, disableAutoMerge, evaluateGate, evaluateOwnerGo, gateRefusals, localContentHash, mergeTiming, ownerGoBaseProblem, ownerItemsMoved, substituteRouteProblem, preMergeProblems, readReviewJson,
+  GATE_FILE, PR_FIELDS, READABLE_MERGE_STATES, abandonMerge, disableAutoMerge, evaluateGate, evaluateOwnerGo, gateRefusals, localContentHash, mergeTiming, ownerGoBaseProblem, ownerItemsMoved, substituteRouteProblem, preMergeProblems, readReviewJson,
   waitBlockers, waitForMerge,
 } from '../lib/finalgate.mjs';
 import { classifyMergeCommand, commandTail } from '../lib/merge-cleanup.mjs';
+import { hashBranch } from '../lib/risk.mjs';
+
+// The default branch the gate resolved for its run (finalgate.mjs#evaluateGate's trustedBranch), recorded in the gate file; absent (an older gate file) -> undefined, so the hash helper works it out.
+const trustedBranchOf = (gate) => (typeof gate?.trustedBranch === 'string' && gate.trustedBranch !== '' ? gate.trustedBranch : undefined);
 import { QueueUnreadable, clearSessionHold, endRecord, holdOnSignal, queueModeFor, readQueueRecord, recordOwnsHold, recordedHold, recoverQueuedLift, restoreHoldLabel, setHold, settleGuardStatuses } from '../lib/merge-queue.mjs';
 import { approvalGapSince, createQueueRoute, gateFreshSince, recheckGated, recheckOwnerGo, restoreHoldOnTerminal } from '../lib/queue-route.mjs';
 import { bestEffortSweep } from '../lib/queue-sweep.mjs';
@@ -169,7 +173,7 @@ export const run = guarded(async (argv, ctx) => {
     const head = headSha({ cwd: root });
     let hash = '';
     try {
-      hash = localContentHash(root, config);
+      hash = localContentHash(root, config, trustedBranchOf(gate)); // the branch the gate measured from, so both hashes agree
     } catch { /* gateRefusals reports the mismatch */ }
     const refusals = gateRefusals({
       gate, pr, head, prHead: gh.prView(pr, [...PR_FIELDS]).headRefOid, hash, repo: gh.repo().slug,
@@ -766,7 +770,7 @@ async function dryRunMerge({ root, config, pr, gh, ctx, ownerGo }) {
     gate = readReviewJson(root, GATE_FILE);
     let hash = '';
     try {
-      hash = localContentHash(root, config);
+      hash = localContentHash(root, config, trustedBranchOf(gate));
     } catch { /* gateRefusals reports the mismatch */ }
     const refusals = gateRefusals({ gate, pr, head, prHead: gh.prView(pr, [...PR_FIELDS]).headRefOid, hash, repo: slug });
     if (refusals.length > 0) add('gate', refusals.join('; '));
@@ -861,7 +865,7 @@ async function dryRunMerge({ root, config, pr, gh, ctx, ownerGo }) {
       }
       // Behind its base but accepted (merge.behind_base: disjoint): the owner is told so in the request, above the Areas / Head lines.
       if (queue.on) ownerStep = { ...ownerStep, queueNote: 'GitHub\'s merge queue tests it on top of main and everything ahead of it, then merges it — one "merge" is enough.' };
-      if (behind !== null) ownerStep = { ...ownerStep, behindNote: `behind ${anchorOf(root, config)} by ${behind.behindBy} commit(s); ${anchorOf(root, config)}'s ${behind.mainFiles} new file(s) touch none of this PR's files` };
+      if (behind !== null) ownerStep = { ...ownerStep, behindNote: `behind ${hashBranch(root, config)} by ${behind.behindBy} commit(s); ${hashBranch(root, config)}'s ${behind.mainFiles} new file(s) touch none of this PR's files` };
       ownerStep = { ...ownerStep, closing: closingBlock(ownerStep, pr) };
     }
   }

@@ -582,6 +582,12 @@ A `warnings` entry also appears when the guard (`evaluateBashForFiles`, run from
 
 Branch protection must require `ci.required_checks` AND, unless `ci.guard_checks: false`, the guard contexts `Test integrity` and `Hard-stop scan` (plus `Cross-model review` with `ci.review_check: true`); `protect` sets that same list.
 
+### The trusted default branch
+
+The pipeline's main is GitHub's default branch: what `refs/remotes/origin/HEAD` names, else `git ls-remote --symref origin HEAD` (asked once, read-only). `default_branch` in `.claude/pipeline.yml` must equal it: `preflight` reports a mismatch (`canMerge: false`, with the fix: set `default_branch` to GitHub's default, or make that branch the default on GitHub) and the merge gate refuses it. Every content hash, behind-base check, docs-exempt check, the gate's PR-base check, the CI-proof settings and the merge-queue rules read that trusted branch, never the PR-editable `default_branch`. Remote refs are read fully qualified (`refs/remotes/origin/<branch>`), so a local branch or tag named `origin/<branch>` cannot shadow them.
+
+The gate resolves the branch once per run and does NOT fetch first: the dry run and the real gate must scan the same range (#417), and the branch name comes from `origin/HEAD`, which a fetch of the branch does not change. It refuses when that branch is unanchored (an origin remote, no `origin/HEAD`, and `ls-remote` fails) or differs from GitHub's default (a stale `origin/HEAD`, a renamed origin remote); the remedy is `git remote set-head origin -a`. A clone with no origin remote falls back to `default_branch`.
+
 ## protect
 
 print (or with --apply, set) the GitHub branch protection and repo settings the pipeline relies on.
@@ -643,7 +649,7 @@ post the review-complete comment (and remove awaiting-review) once the review is
 
 ```
 pipeline review-complete --pr N [--repo DIR]   -> exit 0 {ok:true, posted|reused, comment:{id, url}, review, removed, recheck, recheckError?, warnings?}; exit 1 {ok:false, reason} when the review is not valid
-  origin/<default branch> (the anchor `pipeline risk` describes: the trusted fork point of the model and lanes too) is fetched first (best effort: offline keeps the cached ref, and a coverage refusal then says it could not be refreshed), so a PR updated
+  the trusted default branch (GitHub's default) as origin/<branch> is fetched first (best effort: offline keeps the cached ref, and a coverage refusal then says it could not be refreshed), so a PR updated
   from its base branch and pulled is judged against the main that was merged in
   after the validity checks it also refuses (exit 1) while a Claude-ruled follow-up has no issue or a fix made outside the file the finding names is not yet
   confirmed by a later round, and (exit 1 {error:closing-keywords}) a PR body that lists several issues after one closing keyword ("Closes #1, #2" closes only #1),
@@ -663,9 +669,9 @@ pipeline review-complete --pr N [--repo DIR]   -> exit 0 {ok:true, posted|reused
   when a proven Fable round counts as current only because of the owner's allowance (model-floor reset --allow-id, an id the parser cannot read) or a hold below MIN_FABLE, the comment gets one line
   "Standing Fable bypass: Fable round 3 counted via owner allowance <id>" (or "... via owner hold <id> (below <MIN_FABLE>)"), the output carries fableBypass:{note, rounds:[{round, via, id}]},
   and the final gate's review check detail carries the same note
-  a DRAFT whose head lacks commits of origin/<default branch> is refused last, before anything is published or posted (labels stay): exit 1 {ok:false, reason:'behind-base', error:'behind-base', base, behindBy, detail (why the check refused it: the helper's reason), remedy},
+  a DRAFT whose head lacks commits of the trusted default branch (GitHub's default) is refused last, before anything is published or posted (labels stay): exit 1 {ok:false, reason:'behind-base', error:'behind-base', base, behindBy, detail (why the check refused it: the helper's reason), remedy},
   so the review skill catches it up BEFORE `gh pr ready` and CI runs once, on current main: the remedy is `pipeline update-branch --pr N`, `git pull --ff-only`, the next codex-review round (only main was merged in: baseOnly, Codex does not run,
-  nothing is counted), then review-complete again. merge.behind_base: update = behind when origin/<default branch> is not an ancestor of HEAD; disjoint = behind only when the merge would refuse it too (the same check as `merge --owner-go`; a `mergeable` GitHub has not computed yet, UNKNOWN, is not a conflict: if everything else passes, the draft posts with a warning).
+  nothing is counted), then review-complete again. merge.behind_base: update = behind when the trusted default branch (GitHub's default) is not an ancestor of HEAD; disjoint = behind only when the merge would refuse it too (the same check as `merge --owner-go`; a `mergeable` GitHub has not computed yet, UNKNOWN, is not a conflict: if everything else passes, the draft posts with a warning).
   A ready PR is never refused for this; the check is skipped with a `warnings` entry when the base ref could not be refreshed (offline), the base has a merge queue (or it cannot be read), or the ancestry cannot be read
 ```
 
@@ -786,7 +792,7 @@ pipeline state outcome [--repo DIR]   -> roundOutcome + {clean, arbiterFailures,
   wholePrOwed: true (with base: the PR's merge base) when an Opus substitute round came before the PR's risk rose to high and no whole-PR round since: the next round must start at that base and reviews the whole PR
     (codex-review rejects any other base). nextRound.base is the base to pass (the merge base when wholePrOwed, else the last round's toHead); the effort and route of that round: pipeline codex-review --plan
   roundOutcome carries substituteRounds:[n] (rounds a Claude substitute reviewed first, while Codex was out of quota) and maxRisk (the highest risk the PR ever had: low|medium|high)
-  first fetches origin/<default branch> (the anchor `pipeline risk` describes; best effort: offline keeps the cached ref), so a PR updated from its base branch is not read as changed
+  first fetches the trusted default branch (GitHub's default; best effort: offline keeps the cached ref), so a PR updated from its base branch is not read as changed
   grantedRound {k, grantId, head, quote}: the owner's open extra-round grant for the next counted round and the checked-out HEAD (chat mode, an owner
   record younger than 24 h, not yet used) - it lifts reachedMax and effectiveMaxRounds by one; null otherwise. autoExtraOrdinal: the counted round the
   automatic extra round took, or null
@@ -796,8 +802,8 @@ pipeline state mark-implemented --ids a,b [--repo DIR]
   -> a forced or Claude-ruled ACCEPT whose named file is empty or was not changed is still marked, with implementedVia 'other-files': the next codex-review
      round asks Codex to confirm it (round.confirmFixed) and review-complete waits for that round. Ordinary ACCEPTs get no such field
   -> every mark records item.implementedAfterRound, the newest round number at that time (triage defer-fixes uses it to tell a fix made before the last reviewed round from a later one)
-  -> exit 3 {ok:false, unavailable:true, reason:base-refresh} and nothing is marked when origin/<default branch> cannot be fetched (offline, remote down) while the
-     hash would be measured from it - also with no origin remote but a leftover origin/<default branch> ref: a stale base would count the default branch's commits as the fix
+  -> exit 3 {ok:false, unavailable:true, reason:base-refresh} and nothing is marked when the trusted default branch (GitHub's default) cannot be fetched (offline, remote down) while the
+     hash would be measured from it - also with no origin remote but a leftover origin/<branch> ref: a stale base would count the default branch's commits as the fix
 pipeline state fable-refresh --pr N [--repo DIR]
   -> {ok, round, staleRounds, scope: "whole-pr"}: opens an uncounted Fable-only round (no Codex, not counted against review.max_rounds, allowed past it and with no new commit) on the pushed head, so a Fable pass proven with
      a Fable older than MIN_FABLE (or the lower hold of model-floor reset --hold) is re-reviewed. Refused (exit 2) unless a proven Fable round - or a substitute-fable review that stood in for Codex - is below that and no later whole-PR pass at or above it replaced it (error nothing-stale), every earlier round is finished
