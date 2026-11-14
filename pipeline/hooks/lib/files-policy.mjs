@@ -2210,6 +2210,15 @@ function dirLikeWord(cmds, ci, ctx, bases, fromFile = false) {
   if (w.length > MAX_DIR_WORD) return false;
   // (a sourced file is judged on its own text: the line's variables are not what its assignments leave, R18-F6)
   const e = fromFile ? w : expandRefs(w, ctx);
+  // (#352 merge of main: `exec {k}>f` / `{a[0]}>f`, an unquoted named-descriptor word right before `<` / `>`, opens a descriptor in zsh and bash >= 4.1 and is the command `{k}` in sh /
+  // bash 3.2, which have no AUTO_CD. Only zsh with IGNORE_BRACES reads it as a plain word (a `[N]` subscript then a glob): it runs a cd only when a directory named `{name…}` is there or
+  // made on the line. The brace is no run-time part here; the shell-parse side marks the line ctlBroken, so no cd on it is believed either)
+  const fdWord = /^\{([A-Za-z_]\w*)(?:\[\d+\])?\}$/.exec(w);
+  if (fdWord && typeof unq === 'string' && new RegExp(`(?:^|[\\s;&|(){}])${escapeRe(w)}(?=[<>])`).test(unq)) {
+    const like = (n) => typeof n === 'string' && n.startsWith(`{${fdWord[1]}`) && n.endsWith('}');
+    if (bases.some((d) => (ctx.readDir(d) ?? []).some((n) => like(n) && Array.isArray(ctx.readDir(pathsFor().join(d, n)))))) return true;
+    return makerOps(cmds).some((ops, k) => k !== ci && ops !== null && ops.some((q) => like(String(q).replace(/^(?:\.\/)+/, '').split('/')[0])));
+  }
   // (d) a run-time word, and a double-quoted word with no reference in it is literal text (`"a[@]"`)
   const rawWord = (c.raw ?? '').trim();
   const quotedLiteral = /^"[^"$`\\]*"$/.test(rawWord) || /^'[^']*'$/.test(rawWord);
@@ -3102,7 +3111,7 @@ function isReadOnly(cmd, ctx) {
   if (!argv.length) return false;
   const name = baseOf(argv[0]);
   const shadow = ctx.shadowed?.get(cmd);
-  if (shadow !== undefined && (shadow === 'all' ? !CD_CMDS.has(name) : !PATH_BUILTINS.has(name))) return false; // (#265 e)
+  if (shadow !== undefined && (shadow === 'all' ? !CD_CMDS.has(name) : !(PATH_BUILTINS.has(name) || (name === 'print' && ctx.selfZsh)))) return false; // (#265 e; zsh's print is a builtin a PATH change does not move, bash has none)
   const judged = judgedWords(name, argv.slice(1), ctx);
   if (judged.unknown) return false;
   if (evaluatesSubscript(name, argv.slice(1), ctx, cmd.raw)) return false;
@@ -3119,6 +3128,9 @@ function readOnlyWith(name, args, cmd, ctx, argv) {
     if (name === 'rg' && args.some((a) => a === '--pre' || a.startsWith('--pre='))) return false;
     return !(['less', 'more', 'bat', 'rg'].includes(name) && toolEnvTouched(cmd, ctx, GIT_TOOL_ENV));
   }
+  // (#352 merge of main: zsh's print writes its words to standard output like echo; an option cluster before the first operand that binds a name (-v), feeds the history (-s / -S) or the
+  // edit buffer (-z), writes to a numbered descriptor (-u, -p) or prompt-expands its words (-P) is not read-only. A word after `-` / `--` or the first operand ends the options.)
+  if (name === 'print') { for (const a of args) { if (a === '-' || a === '--' || !/^[-+]/.test(a)) break; if (/[vsSzuPp]/.test(a.slice(1))) return false; } return true; }
   if (name === 'find') return !args.some((a) => FIND_UNSAFE.test(a));
   if (name === 'git') return gitReadOnly(args) && !toolEnvTouched(cmd, ctx, GIT_TOOL_ENV);
   if (name === 'gh') return ghReadOnly(args, cmd, ctx);
@@ -5062,7 +5074,7 @@ function evaluateBashForFilesFrame(command, opts) {
     const at = ctx.frames.indexOf(frame);
     for (const d of unique([...assumedCwds(ctx), ...below])) {
       countCdRun(ctx.budget);
-      const r = evaluateBashForFiles(command, { ...opts, cwd: d, _assumedCwd: true, _writesOnly: true, _unknownCwd: false, _frames: ctx.frames.slice(0, at).map((f) => ({ ...f, recs: [...f.recs] })) });
+      const r = evaluateBashForFiles(command, { ...opts, cwd: d, _assumedCwd: true, _writesOnly: true, _unknownCwd: false, _selfZsh: ctx.selfZsh, _frames: ctx.frames.slice(0, at).map((f) => ({ ...f, recs: [...f.recs] })) });
       if (r.decision === 'deny') return deny(`after a cd into a directory known only at run time, ${r.reason} (judged as if the directory were ${d})${ctx.bareCd ? BARE_CD_HINT : ''}`);
     }
   }

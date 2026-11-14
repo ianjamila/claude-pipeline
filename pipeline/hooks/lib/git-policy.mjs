@@ -3090,7 +3090,17 @@ function evalString(str, startDir, ctx, level, child = false) {
       const op = own.sep === '|' ? (own.lead ?? ';') : own.sep;
       if (op === '&&') return true;
       // (#427: only a plain `exit` leaves (not `return`, not one with a redirection or extra words), and no redirection on the closer of its group right after it)
-      if (op === '||' && !deeper && plainExit(c) && !c.pipe && !c.bg && !(cmds[i + 1] !== undefined && cmds[i + 1].argv.length === 0 && (cmds[i + 1].redirects ?? []).length > 0)) return true;
+      if (op === '||' && plainExit(c) && !c.pipe && !c.bg && !(cmds[i + 1] !== undefined && cmds[i + 1].argv.length === 0 && (cmds[i + 1].redirects ?? []).length > 0)) {
+        if (!deeper) return true;
+        // (#427 merge of main: `cd X || { exit 1; }`: the exit is the first command the `||` reaches (its own sep is ||) through `{ }` / if / while openings of this shell (no subshell level
+        // between), so it runs when the change failed. Not in a function or trap body the change is not in (`cd X || function g { exit 1; }` only defines g), and no redirection on a closer
+        // of the levels between (`{ exit 1; } < f`: listed as commands of no words right after it, see above))
+        const between = c.up.slice(x.up.length);
+        let k = i + 1;
+        while (cmds[k] !== undefined && cmds[k].argv.length === 0 && (cmds[k].up?.length ?? 0) > x.up.length) { if ((cmds[k].redirects ?? []).length > 0) break; k++; }
+        const closerRedir = cmds[k] !== undefined && cmds[k].argv.length === 0 && (cmds[k].redirects ?? []).length > 0;
+        if (c.sep === '||' && between.every((e) => e.kind !== 'sub' && e.sep === '||') && !(c.ctl?.fn === true && !x.fn) && !(c.ctl?.trap === true && !x.trap) && !closerRedir) return true;
+      }
       if (op === '||' || x.cond) forget(x);
       return false;
     });
@@ -3327,7 +3337,7 @@ function evalString(str, startDir, ctx, level, child = false) {
     if (verdict && verdict.decision === 'deny') return verdict;
     if (argv.length > 0 && (changesStateWords || stateChanged(ctx, before))) {
       const how = certainChange(cmds, c, trusted);
-      const x = { up: c.up, cond: c.sep === '&&' || how === 'chain', scoped: how === 'chain', lost: changesStateWords, before };
+      const x = { up: c.up, cond: c.sep === '&&' || how === 'chain', scoped: how === 'chain', lost: changesStateWords, before, fn: c.ctl?.fn === true, trap: c.ctl?.trap === true };
       if (how) {
         trackers.push(x);
         const top = levels?.[levels.length - 1];

@@ -332,4 +332,16 @@ describe('#427: only a plain `exit` (alone or with one number) makes the code af
   NOT('cd X || { return 1; }', 'cd /other || { return 1; }; git push');
   NOT('cd X || exit 1 | cat (a pipeline stage)', 'cd /other || exit 1 | cat; git push');
   NOT('cd X || exit 1 & (a background job)', 'cd /other || exit 1 &\ngit push');
+  // (#352 merge of main: the git guard tracks levels, so the exit one level down is accepted only where the `||` surely reaches it in this shell)
+  NARROWED('cd X || { { exit 1; }; } (nested groups)', 'cd /other || { { exit 1; }; }; git push');
+  NOT('cd X || { echo; exit 1; } (not the first command)', 'cd /other || { echo x; exit 1; }; git push');
+  NOT('cd X || ( exit 1 ) (a subshell exit)', 'cd /other || ( exit 1 ); git push');
+  NOT('cd X || { exit 1; } | cat (a pipeline stage)', 'cd /other || { exit 1; } | cat; git push');
+  NOT('cd X || { exit 1; } & (a background job)', 'cd /other || { exit 1; } &\ngit push');
+  NOT('cd X || { { exit 1; }; } < /missing (a redirection on the outer closer)', 'cd /other || { { exit 1; }; } < /missing; git push');
+  NOT('cd X || { { exit 1; } < /missing; } (a redirection on the inner closer)', 'cd /other || { { exit 1; } < /missing; }; git push');
+  NOT('cd X || function g { exit 1; } (only defines g)', 'cd /other || function g { exit 1; }; git push');
+  NOT('cd X || g() { exit 1; } (only defines g)', 'cd /other || g() { exit 1; }; git push');
+  NOT('cd X || if true; then exit 1; fi (not the first command)', 'cd /other || if true; then exit 1; fi; git push');
+  NOT('cd X || for x in $L; do exit 1; done (the body may not run)', 'cd /other || for x in $L; do exit 1; done; git push');
 });

@@ -182,6 +182,38 @@ test('#352 R23-B1, R23-F1, R23-F2: nested / quoted subscripted descriptors rebin
   assert.equal(files('export F=22; sh run.sh', ok).decision, 'allow');
 });
 
+// (#352, merge of main: main's AUTO_CD reading took the `{k}` of `exec {k}>f` for a command word that could be a directory, so a script that opens a named descriptor was judged as if it
+// could cd anywhere. The word right before `<` / `>` is a descriptor (zsh, bash >= 4.1) or the command `{k}` (sh, bash 3.2: no AUTO_CD); only zsh with IGNORE_BRACES reads it as a word,
+// which runs a cd only into a directory of that name, there or made on the line)
+test('#352 merge: a named descriptor word is no AUTO_CD directory unless a directory of that name is there or made', () => {
+  const body = (pre) => `${pre}\necho '{}' > .review/round-$F/arbiter-output.json\n`;
+  for (const pre of ['exec {k}>/dev/null', 'exec {a[0]}>/dev/null', '{k}>/dev/null']) {
+    const sfs = fakeFs(PROJ, { 'run.sh': body(pre) }, [...DIRS, '.review']);
+    assert.equal(files('export F=x; bash run.sh', sfs).decision, 'allow', pre);
+  }
+  // (a directory of that name, or one the script makes, keeps the AUTO_CD reading: refused)
+  for (const [pre, dirs] of [['exec {k}>/dev/null', ['{k}']], ['exec {a[0]}>/dev/null', ['{a0}']], ["mkdir '{k}'\nexec {k}>/dev/null", []]]) {
+    const sfs = fakeFs(PROJ, { 'run.sh': body(pre) }, [...DIRS, '.review', ...dirs]);
+    assert.equal(files('export F=x; bash run.sh', sfs).decision, 'deny', `${pre} with ${dirs}`);
+  }
+  // (a quoted word is a command word, as before)
+  const qfs = fakeFs(PROJ, { 'run.sh': body('"{k}" >/dev/null') }, [...DIRS, '.review']);
+  assert.equal(files('export F=x; bash run.sh', qfs).decision, 'deny');
+});
+
+// (#352, merge of main: zsh's print writes its words to standard output like echo; main's hook-file rule read `print "starting $(date)"` after a cd only known at run time as a write of a file
+// of that name. Options that do more than print stay refused, and a PATH change keeps print a possible program unless the script is run by zsh, where it is a builtin)
+test('#352 merge: zsh print is read-only like echo, unless an option binds, feeds history or a descriptor, or prompt-expands', () => {
+  const fs = fakeFs(PROJ, {}, DIRS);
+  for (const p of ['print "a $Y"', 'print -r -- "a $Y"', 'print -l "a $Y" b', 'print -- -s "a $Y"']) assert.equal(files(`cd "$X" || exit 1; ${p}`, fs).decision, 'allow', p);
+  for (const p of ['print -s "a $Y"', 'print -S "a $Y"', 'print -z "a $Y"', 'print -u3 "a $Y"', 'print -rP "a $Y"', 'print -p "a $Y"', 'print -v V "a $Y"']) assert.equal(files(`cd "$X" || exit 1; ${p}`, fs).decision, 'deny', p);
+  const script = '#!/bin/zsh\nexport PATH="$HOME/.npm-global/bin:$PATH"\ncd "$X" || exit 1\nprint "starting $(date)"\n';
+  const zfs = fakeFs(PROJ, { 'run.sh': script }, DIRS);
+  assert.equal(files(`${PROJ}/run.sh`, zfs).decision, 'allow', 'run by zsh: print is a builtin');
+  assert.equal(files('zsh run.sh', zfs).decision, 'allow', 'zsh run.sh');
+  assert.equal(files('bash run.sh', zfs).decision, 'deny', 'run by bash: print may be a program on the moved PATH');
+});
+
 // ---- the second pass of a stale line spends what the first one left ------------------------------------------------------------------------------------------
 
 // main.sh runs n scripts; the first through "${BASH:-bash}" (rewritten), the last one binds BASH (judged after the rewrite, so the verdict is stale and the line is judged again)
