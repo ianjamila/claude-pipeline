@@ -781,6 +781,11 @@ const queueStateCheck = (message) => check('queue-state', false, `the merge queu
 
 // ---- the gate -----------------------------------------------------------------------------------
 
+// #417: the ONE comparison of the owner items a final-gate.json recorded with a live evaluation of the same head. `P merge` refuses on it after the owner
+// said "merge" (the owner never saw the new set); `P merge --dry-run` reports it as a blocker, so a preview never says wouldMerge for a merge that is refused.
+// null = same set (or a gate file that names none: nothing to compare); else { was, now }.
+export const ownerItemsMoved = (gate, live) => (typeof gate?.ownerItems === 'string' && live?.ownerItems !== gate.ownerItems ? { was: gate.ownerItems, now: live?.ownerItems ?? null } : null);
+
 // Runs every check (no short-circuit, so one run reports every problem). A gh failure on the PR lookup itself throws:
 // the caller maps it to exit 3, because without the PR there is nothing to judge.
 // readOnly (P merge --dry-run): changes no shared git state. The only step that does is the deferred-CI proof's base-settings read
@@ -800,6 +805,9 @@ export async function evaluateGate({ root, config, pr, gh, env, sleep = defaultS
   } catch (err) {
     hashError = String(err?.message ?? err);
   }
+  // The diff is taken once, here, against the same base as the content hash: a later check that reads it first would see the base AFTER a deferred
+  // verify step's `git fetch` (and the queue / BEHIND routes skip the read in behindBase), so the dry run and the real gate would scan different ranges (#417).
+  diff();
   let tree = '';
   try {
     tree = treeFingerprint(o);

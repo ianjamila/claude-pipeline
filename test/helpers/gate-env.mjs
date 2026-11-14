@@ -25,13 +25,26 @@ export const BASE_SHA = '9'.repeat(40);
 export const ME = { match: '^api user', stdout: 'me\n' };
 export const REPO = { match: '^repo view', stdoutJson: REPO_VIEW };
 
+// The environment of a spawned CLI: the caller's, minus what would make the child act for the LAUNCHING session. A suite run inside a Claude Code session (or inside a
+// `P job` started from one) inherits that session's review-lease variables; with them the child CLI takes a lease of the account (under that session's identity, in its
+// folder) instead of running as a plain test. Only a test that asks for them (in `env`) gets them. `node --test` marks its test processes with NODE_TEST_CONTEXT, which is what
+// keeps a checkout's CLI from taking leases (review-lease-wiring.mjs leasesOffForTests); a run without process isolation (`--test-isolation=none`, an in-process runner)
+// leaves it unset, so the child gets the mark here. Exported for test/gate-env-hermetic.test.mjs.
+export function cliEnv(fake, env = {}) {
+  const ambient = { ...process.env };
+  for (const k of ['PIPELINE_LEASE_HOLDER', 'PIPELINE_REVIEW_LEASE_DIR', 'PIPELINE_ADMISSION_WAIT_MS']) delete ambient[k];
+  ambient.NODE_TEST_CONTEXT ??= 'child-v8';
+  // PIPELINE_MERGEABLE_PAUSE_MS shortens the 2 s wait between `mergeable: UNKNOWN` re-reads (it can never lengthen it).
+  return { ...ambient, PIPELINE_MERGEABLE_PAUSE_MS: '1', PIPELINE_LOCK_DIR: LOCK_DIR, PIPELINE_MACHINE_ID: 'gate-env-test-machine', ...(fake?.env ?? {}), ...createFakeCodex().env, ...env };
+}
+
 // Spawns the real CLI inside `dir` against a fake gh. PIPELINE_* switches of the caller are scrubbed so a developer
 // running this inside a pipeline session cannot change the outcome.
 export function cli(args, { dir, fake, env = {} }) {
-  // PIPELINE_MERGEABLE_PAUSE_MS shortens the 2 s wait between `mergeable: UNKNOWN` re-reads (it can never lengthen it).
-  const base = { ...process.env, PIPELINE_MERGEABLE_PAUSE_MS: '1', PIPELINE_LOCK_DIR: LOCK_DIR, PIPELINE_MACHINE_ID: 'gate-env-test-machine', ...(fake?.env ?? {}), ...createFakeCodex().env, ...env };
+  const base = cliEnv(fake, env);
   for (const k of ['PIPELINE_OFF', 'PIPELINE_ADMIN', 'PIPELINE_MERGE_WAIT_MS', 'PIPELINE_MERGE_POLL_MS']) if (!(k in env)) delete base[k];
-  const r = spawnSync(process.execPath, [bin, ...args], { cwd: dir, env: base, encoding: 'utf8', timeout: 120_000 });
+  // stdin is closed, never a pipe or the session's terminal: no child can wait on input.
+  const r = spawnSync(process.execPath, [bin, ...args], { cwd: dir, env: base, encoding: 'utf8', timeout: 120_000, stdio: ['ignore', 'pipe', 'pipe'] });
   let json = null;
   try {
     json = r.stdout ? JSON.parse(r.stdout) : null;
