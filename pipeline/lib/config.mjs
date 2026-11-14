@@ -136,8 +136,9 @@ export function requiredChecks(ci) {
   return [...new Set([...configured, ...guards, ...review])];
 }
 
-const EFFORTS = ['low', 'medium', 'high', 'xhigh'];
-const EFFORT_LANES = ['low', 'medium', 'high', 'followup', 'small_fix'];
+// Lowest to highest: the order the stricter-of-two readers of review.effort compare in (review-round.mjs#strictestRouteConfig).
+export const EFFORTS = Object.freeze(['low', 'medium', 'high', 'xhigh']);
+export const EFFORT_LANES = Object.freeze(['low', 'medium', 'high', 'followup', 'small_fix']);
 const OWNER_APPROVALS = ['label', 'chat'];
 const OWNER_GO_CLICKS = ['on', 'off'];
 const PROVIDERS = ['vercel', 'github-deployments', 'other'];

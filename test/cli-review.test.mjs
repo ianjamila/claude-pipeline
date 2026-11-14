@@ -319,20 +319,45 @@ test('codex-review: a large binary document in the range is left out of diff.pat
   assert.equal(w.state().rounds[0].contentHashAtToHead, contentHash('main', 'HEAD', { cwd: repo.dir, exclude: ['docs/agent-log.md'] }));
 });
 
-test('codex-review: --model overrides the configured model; a bad effort or model is a usage error before anything runs', (t) => {
-  const w = world(t);
+// #389: the model is the TRUSTED config's (the one committed at the default branch's fork point), so --model may only name it; the working-tree value is the PR's to edit.
+const withModel = (m) => `${pipelineYml()}review:\n  codex_model: ${m}\n`;
+test('codex-review: --model must be the configured (trusted) model; a bad effort or model is a usage error before anything runs', (t) => {
+  const w = world(t, { yml: withModel('gpt-test-1') });
   const ok = w.codex(1, findingsOf(), { extra: ['--model', 'gpt-test-1'] });
   assertExit(ok, 0);
   assert.ok(w.captured()[0].argv.includes('model="gpt-test-1"'));
   assert.equal(w.state().rounds[0].items.length, 0, 'an empty review is a valid round with no items');
 
-  const w2 = world(t);
+  const w2 = world(t, { yml: withModel('gpt-test-1') });
   const badEffort = w2.cli(['codex-review', '--pr', '7', '--round', '1', '--base', w2.base, '--head', w2.head, '--effort', 'ultra']);
   assertExit(badEffort, 2);
   const badModel = w2.cli(['codex-review', '--pr', '7', '--round', '1', '--base', w2.base, '--head', w2.head, '--effort', 'high', '--model', 'x"; rm']);
   assertExit(badModel, 2);
+  assert.match(badModel.stderr + badModel.stdout, /invalid model/, 'a malformed --model is a usage error about its shape, not a model-mismatch');
   assert.equal(w2.captured().length, 0);
   assert.ok(!existsSync(join(w2.repo.dir, '.review', 'state.json')));
+});
+
+test('codex-review: a well-formed --model that is not the trusted model is refused with model-mismatch (exit 2), before anything runs (#389)', (t) => {
+  const w = world(t, { yml: withModel('gpt-test-1') });
+  const r = w.codex(1, findingsOf(), { extra: ['--model', 'gpt-other-9'] });
+  assertExit(r, 2);
+  assert.equal(r.json.error, 'model-mismatch');
+  assert.equal(r.json.expected, 'gpt-test-1');
+  assert.equal(w.captured().length, 0);
+  assert.ok(!existsSync(join(w.repo.dir, '.review', 'state.json')));
+});
+
+test('codex-review: a working-tree review.codex_model change is ignored: Codex runs with the base config\'s model, and --model naming the edited one is refused (#389)', (t) => {
+  const w = world(t, { yml: withModel('gpt-test-1') });
+  writeFileSync(join(w.repo.dir, '.claude', 'pipeline.yml'), withModel('gpt-evil-2'));
+  const refused = w.codex(1, findingsOf(), { extra: ['--model', 'gpt-evil-2'] });
+  assertExit(refused, 2);
+  assert.deepEqual([refused.json.error, refused.json.expected], ['model-mismatch', 'gpt-test-1']);
+  const ok = w.codex(1, findingsOf());
+  assertExit(ok, 0, ok.stderr + ok.stdout);
+  assert.ok(w.captured()[0].argv.includes('model="gpt-test-1"'), 'the trusted model ran');
+  assert.equal(w.state().rounds[0].codexModel, 'gpt-test-1');
 });
 
 test('codex-review: quota, auth and a missing binary are exit 3 with unavailable:true and a reason; no state is written', (t) => {
@@ -774,6 +799,25 @@ test('codex-review: a PR that targets a branch other than the default branch exc
   assert.equal(r.json.baseOnly, undefined);
   assert.equal(w.captured().length, 2, 'Codex ran');
   assert.match(patchOf(w, 2), /from-release\.js/, 'the author-chosen base branch\'s code is reviewed');
+  assert.equal(w.state().rounds[1].reviewBaseKind, 'previous');
+});
+
+// #398: "is this PR's base the default branch" is answered by the trusted default branch (origin/HEAD), never by the working-tree config's default_branch, which the PR
+// can edit: naming its own base branch there must not make that branch's merged-in commits count as "from the default branch" and drop out of the next round.
+test('codex-review: a PR whose own pipeline.yml names its base branch as default_branch still has that branch\'s merged-in commits reviewed (#398)', (t) => {
+  const gh = GH.map((e) => (e.match === '^pr view 7' ? { ...e, stdoutJson: { ...e.stdoutJson, baseRefName: 'release' } } : e));
+  const w = worldIgnoringReview(t, { gh, featFiles: { '.claude/pipeline.yml': `${pipelineYml()}default_branch: release\n` } });
+  w.repo.git(['branch', 'release', w.base]);
+  // the remote's own default branch (what origin/HEAD names) is main: the anchor the PR cannot edit
+  w.repo.git(['update-ref', 'refs/remotes/origin/main', w.base]);
+  w.repo.git(['symbolic-ref', 'refs/remotes/origin/HEAD', 'refs/remotes/origin/main']);
+  assertExit(w.codex(1, findingsOf()), 0);
+  const merged = mergeMainInto(w, { 'src/from-release.js': 'export const x = 1;\n' }, { branch: 'release' });
+  const r = w.codex(2, findingsOf(), { from: w.head, to: merged });
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.equal(r.json.baseOnly, undefined, 'not a base-only round');
+  assert.equal(w.captured().length, 2, 'Codex ran');
+  assert.match(patchOf(w, 2), /from-release\.js/, 'the PR-chosen base branch\'s code is reviewed');
   assert.equal(w.state().rounds[1].reviewBaseKind, 'previous');
 });
 
@@ -1838,6 +1882,19 @@ test('review-complete: a gh failure while removing the label is exit 3, not succ
   const w = world(t, { gh: [...GH, ...REVIEW_COMMENT, { match: '^pr edit', code: 1, stderr: 'HTTP 502' }] });
   assertExit(w.codex(1, findingsOf()), 0);
   assertExit(w.cli(['review-complete', '--pr', '7']), 3);
+});
+
+test('review-complete: the marker\'s fallback codexModel (a newest round that recorded none) is the trusted model, not a working-tree review.codex_model edit (#389, R1-F2)', (t) => {
+  const w = world(t, { yml: withModel('gpt-test-1'), gh: [...GH, REMOVE_LABEL, ...REVIEW_COMMENT] });
+  assertExit(w.codex(1, findingsOf()), 0);
+  const s = w.state();
+  delete s.rounds[0].codexModel; // a round that never recorded its model: only the configured default can name it
+  writeFileSync(join(w.repo.dir, '.review', 'state.json'), JSON.stringify(s, null, 2));
+  writeFileSync(join(w.repo.dir, '.claude', 'pipeline.yml'), withModel('gpt-evil-2'));
+  const r = w.cli(['review-complete', '--pr', '7']);
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.equal(r.json.review.codexModel, 'gpt-test-1');
+  assert.equal(reviewJson(postedBodies(w)[0]).codexModel, 'gpt-test-1');
 });
 
 test('review-complete: posts the marker comment with {contentHash, base, head, rounds, codexModel, modelProofDigest, stateHash}; an identical one is reused', (t) => {
@@ -4785,4 +4842,21 @@ test('R1-F4: state fable-refresh accepts a head that only added ledger rows (doc
   moved.repo.write('src/b.js', `${bFile}export const extra = 1;\n`);
   moved.prHead(moved.repo.commit('unreviewed change'));
   assert.equal(refreshOf(moved).json.error, 'content-moved');
+});
+
+// S1: state fable-refresh measures its whole-PR range from the PR's base branch; when GitHub names none and the default branch cannot be anchored on the remote (an origin remote that
+// answered neither origin/HEAD nor ls-remote), the working tree's default branch is the PR's to choose, so the refresh keeps the fork point the last round recorded.
+test('state fable-refresh: an untrusted anchor does not move the whole-PR range: the refresh round keeps the recorded fork point', (t) => {
+  const w = oldProofWorld(t);
+  w.repo.git(['remote', 'add', 'origin', '/nonexistent/cp-no-such-origin-s1']);
+  w.repo.git(['checkout', '-q', 'main']);
+  w.repo.write('docs.md', 'main moves\n');
+  const moved = w.repo.commit('main moves');
+  w.repo.git(['checkout', '-q', 'feat/x']);
+  w.repo.git(['merge', '--no-edit', 'main']); // the PR's content is unchanged, but its merge base with main is now main's new tip
+  w.setGh([{ match: '^pr view 7', stdoutJson: { title: 'Add compute', body: 'x', headRefName: 'feat/x', baseRefName: null } }, { match: '^repo view', stdoutJson: REPO_VIEW }], w.repo.git(['rev-parse', 'HEAD']).trim()); // GitHub names no base branch
+  const r = refreshOf(w);
+  assertExit(r, 0, r.stdout + r.stderr);
+  const [r1, r2] = w.state().rounds;
+  assert.deepEqual([r2.forkPoint, r2.forkPoint === moved], [r1.forkPoint, false]);
 });

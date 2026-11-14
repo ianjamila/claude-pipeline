@@ -24,15 +24,15 @@ import {
 import { createGitHub } from './github.mjs';
 import { assertPublishedHistory } from './review-publish.mjs';
 import { GhError } from './proc.mjs';
-import { isSensitivePath, rateBranch, trustedBase } from './risk.mjs';
-import { DEFAULTS } from './config.mjs';
+import { isSensitivePath, prBaseBranch, rateBranch, trustedBase } from './risk.mjs';
+import { DEFAULTS, EFFORTS, EFFORT_LANES } from './config.mjs';
 import { addRound, emptyState, higherRisk, loadState, maxRiskOf, saveState } from './state.mjs';
 import { baseEffort, codexSpend, decideRoute, protectedKindsFor, wholePrOwed } from './review-route.mjs';
 import { readWeeklyUsage } from './codex-usage.mjs';
 import { linkDeferredFollowups, reuseRuled, reviewedRoundCount, roundAdmission, roundOutcome, ruledCacheFrom } from './triage.mjs';
 import { claimGrantMarkers, grantIdOf, ownerGrantConfigDirHint, ownerGrantedRounds, ownerGrantGap } from '../hooks/lib/owner-go.mjs';
 import {
-  allItems, currentContentHash, ensureRoundDir, excerptWindow, reviewBaseRef, roundDir, withReviewLock, withRouteLock, writeFileAtomic, writeJson,
+  allItems, currentContentHash, ensureRoundDir, excerptWindow, refreshTrustedDefault, reviewBaseRef, roundDir, withReviewLock, withRouteLock, writeFileAtomic, writeJson,
 } from './review-context.mjs';
 
 // What the prompt and the stored round carry of a proven resolution. The lists are cut to 50 (dropped blocks first, so a cut never
@@ -172,8 +172,13 @@ export async function admitRound({ root, config, ctx, pr, round, base, head }) {
     throw err;
   }
 
-  // The merge base of the whole PR: where the PR forked from the branch it targets (origin/<base> when it exists).
-  const prBase = typeof view.baseRefName === 'string' && view.baseRefName !== '' ? view.baseRefName : config.default_branch;
+  // The merge base of the whole PR: where the PR forked from the branch it targets (origin/<base> when it exists). GitHub's answer wins; without one the PR is read as
+  // targeting the TRUSTED default branch (risk.mjs#prBaseBranch), never the working-tree config's default_branch, which the PR can edit (#398). When that fallback is needed and the
+  // default branch could not be anchored on the remote (an origin remote that did not answer), the working tree's value is the PR's to choose: exit 3 rather than let it set the range (S1).
+  const { branch: prBase, untrusted: prBaseUntrusted } = prBaseBranch(view, root, config);
+  if (prBaseUntrusted !== null) {
+    throw unavailable('github', { error: 'unanchored-base', message: `GitHub did not name the PR's base branch, and ${prBaseUntrusted}` });
+  }
   // Best effort: a fresh origin/<base> is what "merged in from the base branch" is measured against. Offline, no remote or a
   // slow one just means the cached ref is used.
   try {
@@ -181,6 +186,8 @@ export async function admitRound({ root, config, ctx, pr, round, base, head }) {
   } catch (err) {
     if (!(err instanceof GitError)) throw err;
   }
+  // The trusted fork point (rateBranch, the model, the lanes) is measured from origin/<default branch>, which is not the PR's base for a stack: refresh it too (R2-F1).
+  refreshTrustedDefault(root, config, { except: prBase });
   const forkPoint = mergeBase(reviewBaseRef(root, config, prBase), head, o);
   c.forkPoint = forkPoint;
   checkBase(state, c);
@@ -201,8 +208,10 @@ export async function admitRound({ root, config, ctx, pr, round, base, head }) {
   // What the reviewer is shown (and what the fix commits are measured against) is exactly this range. Round 1 starts at the merge
   // base; a later round starts where the previous one ended, with the base branch's commits merged in since then taken out.
   // Only commits that came from the protected default branch are left out: the base side is origin/<default_branch> (never a
-  // branch the PR author chose), and a PR that targets any other branch leaves nothing out. A failed or stale fetch only
-  // leaves an older origin/<default_branch>, which can only make the range bigger.
+  // branch the PR author chose), and a PR that targets any other branch leaves nothing out. "Targets the default branch" is the trusted one
+  // (rated.defaultBranch: origin/HEAD), not config.default_branch: a PR that names its own base branch there would otherwise have that branch's commits left out (#398). An UNTRUSTED anchor
+  // (rated.untrusted: an origin remote that answered neither origin/HEAD nor ls-remote, so the default branch is the working tree's, which the PR can edit) leaves nothing out either (S1).
+  // A failed or stale fetch only leaves an older origin/<default_branch>, which can only make the range bigger.
   // The conflict case ('whole-pr' above): when the merge of the default branch conflicted and the resolution only chose lines the
   // two sides had, the range is the resolution alone and the round is free of the cap (resolutionReviewBase has every rule).
   const baseBranchRef = reviewBaseRef(root, config, prBase);
@@ -210,7 +219,7 @@ export async function admitRound({ root, config, ctx, pr, round, base, head }) {
   let review = { base: forkPoint, kind: 'merge-base' };
   let resolution = null;
   if (state?.rounds.length > 0 && !wholePr) {
-    review = prBase === config.default_branch
+    review = prBase === rated.defaultBranch && rated.untrusted === null
       ? effectiveReviewBase({ from: base, forkPoint }, o)
       : { base, kind: 'previous' };
     if (review.kind === 'whole-pr') {
@@ -328,11 +337,19 @@ export function protectedKindsOf(adm) {
 // The substitute's own gates (review.substitute.*, read by codex-review's verdict, `substitute prepare|apply` and `triage second-review`) follow the same rule: a HIGHER
 // min_wait_minutes (Codex is waited for longer) and a LOWER max_packet_mb (fewer packets may go to a substitute).
 // An unreadable or invalid base config cannot be compared: the working tree is held against the built-in defaults instead (never looser than them), and the mode is off.
-// -> { smallFixLines, codexRoundBudget, soft, hard, mode, minWaitMinutes, maxPacketMb, modeOffFrom }; modeOffFrom says where an off came from (null when the mode is auto): the
+// A base config that is readable but names another default_branch than the working tree's, with a TRUSTED anchor (the remote named the default branch: trustedBaseOf's `anchoredConfig`),
+// is the same unreadable base for everything above (mode off, every path sensitive, Fable, the lane reason); only the effort lanes and the model keep using it, because its fork
+// point and committed config are the genuine ones and only the working tree moved default_branch (R1-B1): the lanes are the stricter of the working tree, that config AND the built-in lanes, and the model is its.
+// An untrusted anchor (trustedBaseOf gives no anchoredConfig) leaves the built-in lanes as the floor and the built-in model.
+// -> { smallFixLines, codexRoundBudget, soft, hard, mode, minWaitMinutes, maxPacketMb, effort, codexModel, modeOffFrom }; modeOffFrom says where an off came from (null when the mode is auto): the
 // working-tree config, the base config at the fork point, or an unreadable base config (with trustedBaseOf's reason), for the refusals that name it.
+// The effort lanes (review.effort.low|medium|high|followup|small_fix) are the stricter per lane too: the HIGHER effort (low < medium < high < xhigh) of the two, and an unreadable base
+// holds the working tree against the built-in lanes, so a PR cannot lower the effort its own review runs at (#389) -> `effort`: { low, medium, high, followup, small_fix }.
+// review.codex_model is not a stricter-of-two but the trusted one: the base config's when it is readable, else the built-in default, never the working tree's, which a PR can edit
+// to point the review at a model of its choosing (#389) -> `codexModel`.
 export function strictestRouteConfig(config, trusted) {
   const knobs = (c, mode) => ({
-    smallFixLines: c.review.effort.small_fix_lines, codexRoundBudget: c.review.codex_round_budget,
+    smallFixLines: c.review.effort.small_fix_lines, codexRoundBudget: c.review.codex_round_budget, effort: c.review.effort, codexModel: c.review.codex_model,
     soft: c.review.codex_budget.soft, hard: c.review.codex_budget.hard, mode: mode ?? c.review.substitute.mode,
     minWaitMinutes: c.review.substitute.min_wait_minutes, maxPacketMb: c.review.substitute.max_packet_mb,
   });
@@ -342,8 +359,11 @@ export function strictestRouteConfig(config, trusted) {
     : other.mode !== 'off' ? null
       : trusted?.ok === true ? "the pipeline.yml at the default branch's fork point sets review.substitute.mode off (the stricter of it and the working-tree config applies, so the working tree cannot turn the substitute on)"
         : `the pipeline.yml at the default branch's fork point could not be read (${trusted?.reason ?? 'no reason given'}); an unreadable base config turns the substitute off`;
+  const higher = (a, b) => (EFFORTS.indexOf(b) > EFFORTS.indexOf(a) ? b : a);
+  const anchored = trusted?.ok !== true && trusted?.anchoredConfig ? knobs(trusted.anchoredConfig) : null;
+  const effort = Object.fromEntries(EFFORT_LANES.map((lane) => [lane, higher(higher(wt.effort[lane], other.effort[lane]), anchored ? anchored.effort[lane] : other.effort[lane])]));
   return {
-    modeOffFrom,
+    modeOffFrom, effort, codexModel: (anchored ?? other).codexModel,
     smallFixLines: Math.min(wt.smallFixLines, other.smallFixLines), codexRoundBudget: Math.max(wt.codexRoundBudget, other.codexRoundBudget),
     soft: Math.max(wt.soft, other.soft), hard: Math.max(wt.hard, other.hard), mode: wt.mode === 'off' || other.mode === 'off' ? 'off' : wt.mode,
     minWaitMinutes: Math.max(wt.minWaitMinutes, other.minWaitMinutes), maxPacketMb: Math.min(wt.maxPacketMb, other.maxPacketMb),
@@ -355,10 +375,13 @@ export function strictestRouteConfig(config, trusted) {
 // it). As baseConfigAt answers: { ok, config } | { ok: false, reason }. A git failure is an unreadable base, never a throw. A readable committed config that names another
 // default_branch than the working tree's is not trusted here either (the PR may have moved the anchor): it reads as unreadable, so the gates fall back to the built-in
 // defaults and the substitute is off (the status display, round-status.mjs#trustedBaseConfig, keeps its lists for the severity union and reports the mismatch apart).
+// When the anchor itself is trusted (origin/HEAD or ls-remote named the default branch: only the working tree's default_branch moved) the unreadable answer also carries
+// `anchoredConfig`, the config committed at that genuine fork point, which strictestRouteConfig still uses for the effort lanes and the model (R1-B1). An untrusted anchor carries none.
 export function trustedBaseOf(root, config, forkPoint) {
   try {
-    const { trusted, mismatch } = trustedBase({ root, head: 'HEAD', config, trustedFork: forkPoint });
-    return trusted.ok && mismatch !== null ? { ok: false, reason: mismatch } : trusted;
+    const { trusted, mismatch, untrusted } = trustedBase({ root, head: 'HEAD', config, trustedFork: forkPoint });
+    if (trusted.ok && mismatch !== null) return untrusted === null ? { ok: false, reason: mismatch, anchoredConfig: trusted.config } : { ok: false, reason: mismatch };
+    return trusted;
   } catch (err) {
     return { ok: false, reason: String(err?.message ?? err).split('\n')[0].slice(0, 160) };
   }
@@ -371,12 +394,12 @@ export const routeConfigFor = (root, config, forkPoint) => strictestRouteConfig(
 // -> { route, evidence, effort, why, protected, small, lowered?, round, base, wholePr, spend, budget, governor, facts }
 export function planRound(adm, { env = process.env, now = Date.now() } = {}) {
   const { config, state, round, root } = adm;
-  const effort = config.review.effort;
   const kinds = protectedKindsOf(adm);
   // A PR must not loosen its own routing: the sensitive-path test and the knobs are read under the working-tree config AND the trusted base config, stricter wins
   // (R13-B1 / R13-F1); a base config that cannot be read counts every path as sensitive.
   const trusted = trustedBaseOf(root, config, adm.rated.trustedFork);
   const route = strictestRouteConfig(config, trusted);
+  const effort = route.effort; // the stricter lanes (#389): a PR cannot lower its own review effort
   const facts = rangeFacts(adm.review.base, adm.head, trusted.ok ? [config, trusted.config] : [config], { cwd: root });
   if (!trusted.ok) facts.sensitive = true;
   const small = facts.changedLines <= route.smallFixLines && !facts.newFile && !facts.sensitive;

@@ -5,6 +5,7 @@ import assert from 'node:assert/strict';
 import { roundWorld, findingsOf, low, aFile } from './helpers/round-world.mjs';
 import { assertExit } from './helpers/assert-exit.mjs';
 import { strictestRouteConfig } from '../pipeline/lib/review-round.mjs';
+import { DEFAULTS } from '../pipeline/lib/config.mjs';
 
 const lines = (n, tag) => Array.from({ length: n }, (_, i) => `export const ${tag}${i} = ${i};`).join('\n') + '\n';
 
@@ -125,4 +126,91 @@ test('a committed base config naming another default_branch than the working tre
   assert.equal(r.json.plan.small, false);
   assert.equal(r.json.plan.route, 'codex', 'a sensitive fix-check is never withheld for the budget');
   assert.match(r.json.plan.modeOffFrom, /could not be read .*default_branch/, 'the plan says the off came from an unreadable base, naming the mismatch');
+});
+
+// #389: the effort lanes are the stricter (higher) of the working tree and the trusted base config, per lane; the base here has every lane at high (roundWorld).
+const LOW_EFFORT = '  effort: {low: low, medium: low, high: low, followup: low, small_fix: low}\n';
+const plan1 = (w, extra = []) => w.cli(['codex-review', '--pr', '7', '--round', '1', '--base', w.base, '--head', w.head, ...extra]);
+
+test('#389: a working tree that lowers every effort lane to low still gets the base\'s high: --plan expectedEffort and the effort-mismatch check', (t) => {
+  const w = roundWorld(t, { max: 3 });
+  w.config({ review: LOW_EFFORT });
+  const planned = plan1(w, ['--plan']);
+  assertExit(planned, 0, planned.stderr + planned.stdout);
+  assert.deepEqual([planned.json.expectedEffort, planned.json.plan.effort], ['high', 'high']);
+  const refused = plan1(w, ['--effort', 'low']);
+  assertExit(refused, 2);
+  assert.deepEqual([refused.json.error, refused.json.expected], ['effort-mismatch', 'high']);
+});
+
+test('strictestRouteConfig: effort lanes take the higher per lane (low < medium < high < xhigh); an unreadable base holds the working tree against the built-in lanes; codexModel is the base\'s or the default, never the working tree\'s (#389)', () => {
+  const cfg = (effort, model) => ({ review: { effort: { small_fix_lines: 40, ...effort }, codex_round_budget: 6, codex_budget: { soft: 75, hard: 90 }, substitute: { mode: 'auto', min_wait_minutes: 0, max_packet_mb: 8 }, codex_model: model } });
+  const wt = cfg({ low: 'xhigh', medium: 'low', high: 'low', followup: 'medium', small_fix: 'low' }, 'wt-model');
+  const base = cfg({ low: 'medium', medium: 'high', high: 'high', followup: 'medium', small_fix: 'medium' }, 'base-model');
+  const both = strictestRouteConfig(wt, { ok: true, config: base });
+  assert.deepEqual(both.effort, { low: 'xhigh', medium: 'high', high: 'high', followup: 'medium', small_fix: 'medium' });
+  assert.equal(both.codexModel, 'base-model');
+  const unreadable = strictestRouteConfig(cfg({ low: 'low', medium: 'low', high: 'low', followup: 'low', small_fix: 'low' }, 'wt-model'), { ok: false, reason: 'x' });
+  // the built-in lanes (config.mjs DEFAULTS.review.effort): low medium, medium medium, high high, followup medium, small_fix low
+  assert.deepEqual(unreadable.effort, { low: 'medium', medium: 'medium', high: 'high', followup: 'medium', small_fix: 'low' });
+  assert.equal(unreadable.codexModel, DEFAULTS.review.codex_model);
+});
+
+// R1-B1: a working tree that moves default_branch to a side branch is a mismatch of the branch NAME only when the anchor is trusted (origin/HEAD says main): the fork point and its committed
+// config are genuine, so the effort lanes stay at least that config's (and the built-in lanes) and the model stays its, while every other consequence of a mismatch stays.
+const XHIGH_EFFORT = '  effort: {low: xhigh, medium: xhigh, high: xhigh, followup: xhigh, small_fix: xhigh}\n';
+const anchorOnMain = (w) => {
+  w.repo.git(['update-ref', 'refs/remotes/origin/main', 'main']);
+  w.repo.git(['symbolic-ref', 'refs/remotes/origin/HEAD', 'refs/remotes/origin/main']);
+  w.repo.git(['branch', 'side', 'main']); // an existing branch the edited config can name, so the fork point still resolves
+};
+
+test('R1-B1: default_branch moved to a side branch with a trusted anchor (origin/HEAD): the effort lanes stay at the readable base config\'s xhigh, the substitute stays off', (t) => {
+  const w = roundWorld(t, { max: 3, review: XHIGH_EFFORT });
+  anchorOnMain(w);
+  w.config({ review: LOW_EFFORT, yml: 'default_branch: side\n' });
+  const planned = plan1(w, ['--plan']);
+  assertExit(planned, 0, planned.stderr + planned.stdout);
+  assert.deepEqual([planned.json.expectedEffort, planned.json.plan.effort], ['xhigh', 'xhigh']);
+  assert.equal(planned.json.plan.facts.sensitive, true, 'the other consequences of the mismatch stay: every path is sensitive');
+  const refused = plan1(w, ['--effort', 'high']);
+  assertExit(refused, 2);
+  assert.deepEqual([refused.json.error, refused.json.expected], ['effort-mismatch', 'xhigh']);
+});
+
+test('R1-B1: the same mismatch keeps the base config\'s codex_model, not the built-in one (--model naming the edited one is refused with the base\'s expected)', (t) => {
+  const w = roundWorld(t, { max: 3, review: '  codex_model: gpt-test-1\n' });
+  anchorOnMain(w);
+  w.config({ review: '  codex_model: gpt-evil-2\n', yml: 'default_branch: side\n' });
+  const refused = plan1(w, ['--plan', '--model', 'gpt-evil-2']);
+  assertExit(refused, 2);
+  assert.deepEqual([refused.json.error, refused.json.expected], ['model-mismatch', 'gpt-test-1']);
+  const ok = plan1(w, ['--plan', '--model', 'gpt-test-1']);
+  assertExit(ok, 0, ok.stderr + ok.stdout);
+});
+
+test('R1-B1: an untrusted anchor (an origin that answers nothing) keeps the built-in lanes and model as the floor, never the committed config the working tree could have pointed at', (t) => {
+  const w = roundWorld(t, { max: 3, review: `${XHIGH_EFFORT}  codex_model: gpt-test-1\n` });
+  w.repo.git(['remote', 'add', 'origin', '/nonexistent/cp-no-such-origin-r1b1']); // an origin remote, no origin/HEAD, ls-remote unanswered
+  w.repo.git(['branch', 'side', 'main']);
+  w.config({ review: LOW_EFFORT, yml: 'default_branch: side\n' });
+  const planned = plan1(w, ['--plan']);
+  assertExit(planned, 0, planned.stderr + planned.stdout);
+  assert.equal(planned.json.expectedEffort, DEFAULTS.review.effort.low, 'the built-in lane for a low-risk first round');
+  const refused = plan1(w, ['--plan', '--model', 'gpt-test-1']);
+  assertExit(refused, 2);
+  assert.deepEqual([refused.json.error, refused.json.expected], ['model-mismatch', DEFAULTS.review.codex_model]);
+});
+
+test('strictestRouteConfig: a mismatch with an anchored (genuine) base config takes the stricter of the working tree, that config and the built-in lanes, and its model; other knobs keep the mismatch\'s consequences', () => {
+  const cfg = (effort, model) => ({ review: { effort: { small_fix_lines: 40, ...effort }, codex_round_budget: 6, codex_budget: { soft: 75, hard: 90 }, substitute: { mode: 'auto', min_wait_minutes: 0, max_packet_mb: 8 }, codex_model: model } });
+  const wt = cfg({ low: 'low', medium: 'low', high: 'low', followup: 'low', small_fix: 'low' }, 'wt-model');
+  const anchored = cfg({ low: 'xhigh', medium: 'low', high: 'low', followup: 'low', small_fix: 'low' }, 'base-model');
+  const r = strictestRouteConfig(wt, { ok: false, reason: 'moved', anchoredConfig: anchored });
+  assert.deepEqual(r.effort, { low: 'xhigh', medium: 'medium', high: 'high', followup: 'medium', small_fix: 'low' }, 'per lane: the highest of wt, base and built-in');
+  assert.equal(r.codexModel, 'base-model');
+  assert.equal(r.mode, 'off', 'the substitute stays off');
+  assert.match(r.modeOffFrom, /could not be read \(moved\)/);
+  const plain = strictestRouteConfig(wt, { ok: false, reason: 'untrusted' });
+  assert.equal(plain.codexModel, DEFAULTS.review.codex_model);
 });

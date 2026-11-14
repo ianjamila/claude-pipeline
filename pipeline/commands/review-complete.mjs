@@ -15,7 +15,8 @@ import { git, headSha, isAncestor, mergeBase, revParse } from '../lib/git.mjs';
 import { behindFreshEnough, lazyDiff } from '../lib/finalgate.mjs';
 import { QueueUnreadable, queueModeFor } from '../lib/merge-queue.mjs';
 import { createGitHub, guardGh } from '../lib/github.mjs';
-import { assessRisk, rateBranch, reviewLane } from '../lib/risk.mjs';
+import { assessRisk, prBaseBranch, rateBranch, reviewLane } from '../lib/risk.mjs';
+import { routeConfigFor } from '../lib/review-round.mjs';
 import { isSubstituteRound, loadState } from '../lib/state.mjs';
 import { readReviewGate } from '../lib/model-floor.mjs';
 import { noteReviewed } from '../lib/codex-usage.mjs';
@@ -24,14 +25,14 @@ import { verifyOwnerGrants } from '../lib/owner-grants.mjs';
 import { docsExemptFrom } from '../lib/docs-exempt.mjs';
 import { REVIEW_COMPLETE_MARKER } from '../lib/review-marker.mjs';
 import { closingKeywordProblem, multiIssueClosingLines } from '../lib/closing-keywords.mjs';
-import { currentContentHash, refreshBaseRef, reviewBaseRef, withReviewLock } from '../lib/review-context.mjs';
+import { currentContentHash, refreshBaseRef, refreshTrustedDefault, reviewBaseRef, withReviewLock } from '../lib/review-context.mjs';
 import { publishTriage, readPublished, reviewContentHash } from '../lib/review-publish.mjs';
 
 export const meta = {
   summary: 'post the review-complete comment (and remove awaiting-review) once the review is valid for the current content',
   usage: [
     'pipeline review-complete --pr N [--repo DIR]   -> exit 0 {ok:true, posted|reused, comment:{id, url}, review, removed, recheck, recheckError?, warnings?}; exit 1 {ok:false, reason} when the review is not valid',
-    '  origin/<default_branch> is fetched first (best effort: offline keeps the cached ref, and a coverage refusal then says it could not be refreshed), so a PR updated',
+    '  origin/<default_branch> (and the remote\'s own default branch when that is another one: the trusted fork point of the model and lanes) is fetched first (best effort: offline keeps the cached ref, and a coverage refusal then says it could not be refreshed), so a PR updated',
     '  from its base branch and pulled is judged against the main that was merged in',
     '  after the validity checks it also refuses (exit 1) while a Claude-ruled follow-up has no issue or a fix made outside the file the finding names is not yet',
     '  confirmed by a later round, and (exit 1 {error:closing-keywords}) a PR body that lists several issues after one closing keyword ("Closes #1, #2" closes only #1),',
@@ -47,6 +48,7 @@ export const meta = {
     '  same check as the final gate\'s review check): exit 1 {ok:false, reason: "round n: owner grant cannot be verified on this machine ..."} otherwise',
     '  a proven Fable round recorded with a Fable older than MIN_FABLE (or the lower hold of model-floor reset --hold) that no later whole-PR pass at or above it replaced is refused: exit 1 {ok:false, error:fable-refresh, reason, staleFableRounds:[{round, models}]},',
     '  the reason names the rounds and models and says `run `pipeline state fable-refresh --pr N``; the final gate\'s review check refuses the same PR the same way',
+    '  when GitHub names no base branch and the default branch cannot be anchored on the remote (an origin remote that answered neither origin/HEAD nor ls-remote: the working tree\'s default_branch is the PR\'s to edit), it is refused too: exit 1 {ok:false, reason: "GitHub did not name the PR\'s base branch, and ..."}',
     '  when a proven Fable round counts as current only because of the owner\'s allowance (model-floor reset --allow-id, an id the parser cannot read) or a hold below MIN_FABLE, the comment gets one line',
     '  "Standing Fable bypass: Fable round 3 counted via owner allowance <id>" (or "... via owner hold <id> (below <MIN_FABLE>)"), the output carries fableBypass:{note, rounds:[{round, via, id}]},',
     '  and the final gate\'s review check detail carries the same note',
@@ -82,15 +84,16 @@ function whyNot(state, hash) {
 // Fable when no round ran a proven Fable pass. A recorded high risk is Fable without looking further. When the hard stops cannot be collected the
 // lane is Fable whatever the level (fail closed). A recorded medium stays medium and only the judge lane of a fresh size-only medium may keep it
 // with the judge: a medium that came from a hit (now gone from a fresh scan, or never found by it) needs Fable.
-// `prBase`: the PR's base branch; a stack never gets the size-only judge (rateBranch).
-export async function laneProblem(state, root, config, base, { prBase = config.default_branch, rate = rateBranch } = {}) {
+// `prBase`: the PR's base branch; a stack never gets the size-only judge (rateBranch). Without one it is the TRUSTED default branch (rateBranch defaults it; never the
+// working-tree config's default_branch, which the PR can edit: #398).
+export async function laneProblem(state, root, config, base, { prBase, rate = rateBranch } = {}) {
   const recorded = LEVELS.includes(state.risk) ? state.risk : 'low';
   const proven = state.rounds.some((r) => r.fableRequired === true && r.arbiter?.proofOk === true);
   const needs = (why) => (proven ? null : `the PR needs the Fable review pass (${why}), but no review round ran a proven one`);
   if (recorded === 'high') return needs('high risk');
   let rated;
   try {
-    rated = await rate({ root, head: 'HEAD', config, prBase, base });
+    rated = await rate({ root, head: 'HEAD', config, ...(prBase === undefined ? {} : { prBase }), base });
   } catch (err) {
     return needs(`hard stops could not be collected: ${oneLine(err)}`);
   }
@@ -238,6 +241,7 @@ export const run = guarded(async (argv, ctx) => {
       // The hash is measured from origin/<default_branch>; after `update-branch` + `git pull --ff-only` that ref is older than the main that
       // was merged in, so refresh it first (best effort: offline keeps the cached ref and the round's own hash is what it is compared to).
       const refresh = refreshBaseRef(root, config);
+      refreshTrustedDefault(root, config, { except: config.default_branch }); // the trusted fork point (model, lanes) is measured from the remote's default branch, which can be another one
       const hash = currentContentHash(root, config);
       // The review is valid for the content as it is, or (review.docs_exempt_paths) the content is the reviewed one plus lines added to
       // listed documents. The same helper decides it in the final gate; everything below (grants, Fable, the lane) runs either way.
@@ -273,7 +277,9 @@ export const run = guarded(async (argv, ctx) => {
       }
       if (!grants.ok) return { exitCode: EXIT.FAILED, output: { ok: false, reason: grants.problems.join('; '), currentContentHash: hash } };
       const base = mergeBase(reviewBaseRef(root, config), local, { cwd: root });
-      const prBase = typeof view.baseRefName === 'string' && view.baseRefName !== '' ? view.baseRefName : config.default_branch;
+      // GitHub's base branch, else the trusted default branch; when that fallback is the working tree's own (an origin remote that did not answer) the PR chose it: refuse (S1).
+      const { branch: prBase, untrusted: prBaseUntrusted } = prBaseBranch(view, root, config);
+      if (prBaseUntrusted !== null) return { exitCode: EXIT.FAILED, output: { ok: false, reason: `GitHub did not name the PR's base branch, and ${prBaseUntrusted}`, currentContentHash: hash } };
       const lane = await laneProblem(state, root, config, base, { prBase });
       if (lane) return { exitCode: EXIT.FAILED, output: { ok: false, reason: lane, currentContentHash: hash } };
       // A Claude stand-in reviewed instead of Codex (plan 2026-11-11-codex-substitute-reviewer): a high-risk PR it covered with Opus alone, or a substitute round whose proof does not hold, is refused.
@@ -296,7 +302,7 @@ export const run = guarded(async (argv, ctx) => {
       publishTriage({ gh, root, pr, state });
 
       const record = reviewRecord(state, {
-        contentHash: hash, base, head: local, modelProofs: fableProofs(state), defaultCodexModel: config.review.codex_model,
+        contentHash: hash, base, head: local, modelProofs: fableProofs(state), defaultCodexModel: routeConfigFor(root, config).codexModel,
       });
       const bypass = fableBypassRounds(state, gate);
       const fableNote = fableBypassNote(bypass, gate);
