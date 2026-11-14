@@ -2647,6 +2647,47 @@ function splitOperands(argv, name) {
   return { written, dests, sources };
 }
 
+// R1-B3 / R1-B2 (#300): rsync's own reading of its words (splitOperands is cp's: it takes `--exclude VALUE` / `--timeout 30` for operands and `-t` for a target directory). The options that take a
+// value, as `--opt=v`, as `--opt v`, and as a short letter (`-e ssh`, `-esh`, `-ae ssh`: the rest of a cluster after the letter is its value, a letter that ends it takes the next word); options may stand
+// among the operands or after them (rsync permutes), and `--` ends them. Same-line names are replaced by their value first. { pos: the operands as written, expanded: the same, as expanded, dry: a real
+// -n / --dry-run option word (a value is no option: `--exclude -n`, `-en`) }
+const RSYNC_VALUE_LONG = new Set(['rsh', 'rsync-path', 'max-delete', 'max-size', 'min-size', 'partial-dir', 'block-size', 'compare-dest', 'copy-dest', 'link-dest', 'exclude', 'exclude-from', 'include', 'include-from',
+  'filter', 'files-from', 'out-format', 'log-file', 'log-file-format', 'bwlimit', 'timeout', 'contimeout', 'port', 'address', 'sockopts', 'password-file', 'temp-dir', 'backup-dir', 'suffix', 'chmod', 'chown',
+  'usermap', 'groupmap', 'iconv', 'skip-compress', 'compress-level', 'compress-choice', 'zc', 'zl', 'checksum-choice', 'cc', 'checksum-seed', 'modify-window', 'write-batch', 'only-write-batch', 'read-batch',
+  'protocol', 'info', 'debug', 'outbuf', 'stop-after', 'time-limit', 'stop-at', 'remote-option', 'copy-as', 'early-input', 'max-alloc']);
+const RSYNC_VALUE_SHORT = new Set(['e', 'f', 'B', 'T', 'M', '@']);
+function rsyncOperands(words, ctx) {
+  const pos = [];
+  const expanded = [];
+  let dry = false;
+  let rest = false;
+  const args = words.slice(1);
+  for (let i = 0; i < args.length; i++) {
+    if (ctx.budget) checkDeadline(ctx.budget);
+    const w = args[i];
+    const e = RUNTIME_PART.test(w) ? expandRefs(w, ctx) : w;
+    if (!rest && e === '--') { rest = true; continue; }
+    if (!rest && e.length > 1 && e[0] === '-') {
+      if (e[1] === '-') {
+        const eq = e.indexOf('=');
+        const o = eq < 0 ? e.slice(2) : e.slice(2, eq);
+        if (o === 'dry-run' && eq < 0) dry = true;
+        else if (eq < 0 && RSYNC_VALUE_LONG.has(o)) i++; // (the next word is its value, an option-looking one included)
+      } else {
+        for (let j = 1; j < e.length; j++) { // (linear: a cluster is read once, up to its first value letter)
+          const ch = e[j];
+          if (RSYNC_VALUE_SHORT.has(ch)) { if (j === e.length - 1) i++; break; }
+          if (ch === 'n') dry = true;
+        }
+      }
+      continue;
+    }
+    pos.push(w);
+    expanded.push(e);
+  }
+  return { pos, expanded, dry };
+}
+
 // R4-B1 / item 6 (#288): rsync's options as the shell passes them. A same-line name is replaced by its value (`D=--delete; rsync -a "$D" SRC ~/`) and a value that holds blanks is several words; a word that
 // can still be an option (it starts with `-`, `$` or a backtick) and holds a part only known at run time is a possible --delete / --remove-source-files, like a value the shell may split on other
 // characters (IFS). { del: deletes at the destination, rm: deletes its sources, unknown: either, as far as can be told }
@@ -4809,8 +4850,20 @@ function evaluateBashForFilesFrame(command, opts) {
     // (`.*`: a visible-file glob never matches a dot folder), and a cp / install source with a trailing slash on macOS (BSD cp copies its contents). A dry run (rsync -n / --dry-run) writes nothing.
     const mergesContents = (c, name, hit) => {
       const words = wordsOf(c);
-      if (name === 'rsync' && words.slice(1).some((w) => w === '--dry-run' || /^-[A-Za-z]*n[A-Za-z]*$/.test(w))) return false;
-      const { dests, sources } = splitOperands(words, name);
+      // R1-B3 / R1-B2: rsync reads its own options (rsyncOperands: a value is no operand and no dry-run flag, `-t` is no target directory)
+      let dests;
+      let sources;
+      if (name === 'rsync') {
+        const r = rsyncOperands(words, ctx);
+        if (r.dry) return false;
+        if (r.pos.length < 2) return false;
+        dests = [r.pos[r.pos.length - 1]];
+        sources = r.pos.slice(0, -1);
+      } else {
+        const r = splitOperands(words, name);
+        dests = r.dests;
+        sources = r.sources;
+      }
       if (!dests.some(hit)) return false;
       return sources.some((src) => {
         const s = toPosix(src);

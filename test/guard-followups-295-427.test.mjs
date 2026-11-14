@@ -158,6 +158,45 @@ describe('#300: a contents merge into the home directory (or a parent of it) is 
     ['cp a glob of visible files into home', 'cp /tmp/x/*.txt ~/'],
     ['rsync single file into home', 'rsync -a /tmp/x/file.txt ~/'],
   ]);
+  // R1-B3: rsync's own operand parsing (an option's value is no operand; options may follow the operands; -t is "times", not a target directory)
+  decide('deny', [
+    ['R1-B3: --exclude VALUE after the operands', 'rsync -a /tmp/x/ ~/ --exclude node_modules'],
+    ['R1-B3: --exclude=VALUE after the operands', 'rsync -a /tmp/x/ ~/ --exclude=node_modules'],
+    ['R1-B3: --timeout 30 after the operands', 'rsync -a /tmp/x/ ~/ --timeout 30'],
+    ['R1-B3: -t (preserve times) before the operands', 'rsync -a -t /tmp/x/ ~/'],
+    ['R1-B3: -t in a cluster', 'rsync -at /tmp/x/ ~/'],
+    ['R1-B3: -e ssh (a value) before the operands', 'rsync -a -e ssh /tmp/x/ ~/'],
+    ['R1-B3: -f FILTER (a value) after the operands', `rsync -a /tmp/x/ ~/ -f '- *.log'`],
+    ['R1-B3: -t alone is no dry run', 'rsync -t /tmp/x/ ~/'],
+    ['R1-B2: --exclude -n is a pattern, not a dry run', 'rsync -a --exclude -n /tmp/x/ ~/'],
+    ['R1-B2: --exclude=-n', 'rsync -a --exclude=-n /tmp/x/ ~/'],
+    ['R1-B2: -e n (the shell command "n"), a cluster ending in -e', 'rsync -ae n /tmp/x/ ~/'],
+    ['R1-B2: -en (the value of -e is "n")', 'rsync -aen /tmp/x/ ~/'],
+    ['R1-B2: a long word of n is no dry run when it holds a value letter first', `rsync -ae${'n'.repeat(50)} /tmp/x/ ~/`],
+  ]);
+  decide('allow', [
+    ['R1-B3: a folder by name, options after', 'rsync -a /tmp/x ~/ --exclude node_modules'],
+    ['R1-B3: a folder by name, --timeout between', 'rsync -a --timeout 30 /tmp/x ~/'],
+    ['R1-B3: --exclude before a folder by name', 'rsync -a --exclude node_modules /tmp/x ~/proj/'],
+    ['R1-B3: contents into a folder of home, options after', 'rsync -a /tmp/x/ ~/proj/ --exclude node_modules'],
+    ['R1-B3: contents into a folder of home, --timeout after', 'rsync -a /tmp/x/ ~/proj/ --timeout 30'],
+    ['R1-B3: -t on a merge below home', 'rsync -at /tmp/x/ ~/proj/'],
+    ['R1-B2: -n first', 'rsync -n -a /tmp/x/ ~/'],
+    ['R1-B2: -n after the operands', 'rsync -a /tmp/x/ ~/ -n'],
+    ['R1-B2: -an with an exclude', 'rsync -an --exclude node_modules /tmp/x/ ~/'],
+    ['R1-B2: --dry-run after the operands', 'rsync -a /tmp/x/ ~/ --dry-run'],
+    ['R1-B2: -vn a cluster (no value letter before n)', 'rsync -vn /tmp/x/ ~/'],
+  ]);
+  decide('deny', [
+    ['R1-B3: `--` ends the options', 'rsync -a -- /tmp/x/ ~/'],
+    ['R1-B3: --rsh=VALUE then the operands', 'rsync -a --rsh=ssh /tmp/x/ ~/'],
+  ]);
+  test('#458: a long -nnn…n1 word is read in linear time', () => {
+    const t0 = Date.now();
+    const r = run(`rsync -${'n'.repeat(150000)}1 /tmp/x/ ~/`);
+    assert.equal(r.decision, 'allow'); // (it holds an n: a dry run, as before)
+    assert.ok(Date.now() - t0 < 3000, `took ${Date.now() - t0} ms`);
+  });
   test('a trailing slash on a cp source is a contents merge on macOS (BSD cp) only', () => {
     assert.equal(run('cp -R /tmp/x/ ~/', { platform: 'darwin' }).decision, 'deny');
     assert.equal(run('cp -R /tmp/x/ ~/', { platform: 'linux' }).decision, 'allow');
