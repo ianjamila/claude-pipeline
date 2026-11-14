@@ -15,7 +15,7 @@ const usable = (w) => typeof w === 'number' && Number.isFinite(w) && w > 0;
 
 // What one file weighs in a bin: its measured ms (scripts/lib/test-weights.json) when known, else its bytes times the median
 // ms/byte of the measured files, so a new file lands near where its size says. With nothing measured the weight is the size.
-function weigh(files, weights) {
+export function weigh(files, weights) {
   const known = weights && typeof weights === 'object' ? weights : {};
   const rates = files.filter((f) => usable(known[f.name]) && f.size > 0).map((f) => known[f.name] / f.size).sort((a, b) => a - b);
   const mid = rates.length >> 1;
