@@ -124,8 +124,8 @@ export const DEFAULTS = deepFreeze({
     fix_verify_after_round: null,
     // Non-test added lines a fix round may have before the late lane flags it (flagged => full brief). A new non-test source file flags it too.
     fix_round_max_lines: 150,
-    // 'review' (off) | 'follow-up': past review.max_rounds (counted ordinal > max + 1, so never the round the owner granted) a low-severity SUGGESTION / WORTH CONSIDERING
-    // the judge or arbiter ruled ACCEPT becomes a FOLLOW-UP (filed as an issue; Claude may tighten it back). 'review' in EITHER config (working tree or fork point) keeps it off.
+    // 'review' (off) | 'follow-up': past review.max_rounds (counted ordinal > max + 1: the first round past the limit (the automatic extra round, or the owner's first grant when there was none) is exempt, later owner-granted rounds are affected) a low-severity SUGGESTION / WORTH CONSIDERING
+    // the judge or arbiter ruled ACCEPT becomes a FOLLOW-UP (filed as an issue; Claude may tighten it back). 'review' in ANY config (working tree, fork point or the trusted default-branch one; an unreadable one counts) keeps it off.
     post_max_suggestions: 'review',
     // The round trip-wire (chat mode, at `triage round-request`): once the PR has reviewed max_rounds + trip_wire_extra_rounds counted rounds, or trip_wire_not_falling rounds
     // past the limit accepted at least as many new items as the round before (and some), the ask becomes a process-review prompt first. The smaller value of the two configs applies.
