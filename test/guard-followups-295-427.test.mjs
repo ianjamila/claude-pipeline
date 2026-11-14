@@ -187,6 +187,25 @@ describe('#300: a contents merge into the home directory (or a parent of it) is 
     ['R1-B2: --dry-run after the operands', 'rsync -a /tmp/x/ ~/ --dry-run'],
     ['R1-B2: -vn a cluster (no value letter before n)', 'rsync -vn /tmp/x/ ~/'],
   ]);
+  // R1-B4: the source is read as the shell will pass it
+  decide('deny', [
+    ['R1-B4: a name that holds a trailing-slash source', 'SRC=/tmp/x/; rsync -a "$SRC" ~/'],
+    ['R1-B4: ${NAME} form', 'SRC=/tmp/x/; rsync -a "${SRC}" ~/'],
+    ['R1-B4: a name that holds a dot source (cp)', 'S=/tmp/x/.; cp -a "$S" ~/'],
+    ['R1-B4: a name that holds a dot glob (cp)', 'S="/tmp/x/.*"; cp -a $S ~/'],
+    ['R1-B4: a name plus slash', 'SRC=/tmp/x; rsync -a "$SRC"/ ~/'],
+    ['R1-B4: a source only known at run time, into home', 'rsync -a "$SRC" ~/'],
+    ['R1-B4: a substitution as the source, into home', 'rsync -a "$(mktemp -d)" ~/'],
+    ['R1-B4: a source only known at run time, into a parent of home', 'rsync -a "$SRC" /home/'],
+    ['R1-B4: a source whose last part is only known at run time', 'rsync -a /tmp/"$X" ~/'],
+  ]);
+  decide('allow', [
+    ['R1-B4: a name that holds a folder (no slash), into home', 'SRC=/tmp/x; rsync -a "$SRC" ~/'],
+    ['R1-B4: a name that holds a trailing-slash source, below home', 'SRC=/tmp/x/; rsync -a "$SRC" ~/proj/'],
+    ['R1-B4: a source only known at run time, below home', 'rsync -a "$SRC" ~/proj/'],
+    ['R1-B4: a run-time folder name, then a file below it, into home', 'rsync -a /tmp/"$X"/sub ~/'],
+    ['R1-B4: cp of a run-time file into home (everyday)', 'cp "$f" ~/'],
+  ]);
   decide('deny', [
     ['R1-B3: `--` ends the options', 'rsync -a -- /tmp/x/ ~/'],
     ['R1-B3: --rsh=VALUE then the operands', 'rsync -a --rsh=ssh /tmp/x/ ~/'],

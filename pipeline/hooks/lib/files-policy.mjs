@@ -4858,16 +4858,18 @@ function evaluateBashForFilesFrame(command, opts) {
         if (r.dry) return false;
         if (r.pos.length < 2) return false;
         dests = [r.pos[r.pos.length - 1]];
-        sources = r.pos.slice(0, -1);
+        sources = r.expanded.slice(0, -1);
       } else {
         const r = splitOperands(words, name);
         dests = r.dests;
-        sources = r.sources;
+        sources = r.sources.map((s) => (RUNTIME_PART.test(s) ? expandRefs(s, ctx) : s)); // (R1-B4: the source as the shell will pass it)
       }
       if (!dests.some(hit)) return false;
       return sources.some((src) => {
         const s = toPosix(src);
         if (s.endsWith('/') && (name === 'rsync' || ctx.platform === 'darwin')) return true;
+        // R1-B4: a source only known at run time may be a folder with a trailing slash (an rsync call only: `cp "$f" ~/` is an everyday copy of one file)
+        if (name === 'rsync' && RUN_TIME.test(s) && (/[`]|\$\(/.test(s) || RUN_TIME.test(s.slice(s.lastIndexOf('/') + 1)))) return true;
         const b = posix.basename(trimSlashes(s));
         return b === '.' || /^\.[^/]*[*?[]/.test(b);
       });
