@@ -969,6 +969,7 @@ test('dry run --owner-go, a hardstops scan that threw: no owner-runs hand-off (o
   assertExit(d, 1, `${d.stderr}${d.stdout}`);
   assert.equal(d.json.wouldMerge, false);
   assert.equal(d.json.ownerStep, null);
+  assert.ok(!('ownerItems' in d.json), `a scan that did not run has no digest to show: ${d.stdout}`); // #422 R1-F2
   assert.ok(d.json.blockers.some((b) => /^hardstops: could not evaluate/.test(b.detail)), JSON.stringify(d.json.blockers));
 });
 
