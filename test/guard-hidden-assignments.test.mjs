@@ -16,6 +16,7 @@ import assert from 'node:assert/strict';
 import { resolve, dirname, basename } from 'node:path';
 import { evaluateGitCommand } from '../pipeline/hooks/lib/git-policy.mjs';
 import { evaluateBashForFiles } from '../pipeline/hooks/lib/files-policy.mjs';
+import { EVAL_DEADLINE_MS } from '../pipeline/hooks/lib/script-candidates.mjs';
 
 function fakeFs(root, files, dirs = []) {
   const abs = (p) => resolve(root, p);
@@ -242,22 +243,34 @@ const chain = (twice, depth, words, names = 4) => {
   }
   return out;
 };
-const cpu = () => { const u = process.cpuUsage(); return (u.user + u.system) / 1000; }; // (CPU time, not the clock: a busy machine must not fail the test)
-// The timing bound below proves the refusal came well before the guard's 5 s deadline (the reason check proves it was the reading
-// cap). A shared CI runner measured 3480 ms of CPU and 3068 ms of clock for the 20-word chain (main e48f4ae, no code change), so CI
-// gets the headroom guard-t8b's cap got; it stays under the deadline.
-const EARLY_MS = process.env.CI ? 4500 : 3000;
-test('three nested scripts that each assign four names twice and loop over eight words are refused at once, not at the deadline', () => {
-  const t0 = cpu();
-  const w0 = Date.now();
-  const r = files('bash F1.sh', fakeFs(PROJ, chain(true, 3, 'w1 w2 w3 w4 w5 w6 w7 w8')), { now: cpu }); // (the guard's 5 s deadline in CPU time too: at load 100+ the clock deadline fired first and the reason was not the reading cap)
+// "Refused before the deadline" is proved by a virtual clock, not by a real one: a wall or CPU bound flaked on slow runners (Windows CI measured 2-3x a Mac) whatever its allowance.
+// The injected `now` never reads the machine's clock: it advances TICK_MS per call, so the guard's deadline (EVAL_DEADLINE_MS) is reached after a fixed number of calls whatever the
+// speed of the machine. The chains below make ~100,000 calls (~1.1 s of virtual time) before the reading cap refuses them; a cap that stopped refusing early would run into the
+// virtual deadline instead (a different reason) and fail the same way on every machine.
+const TICK_MS = 0.01;
+const virtualClock = () => {
+  let calls = 0;
+  const now = () => calls++ * TICK_MS;
+  return { now, elapsed: () => calls * TICK_MS, calls: () => calls };
+};
+const assertRefusedByReadingCap = (command, fsOpts) => {
+  const clock = virtualClock();
+  const r = files(command, fsOpts, { now: clock.now });
   assert.equal(r.decision, 'deny');
-  assert.match(r.reason, /too many readings/, r.reason);
-  const ms = cpu() - t0;
-  const wall = Date.now() - w0;
-  // Either clock under EARLY_MS proves the refusal came before the 5 s deadline: CPU time is inflated on a CI runner whose cores
-  // are shared with parallel test files (GC threads, contention), the clock on a merely busy machine.
-  assert.ok(ms < EARLY_MS || wall < EARLY_MS, `took ${Math.round(ms)} ms of CPU and ${wall} ms of clock`);
+  assert.match(r.reason, /too many readings/, r.reason); // (the cap refused it, not the deadline)
+  assert.ok(clock.elapsed() < EVAL_DEADLINE_MS / 2, `the refusal came after ${clock.calls()} clock readings (${clock.elapsed()} virtual ms of the ${EVAL_DEADLINE_MS} ms deadline)`);
+};
+test('the virtual clock advances per call, and a clock past the deadline is refused by the deadline, not the reading cap (the proof above is not vacuous)', () => {
+  const clock = virtualClock();
+  const t0 = clock.now();
+  assert.equal(clock.now() - t0, TICK_MS);
+  const late = (() => { let n = 0; return () => (n++ === 0 ? 0 : EVAL_DEADLINE_MS + 1); })(); // (the budget reads it once for its deadline, then it is past it)
+  const r = files('bash F1.sh', fakeFs(PROJ, chain(true, 3, 'w1 w2 w3 w4 w5 w6 w7 w8')), { now: late });
+  assert.equal(r.decision, 'deny');
+  assert.doesNotMatch(r.reason, /too many readings/, r.reason);
+});
+test('three nested scripts that each assign four names twice and loop over eight words are refused at once, not at the deadline', () => {
+  assertRefusedByReadingCap('bash F1.sh', fakeFs(PROJ, chain(true, 3, 'w1 w2 w3 w4 w5 w6 w7 w8')));
 });
 test('a chain with a few readings is still allowed', () => {
   assert.equal(files('bash F1.sh', fakeFs(PROJ, chain(true, 2, 'w1 w2', 2))).decision, 'allow'); // (two names twice, two words: 8 readings a level)
@@ -266,16 +279,7 @@ test('a chain with a few readings is still allowed', () => {
 });
 test('loop words alone (names assigned once) also share the allowance across nested scripts', () => {
   const words = Array.from({ length: 20 }, (_, i) => `w${i + 1}`).join(' '); // (20 + 20^2 + 20^3 readings)
-  const t0 = cpu();
-  const w0 = Date.now();
-  const r = files('bash F1.sh', fakeFs(PROJ, chain(false, 3, words)), { now: cpu }); // (deadline in CPU time, as above)
-  assert.equal(r.decision, 'deny');
-  assert.match(r.reason, /too many readings/, r.reason);
-  const ms = cpu() - t0;
-  const wall = Date.now() - w0;
-  // Either clock under EARLY_MS proves the refusal came before the 5 s deadline: CPU time is inflated on a CI runner whose cores
-  // are shared with parallel test files (GC threads, contention), the clock on a merely busy machine.
-  assert.ok(ms < EARLY_MS || wall < EARLY_MS, `took ${Math.round(ms)} ms of CPU and ${wall} ms of clock`);
+  assertRefusedByReadingCap('bash F1.sh', fakeFs(PROJ, chain(false, 3, words)));
 });
 
 test('program text in quotes (node -e, awk, sed) is no assignment: += and a[i]= in it change nothing', () => {
