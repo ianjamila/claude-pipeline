@@ -11,7 +11,7 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { assertExit } from './helpers/assert-exit.mjs';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
-import { scratchFloorDir } from './helpers/floor-env.mjs';
+import { scratchFloorDir, floorEnv } from './helpers/floor-env.mjs';
 import { createFakeGh, NO_COMMENTS, pipelineYml, REPO_VIEW } from './helpers/fakegh-env.mjs';
 import { withFloorLock } from '../pipeline/lib/model-floor.mjs';
 import { arbiterFailures, roundOutcome } from '../pipeline/lib/triage.mjs';
@@ -76,7 +76,7 @@ function world(t, { fable = true, findings = NO_FINDINGS } = {}) {
     env(extra = {}) {
       const env = {
         ...process.env, ...fake.env, PIPELINE_CODEX: `node "${fakeCodex}"`, PIPELINE_LOCK_DIR: join(scratch, 'locks'),
-        PIPELINE_MODEL_FLOOR_DIR: w.floor, PIPELINE_MACHINE_ID: process.env.PIPELINE_MACHINE_ID,
+        ...floorEnv(w.floor), PIPELINE_MACHINE_ID: process.env.PIPELINE_MACHINE_ID,
       };
       for (const k of SCRUBBED) delete env[k];
       return { ...env, ...extra };
