@@ -11,7 +11,7 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { assertExit } from './helpers/assert-exit.mjs';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
-import { scratchFloorDir } from './helpers/floor-env.mjs';
+import { scratchFloorDir, floorEnv } from './helpers/floor-env.mjs';
 import { createFakeGh, NO_COMMENTS, pipelineYml, REPO_VIEW } from './helpers/fakegh-env.mjs';
 import { raiseFloor, readFloor, resetFloor, withFloorLock } from '../pipeline/lib/model-floor.mjs';
 
@@ -85,7 +85,7 @@ function world(t) {
     env(extra = {}) {
       const env = {
         ...process.env, ...fake.env, PIPELINE_CODEX: `node "${fakeCodex}"`, FAKE_CODEX_CAPTURE: join(scratch, 'codex-capture.jsonl'),
-        PIPELINE_LOCK_DIR: join(scratch, 'locks'), PIPELINE_MODEL_FLOOR_DIR: w.floor, PIPELINE_MACHINE_ID: process.env.PIPELINE_MACHINE_ID || 'test-machine-id',
+        PIPELINE_LOCK_DIR: join(scratch, 'locks'), ...floorEnv(w.floor), PIPELINE_MACHINE_ID: process.env.PIPELINE_MACHINE_ID || 'test-machine-id',
       };
       for (const k of [...SCRUBBED, 'FAKE_CODEX_OUTPUT']) delete env[k];
       return { ...env, ...extra };
