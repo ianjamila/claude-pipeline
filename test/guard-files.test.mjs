@@ -38,6 +38,8 @@ test('protectedRoots lists the pipeline files under <home>/.claude in POSIX form
     '/home/u/.claude/agents/substitute-fable.md',
     '/home/u/.claude/pipeline',
     '/home/u/.claude/settings.json',
+    '/home/u/.claude/hooks', // (#261)
+    '/home/u/.claude/settings.local.json', // (#261)
     '/home/u/.claude/pipeline-state/owner-go',
     '/home/u/.claude/pipeline-state/codex',
     '/home/u/.codex/sessions',
@@ -1248,6 +1250,9 @@ test('#128 R2-B1: ~/.claude-eaglewatch (any home-level .claude* folder) is a tra
     'rsync -a x/ /home/u/proj/.claude-eaglewatch/',
   ]) assert.equal(bash(cmd), 'allow', cmd);
   assert.equal(file('Edit', { file_path: '/repo/.claude/settings.local.json', old_string: 'a', new_string: 'b' }), 'allow');
+  // (#261: a permissions edit of the project's local settings stays allowed; one that adds hooks is denied, see guard-click-hooks.test.mjs)
+  assert.equal(file('Write', { file_path: '/repo/.claude/settings.local.json', content: '{"permissions":{"allow":["Bash(ls:*)"]}}' }), 'allow');
+  assert.equal(file('Write', { file_path: '/repo/.claude/settings.local.json', content: '{"hooks":{"PreToolUse":[]}}' }), 'deny');
 });
 
 // R2-B2: a wildcard segment is asked whether it can stand for ANY name that starts with .claude, not for two sample names.
@@ -1865,7 +1870,9 @@ test('#128 R6-F1: program text naming a bare config root is refused whatever it 
     "python3 -c \"import shutil; shutil.rmtree('/mnt/home/u/claude-config')\"",
     "node -e \"require('fs').writeFileSync('/tmp/x',JSON.stringify({a:1}))\"",
     "python3 -c \"import shutil; shutil.rmtree('/repo/.claude/cache')\"",
-    "node -e \"require('fs').writeFileSync('.claude/settings.local.json','{}')\"",
+    // (#261 R2-F7: .claude/settings*.json can declare hooks, so an inline write to it is refused now — test/guard-click-hooks.test.mjs R2-F7;
+    // the point here, a repo's own .claude/ is not a config root, is kept with a file that declares nothing)
+    "node -e \"require('fs').writeFileSync('.claude/notes.json','{}')\"",
     "python3 -c \"import os,shutil; shutil.rmtree(os.path.join('/repo','.claude','cache'))\"",
   ]) assert.equal(bash(cmd, { env }), 'allow', cmd);
   // (a literal root that is not configured is just a folder)
@@ -1904,12 +1911,20 @@ test('#128 R7-F1: the home .claude folder spelled as a quoted piece with a path 
   ]) assert.equal(bash(cmd), 'deny', cmd);
 });
 
-test('#128 R7-F3: a repo path with a home word, and text naming no root, stay open', () => {
+test('#128 R7-F3: text naming no root stays open (the repo settings.local.json write moved to #269 R26-F3)', () => {
+  const env = { CLAUDE_CONFIG_DIR: '/home/u/claude-config' };
+  for (const cmd of [
+    "python3 -c \"print('x', 'a')\"",
+  ]) { assert.equal(bash(cmd, { env }), 'allow', cmd); assert.equal(bash(cmd), 'allow', cmd); }
+});
+
+test("#269 R26-F3: a run-time-built path to a repo's .claude/settings.local.json is refused (moved from the R7-F3 allow list)", () => {
   const env = { CLAUDE_CONFIG_DIR: '/home/u/claude-config' };
   for (const cmd of [
     "python3 -c \"import os; open(os.path.join('/home/u/repo', '.claude', 'settings.local.json'), 'w').write('{}')\"",
-    "python3 -c \"print('x', 'a')\"",
-  ]) { assert.equal(bash(cmd, { env }), 'allow', cmd); assert.equal(bash(cmd), 'allow', cmd); }
+    "node -e \"fs.writeFileSync(join(dir, '.claude', 'settings.local.json'), '{}')\"",
+    "node -e \"fs.writeFileSync(['..', '.claude', 'settings.local.json'].join('/'), '{}')\"",
+  ]) { assert.equal(bash(cmd, { env }), 'deny', cmd); assert.equal(bash(cmd), 'deny', cmd); }
 });
 
 // R5-F1: a wildcard root/projects segment with a literal folder below the project is the session folder the literal rule protects (mirrors TRANSCRIPT_BELOW).
