@@ -1,11 +1,14 @@
 // The detached half of the job runner (see jobs.mjs). Claude Code's Bash calls die after 10 minutes,
 // so a long command is started through this wrapper instead: it outlives its starter, sends the
-// command's stdout+stderr straight to <jobDir>/log, and leaves exit.json behind when the command
-// ends. Usage: node job-runner.mjs <jobDir> <command>
+// command's stdout+stderr to <jobDir>/log (stdout also, whole, to <jobDir>/stdout, capped at 4 MiB), and leaves
+// exit.json behind when the command ends. exit.json is written only AFTER the stdout capture is flushed, so a job
+// that reads as done always has its complete output. Usage: node job-runner.mjs <jobDir> <command>
 import { spawn } from 'node:child_process';
 import { openSync, closeSync, writeSync, readFileSync, writeFileSync, renameSync } from 'node:fs';
+import { STDOUT_CAP_BYTES, STDOUT_FILE } from './job-output.mjs';
 import path from 'node:path';
 
+const DRAIN_GRACE_MS = 3000;
 const [jobDir, commandArg] = process.argv.slice(2);
 
 // tmp + rename, so a poller never reads half a file.
@@ -16,6 +19,10 @@ function writeJsonAtomic(file, value) {
 }
 
 let logFd = null;
+let outFd = null;
+let outBytes = 0;
+let outputTruncated = false;
+let outputCaptured = false;
 let finished = false;
 let child = null;
 
@@ -37,7 +44,13 @@ function note(message) {
 function finish(code, signal) {
   if (finished) return;
   finished = true;
-  writeJsonAtomic(path.join(jobDir, 'exit.json'), { code, signal, finishedAt: new Date().toISOString() });
+  try { child?.stdout?.destroy(); } catch { /* ignore */ }
+  if (outFd !== null) {
+    try { closeSync(outFd); } catch { /* ignore */ }
+    outFd = null;
+  }
+  const capture = outputCaptured ? { outputBytes: outBytes, outputTruncated } : {};
+  writeJsonAtomic(path.join(jobDir, 'exit.json'), { code, signal, finishedAt: new Date().toISOString(), ...capture });
   if (logFd !== null) {
     try { closeSync(logFd); } catch { /* ignore */ }
   }
@@ -50,21 +63,43 @@ function main() {
   } catch { /* the starter used the same cwd for this process, so the fallback below is equivalent */ }
   const command = commandArg ?? meta.command;
 
-  // Both streams share one O_APPEND descriptor, opened before the command exists, so the output is
-  // interleaved in order and a fast-failing command cannot lose a line.
+  // stderr goes straight to the log descriptor, opened before the command exists, so a fast-failing command cannot lose a
+  // line. stdout comes through a pipe: every chunk is appended to the log AND to the stdout capture (first STDOUT_CAP_BYTES).
   logFd = openSync(path.join(jobDir, 'log'), 'a');
+  outFd = openSync(path.join(jobDir, STDOUT_FILE), 'w');
+  outputCaptured = true;
   child = spawn(command, {
     shell: true,
     cwd: meta.cwd ?? process.cwd(),
-    stdio: ['ignore', logFd, logFd],
+    stdio: ['ignore', 'pipe', logFd],
     windowsHide: true,
   });
+
+  let exited = null;
+  let drained = false;
+  const settle = () => { if (exited && !finished) finish(exited.code, exited.signal); };
+  child.stdout.on('data', (chunk) => {
+    try { writeSync(logFd, chunk); } catch { /* the log is a convenience */ }
+    const room = STDOUT_CAP_BYTES - outBytes;
+    if (chunk.length > room) outputTruncated = true;
+    if (room > 0 && outFd !== null) {
+      const part = chunk.length > room ? chunk.subarray(0, room) : chunk;
+      try { writeSync(outFd, part); outBytes += part.length; } catch { outputTruncated = true; }
+    }
+  });
+  // 'close' fires once the pipe is drained: only then is the capture complete. A grandchild that inherited the pipe can keep it
+  // open after the command exits, so after 'exit' the drain is waited for only briefly.
+  child.stdout.on('close', () => { drained = true; settle(); });
 
   child.on('error', (err) => {
     note(`failed to start command: ${err.message}`);
     finish(127, null);
   });
-  child.on('exit', (code, signal) => finish(code, signal));
+  child.on('exit', (code, signal) => {
+    exited = { code, signal };
+    if (drained) settle();
+    else setTimeout(settle, DRAIN_GRACE_MS);
+  });
 
   if (child.pid) {
     writeJsonAtomic(path.join(jobDir, 'child.json'), { pid: child.pid, startedAt: new Date().toISOString() });
