@@ -223,3 +223,26 @@ describe('#478 R2-F1 / R2-B1: the state after a failure group is forgotten when 
   ALLOW('the plain group form is still narrowed', 'cd /other || { echo no; exit 1; }; git push');
   ALLOW('the checkout group is still narrowed', 'git checkout agent/y || { echo no; exit 1; }; git push');
 });
+
+// R2-B2 / R2-B3 / R2-F2: the --delete dry-run exemption fails closed: a name with a value that no recognised site gave, or a value that holds a name that is not itself sure, is no sure dry-run flag.
+describe('#478 R2-B2 / R2-B3 / R2-F2: the dry-run exemption is refused for a value the line gives in a way it does not read', () => {
+  const SYNC = `${HOME}/proj/sync.sh`;
+  const withScript = { existsSync: (p) => p === SYNC, readText: (p) => (p === SYNC ? 'rsync -a --delete $N /tmp/x/ ~/\n' : null) };
+  decide('deny', [
+    ['a conditional local (R2-B3)', '[ -n "$DRY" ] && local N=-n; rsync -a --delete $N /tmp/x/ ~/'],
+    ['a local inside a function body is no sure site (R2-B3)', 'f() { local N=-n; rsync -a --delete $N /tmp/x/ ~/; }; f'],
+    ['a plain local outside a function (R2-B3)', 'local N=-n; rsync -a --delete $N /tmp/x/ ~/'],
+    ['integer (R2-B3)', '[ -n "$DRY" ] && integer N=-n; rsync -a --delete $N /tmp/x/ ~/'],
+    ['float (R2-B3)', '[ -n "$DRY" ] && float N=-n; rsync -a --delete $N /tmp/x/ ~/'],
+    ['a flag the dependency of a sure assignment may not set (R2-B2)', '[ -n "$DRY" ] && N=-n; OPTS="-a --delete $N"; rsync $OPTS /tmp/x/ ~/'],
+    ['a flag the dependency of a skipped assignment (R2-B2)', 'false && N=-n; OPTS=$N; rsync -a --delete $OPTS /tmp/x/ ~/'],
+  ]);
+  decide('allow', [
+    ['a plain assignment, once, before the line (existing #460)', "OPTS='-a --delete -n'; rsync $OPTS /tmp/x/ ~/"],
+    ['a literal -n (existing)', 'rsync -a --delete -n /tmp/x/ ~/'],
+    ['a sure dependency of a sure assignment', 'N=-n; OPTS="-a --delete $N"; rsync $OPTS /tmp/x/ ~/'],
+  ]);
+  decide('deny', [
+    ['a flag an outer line may have set, in the script it reaches (R2-F2)', '[ -n "$DRY" ] && export N=-n; bash sync.sh'],
+  ], withScript);
+});

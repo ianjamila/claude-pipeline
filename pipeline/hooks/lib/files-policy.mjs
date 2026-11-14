@@ -3290,17 +3290,25 @@ function rsyncFlags(argv, ctx, raw) {
 // A word that holds a substitution, a backtick or an expansion form other than `$NAME` / `${NAME}` is not read. A name the line never gives is no value the line made.
 const SURE_BINDERS = new Set(['export', 'declare', 'typeset', 'readonly']);
 function rsyncNamesSure(cmds, idx, ctx) {
-  const words = cmds[idx].argv.slice(1);
+  // the names a text refers to (null: a form that is not read: a substitution, a backtick, an expansion other than $NAME / ${NAME})
+  const refs = (w) => {
+    const out = [];
+    if (/`|\$\(|\$\{?[^A-Za-z_{]|\$\{[A-Za-z_]\w*[^\w}]|\$$/.test(w)) return null;
+    for (const m of w.matchAll(/\$\{?([A-Za-z_]\w*)/g)) out.push(m[1]);
+    return out;
+  };
   const names = new Set();
-  for (const w of words) {
+  for (const w of cmds[idx].argv.slice(1)) {
     if (!/[$`]/.test(w)) continue;
-    if (/`|\$\(|\$\{?[^A-Za-z_{]|\$\{[A-Za-z_]\w*[^\w}]|\$$/.test(w)) return false;
-    for (const m of w.matchAll(/\$\{?([A-Za-z_]\w*)/g)) names.add(m[1]);
+    const r = refs(w);
+    if (!r) return false;
+    for (const n of r) names.add(n);
   }
   if (!names.size) return true;
   if (cmds.truncated || cmds.ctlBroken || ctx.unknownAll === true) return false;
-  for (const k of names) {
-    if (SKIP_READING.has(k)) continue;
+  // is the name given its value once, by a command that surely runs before `limit`, whose value holds no name that is not itself sure before that command?
+  const nameSure = (k, limit, hops) => {
+    if (SKIP_READING.has(k)) return true;
     if (ctx.unknownVars?.has(k) || ctx.pickUnknown?.has(k) || ctx.srcChanged?.has(k) || ctx.srcTouched?.has(k) || ctx.arith?.names?.has(k)) return false;
     const sites = [];
     for (const [i, c] of cmds.entries()) {
@@ -3309,15 +3317,24 @@ function rsyncNamesSure(cmds, idx, ctx) {
       else if (SURE_BINDERS.has(nm) && declAttrs(c.argv).assigns.some(([n]) => n === k)) sites.push(i);
       else if (c.argv.length && !SURE_BINDERS.has(nm) && c.argv.slice(1).some((a) => new RegExp(`(?:^|[\\s,])${k}(?:\\[|=|$)`).test(a)) && ['read', 'printf', 'mapfile', 'readarray', 'getopts', 'for', 'select', 'let', 'unset', 'eval', 'source', '.', 'set'].includes(nm)) sites.push(i);
     }
-    if (!sites.length) continue;
+    // (#478 R2-B3 / R2-F2: no site here, but a value all the same (a `local` / `integer` / `float` the line gave, a name an outer line gave): not sure; only a name with no value at all is)
+    if (!sites.length) return !(Object.hasOwn(ctx.vars ?? {}, k) || Object.hasOwn(ctx.inheritedVars ?? {}, k));
     if (sites.length > 1) return false;
     const [site] = sites;
     const c = cmds[site];
-    const sure = site < idx && (c.argv.length === 0 || SURE_BINDERS.has(baseOf(c.argv[0]))) && c.depth === 0
+    const sure = site < limit && (c.argv.length === 0 || SURE_BINDERS.has(baseOf(c.argv[0]))) && c.depth === 0
       && c.sep !== '&&' && c.sep !== '||' && c.sep !== '|' && c.sep !== '&' && cmds[site + 1]?.sep !== '|' && cmds[site + 1]?.sep !== '&'
       && !mayNotRun(cmds, flowStart(cmds), site);
     if (!sure) return false;
-  }
+    // (#478 R2-B2: a value that holds a name is only as sure as that name was before this site: `[ -n "$DRY" ] && N=-n; OPTS="-a --delete $N"`)
+    const raw = Object.hasOwn(c.env ?? {}, k) ? c.env[k] : declAttrs(c.argv).assigns.find(([n]) => n === k)?.[1];
+    if (typeof raw !== 'string') return false;
+    if (!/[$`]/.test(raw)) return true;
+    const r = refs(raw);
+    if (!r || hops > 8) return false;
+    return r.every((n) => nameSure(n, site, hops + 1));
+  };
+  for (const k of names) if (!nameSure(k, idx, 0)) return false;
   return true;
 }
 
