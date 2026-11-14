@@ -3,6 +3,7 @@
 // so argv building, output validation, failure classification and finding ids are pure and unit-tested.
 import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
+import { CODEX_MODEL_MAX, CODEX_MODEL_RE, isCodexModelId } from './codex-model-id.mjs';
 
 export const FINDINGS_SCHEMA_PATH = fileURLToPath(new URL('../schemas/codex-findings.schema.json', import.meta.url));
 
@@ -13,7 +14,6 @@ export const CATEGORIES = [
 ];
 
 const EFFORTS = ['low', 'medium', 'high', 'xhigh'];
-const MODEL_RE = /^[A-Za-z0-9._-]+$/;
 const BODY_LIMIT = 2000;
 const RULING_LIMIT = 40;
 const SENSITIVE_LIMIT = 30;
@@ -39,7 +39,7 @@ const clip = (s, n) => (s.length > n ? `${s.slice(0, n - 1)}…` : s);
 // model and effort are spliced into TOML values (-c key="value"), so reject anything that could escape the quotes.
 export function buildCodexArgs({ cwd, model, effort, schemaPath, outPath }) {
   if (!EFFORTS.includes(effort)) throw new Error(`invalid effort ${JSON.stringify(effort)}: expected one of ${EFFORTS.join('|')}`);
-  if (typeof model !== 'string' || !MODEL_RE.test(model)) throw new Error(`invalid model ${JSON.stringify(model)}: expected ${MODEL_RE}`);
+  if (!isCodexModelId(model)) throw new Error(`invalid model ${JSON.stringify(model)}: expected ${CODEX_MODEL_RE}, at most ${CODEX_MODEL_MAX} characters`);
   for (const [name, value] of [['cwd', cwd], ['schemaPath', schemaPath], ['outPath', outPath]]) {
     if (!nonEmptyString(value)) throw new Error(`${name} is required`);
   }

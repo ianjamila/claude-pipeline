@@ -9,6 +9,7 @@ import { globToRegExp, matchAny } from './glob.mjs';
 import { isDocPath } from './doc-paths.mjs';
 import { isUniversalHardStopPath } from './hardstops.mjs';
 import { showFile } from './git.mjs';
+import { isCodexModelId } from './codex-model-id.mjs';
 
 // How many verify proofs a run record holds, and how long a proof step name may be. Defined here (config.mjs is vendored into
 // project repos; run-record.mjs is not) and imported by run-record.mjs, so a config this file accepts always fits the record.
@@ -708,6 +709,7 @@ export function validateConfig(obj) {
 
   const review = section(config, 'review', errors);
   if (review) {
+    if (!isCodexModelId(review.codex_model)) errors.push('review.codex_model must be a model id (letters, digits, . _ -), e.g. gpt-6-astra');
     if (!inRange(review.max_rounds, 1, 5)) errors.push('review.max_rounds must be an integer 1..5');
     checkPosInt(review.light_lane_max_lines, 'review.light_lane_max_lines', errors);
     checkStrArray(review.arbiter_always_paths, 'review.arbiter_always_paths', errors);

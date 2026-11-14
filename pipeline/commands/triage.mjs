@@ -574,7 +574,7 @@ async function secondReview(rest, ctx) {
   try {
     args = buildCodexArgs({ cwd: root, model, effort: SECOND_REVIEW_EFFORT, schemaPath: SECOND_REVIEW_SCHEMA_PATH, outPath });
   } catch (err) {
-    throw new UsageError(err.message);
+    throw new UsageError(`${err.message}; the model comes from review.codex_model of the pipeline.yml at ${config.default_branch}'s fork point: fix it on ${config.default_branch}, then bring that fix into this branch`);
   }
 
   // The attempt (route-2nd-<packetId8>.json, the lifecycle of route.json): pending before Codex runs, so evidence of an earlier attempt for this packet is gone; the final evidence

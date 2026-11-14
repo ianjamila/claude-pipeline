@@ -165,7 +165,12 @@ export const run = guarded(async (argv, ctx) => {
     });
   }
   // The model that will run is checked for shape too, before the plan and before any attempt starts (a malformed codex_model committed at the default branch must not leave a pending route.json) (R2-F2).
-  argsFor(path.join(dir, 'codex-raw.json'), model);
+  // (validateConfig refuses a malformed review.codex_model before this point; a malformed one at the fork point reads as an unreadable base, so this is defence in depth.)
+  try {
+    argsFor(path.join(dir, 'codex-raw.json'), model);
+  } catch (err) {
+    throw new UsageError(`${err.message}; the model comes from review.codex_model of the pipeline.yml at ${config.default_branch}'s fork point: fix it on ${config.default_branch}, then bring that fix into this branch`);
+  }
   const { baseOnly, resolutionOnly, resolutionView, resolution, resolutionIneligible } = adm;
   const prompt = roundPrompt(adm);
 
