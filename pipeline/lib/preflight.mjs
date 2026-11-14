@@ -174,6 +174,12 @@ export async function runPreflight({ cwd, env = process.env, gh = createGitHub({
   if (off) reasons.push('PIPELINE_OFF=1 is set: the pipeline is switched off');
   reasons.push(...issueReasons('pipeline-pause', pause), ...issueReasons('pipeline-rollback', rollback));
   if (config.ok && !enforcementOk) reasons.push(protectionReason(enforcement));
+  // #430: the pipeline supports only GitHub's default branch as its main (the gate, the guard and branch protection all read it); a pipeline.yml naming another one is reported here and
+  // refused at the merge gate, with the fix. A config that did not load (cfg null) or a default branch GitHub did not answer for says nothing.
+  const defaultBranchMismatch = cfg && typeof enforcement.branch === 'string' && cfg.default_branch !== enforcement.branch
+    ? `pipeline.yml names default_branch "${cfg.default_branch}" but GitHub's default branch is "${enforcement.branch}": the pipeline supports only GitHub's default branch as its main — set default_branch: ${enforcement.branch}, or make ${cfg.default_branch} the default branch on GitHub`
+    : null;
+  if (defaultBranchMismatch !== null) reasons.push(defaultBranchMismatch);
 
   return {
     ok: config.ok && authed,
@@ -186,7 +192,7 @@ export async function runPreflight({ cwd, env = process.env, gh = createGitHub({
     codex: codexState,
     clean,
     claudeCode,
-    canMerge: config.ok && authed && !off && !pause.open && !rollback.open && enforcementOk,
+    canMerge: config.ok && authed && !off && !pause.open && !rollback.open && enforcementOk && defaultBranchMismatch === null,
     reasons,
     warnings,
   };
