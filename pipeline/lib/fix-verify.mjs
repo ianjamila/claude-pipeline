@@ -63,11 +63,11 @@ export const countedOrdinal = (state, n) => (state?.rounds ?? []).filter((r) => 
 
 // review.post_max_suggestions for the items of round `round` (#374 PR B): lib/triage.mjs#applyPostMaxDefault with the policy of the working-tree AND the fork-point config ('review' in either, or a
 // config that cannot be read, is off) and the round's counted ordinal. Reads no config at all unless the round is past max + 1. Callers: `arbiter apply` and `triage validate` (the judge); nobody else.
-export async function postMaxApply(items, { state, round, root }) {
+export async function postMaxSettings({ state, round, root }) {
   const max = state?.maxRounds;
-  if (!Number.isInteger(max)) return items;
+  if (!Number.isInteger(max)) return { policy: 'review' };
   const ordinal = countedOrdinal(state, round.n);
-  if (ordinal <= max + 1) return items;
+  if (ordinal <= max + 1) return { policy: 'review' };
   let configs;
   try {
     const loaded = await loadConfig(root);
@@ -76,7 +76,10 @@ export async function postMaxApply(items, { state, round, root }) {
   } catch {
     configs = [null];
   }
-  return applyPostMaxDefault(items, { policy: postMaxPolicy(configs), ordinal, max });
+  return { policy: postMaxPolicy(configs), ordinal, max };
+}
+export async function postMaxApply(items, ctx) {
+  return applyPostMaxDefault(items, await postMaxSettings(ctx));
 }
 
 const NEW_EXPORT = /^\s*export\s+(async\s+)?(function|class|const|let)\b/;

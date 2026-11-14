@@ -247,3 +247,32 @@ test('round-request trip-wire: not tripped (the default settings, a falling or z
   assert.equal(r.json.processReview, undefined);
   assert.match(r.json.line, /^🔁 Extra review round needed #7: round 3/);
 });
+
+// ---- review.post_max_suggestions wired into `triage validate` (#374 PR B). maxRounds is edited to -1 so the first round counts as "past max + 1" without owner grants. ----
+
+function validateAtOrdinal(t, review) {
+  const w = roundWorld(t, { max: 3, review });
+  assertExit(w.codex(1, findingsOf([], [low({ title: 'Issue 1' })])), 0);
+  w.edit((s) => { s.maxRounds = -1; });
+  assertExit(w.judge(1, { 'R1-S1': ['ACCEPT'] }), 0);
+  return w;
+}
+
+test('triage validate: past the limit with post_max_suggestions follow-up in both configs, a low-severity judge ACCEPT becomes a FOLLOW-UP, state version 6, and review-complete eligibility waits for the issue', (t) => {
+  const w = validateAtOrdinal(t, '  post_max_suggestions: follow-up\n');
+  const item = w.item('R1-S1');
+  assert.deepEqual([item.final.decision, item.final.by, item.final.postMax.ordinal, item.final.postMax.max], ['FOLLOW-UP', 'judge', 1, -1]);
+  assert.equal(w.state().version, 6);
+});
+
+test('triage validate: the default policy (review) leaves the ACCEPT alone, and a working-tree-only follow-up does not turn it on (the fork-point config says review)', (t) => {
+  const off = validateAtOrdinal(t, '');
+  assert.equal(off.item('R1-S1').final.decision, 'ACCEPT');
+  assert.equal(off.state().version, 1);
+  const w = roundWorld(t, { max: 3 });
+  assertExit(w.codex(1, findingsOf([], [low({ title: 'Issue 1' })])), 0);
+  w.config({ review: '  post_max_suggestions: follow-up\n' });
+  w.edit((s) => { s.maxRounds = -1; });
+  assertExit(w.judge(1, { 'R1-S1': ['ACCEPT'] }), 0);
+  assert.equal(w.item('R1-S1').final.decision, 'ACCEPT');
+});
