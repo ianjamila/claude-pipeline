@@ -167,6 +167,13 @@ review:
   #                              # Like every new key, set it only after the installed pipeline and the vendored CI runner know it (`pipeline vendor --check`). Empty = off.
   # fix_verify_after_round: null  # null (off) | 1..10: counted review rounds past this one may use the narrow fix-verify brief even on sensitive / high-risk paths (never on a hard-stop hit
   #                              # other than an ignored P-path/R4-config, a size driver or a flagged fix). Honoured only when the fork-point config sets it too.
-  # fix_round_max_lines: 150     # non-test added lines a late-lane fix round may add (or one new non-test source file) before it falls back to the full brief
+  # fix_round_max_lines: 150     # non-test added lines a late-lane fix round may add (or one new non-test source file) before it falls back to the full brief;
+  #                              # `pipeline state fix-scope --round R` measures a fix round with the same limit before the push (and asks the owner when it is over)
+  # post_max_suggestions: review # review (off) | follow-up: past review.max_rounds (counted round > max + 1, so never an owner-granted round) a low-severity SUGGESTION / WORTH CONSIDERING
+  #                              # (performance, maintainability, testing, design, docs, other) the judge or arbiter ruled ACCEPT becomes a FOLLOW-UP: an issue is filed, the merge digest lists it, and Claude may
+  #                              # tighten it back to ACCEPT. Never a BLOCKING or security / bug item, never the owner's or Claude's own ruling. `review` in either the working-tree or the fork-point config keeps it off.
+  # trip_wire_extra_rounds: 3    # 1..10: counted rounds past review.max_rounds after which `triage round-request` asks for a PROCESS REVIEW (a prompt, not a gate) before another round line
+  # trip_wire_not_falling: 2     # 1..5: past-limit rounds whose new-ACCEPT count did not fall (and was above zero) that trip the same prompt. The smaller value of the two configs applies.
+                                # The trip-wire is ON by default in chat mode (review round-request); set trip_wire_extra_rounds: 10 and trip_wire_not_falling: 5 for the laxest setting.
 
 agent_log: docs/agent-log.md   # one line per run; kept on the orphan branch `pipeline-agent-log` (`pipeline agent-log publish`), never committed to a PR branch
