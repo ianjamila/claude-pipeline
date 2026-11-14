@@ -2656,16 +2656,21 @@ const RSYNC_VALUE_LONG = new Set(['rsh', 'rsync-path', 'max-delete', 'max-size',
   'usermap', 'groupmap', 'iconv', 'skip-compress', 'compress-level', 'compress-choice', 'zc', 'zl', 'checksum-choice', 'cc', 'checksum-seed', 'modify-window', 'write-batch', 'only-write-batch', 'read-batch',
   'protocol', 'info', 'debug', 'outbuf', 'stop-after', 'time-limit', 'stop-at', 'remote-option', 'copy-as', 'early-input', 'max-alloc']);
 const RSYNC_VALUE_SHORT = new Set(['e', 'f', 'B', 'T', 'M', '@']);
-// R2-B1 / #459: an UNQUOTED word that a same-line name changed is several words (its value split on blanks; an empty value is none), each read as an argument of its own: `FLAGS='-a --include n'; rsync $FLAGS SRC/ ~/`
+const SUBST_TEXT = /[`]|\$\(/;
+// R2-B1 / #459: bash splits an UNQUOTED word that a same-line name changed on blanks (an empty value is no word), and each piece is an argument of its own: `FLAGS='-a --include n'; rsync $FLAGS SRC/ ~/`
 // is not a cluster with an n in it, `A='-a /tmp/x/'` holds an operand, `X=; … $X` leaves no last word. A quoted word (cmd.quotedWords) stays one.
-function rsyncOperands(words, ctx, quoted) {
+// R3-F1: zsh (the shell of the Bash tool here) does not split an unquoted name, so the caller reads the words BOTH ways (split = true / false) and calls the line a dry run only when both readings agree. The text of a
+// backtick or $( ) substitution is never cut up (what it prints is only known at run time: no dry run). R3-B1: the shell splits on space, tab and newline only (no \s: U+00A0 is no blank to it).
+function rsyncOperands(words, ctx, quoted, split = true) {
   const items = []; // [as written (or the piece), as expanded]
   for (const w of words.slice(1)) {
     if (ctx.budget) checkDeadline(ctx.budget);
     if (!RUNTIME_PART.test(w)) { items.push([w, w]); continue; }
     const e = expandRefs(w, ctx);
     if (e === w || quoted?.has(w)) items.push([w, e]);
-    else for (const piece of e.split(/\s+/)) if (piece !== '') items.push([piece, piece]);
+    else if (!split) { if (e !== '') items.push([w, e]); } // (zsh keeps the value whole, and drops an empty unquoted one)
+    else if (SUBST_TEXT.test(e)) items.push([w, e]);
+    else for (const piece of e.split(/[ \t\n]+/)) if (piece !== '') items.push([piece, piece]);
   }
   const pos = [];
   const expanded = [];
@@ -2675,16 +2680,18 @@ function rsyncOperands(words, ctx, quoted) {
     const [w, e] = items[i];
     if (!rest && e === '--') { rest = true; continue; }
     if (!rest && e.length > 1 && e[0] === '-') {
+      const sub = SUBST_TEXT.test(e); // (an option word that holds a substitution is only known at run time: it is no dry run)
       if (e[1] === '-') {
         const eq = e.indexOf('=');
         const o = eq < 0 ? e.slice(2) : e.slice(2, eq);
-        if (o === 'dry-run' && eq < 0) dry = true;
+        if (o === 'dry-run' && eq < 0 && !sub) dry = true;
         else if (eq < 0 && RSYNC_VALUE_LONG.has(o)) i++; // (the next word is its value, an option-looking one included)
       } else {
         for (let j = 1; j < e.length; j++) { // (linear: a cluster is read once, up to its first value letter)
           const ch = e[j];
           if (RSYNC_VALUE_SHORT.has(ch)) { if (j === e.length - 1) i++; break; }
-          if (ch === 'n') dry = true;
+          if (!/[A-Za-z0-9@ \t\n-]/.test(ch)) break; // (a word held whole by zsh may hold the shell's blanks, `-a -n`; any other character, a U+00A0 included, is no option letter: no dry run in it)
+          if (ch === 'n' && !sub) dry = true;
         }
       }
       continue;
@@ -4858,27 +4865,22 @@ function evaluateBashForFilesFrame(command, opts) {
     const mergesContents = (c, name, hit) => {
       const words = wordsOf(c);
       // R1-B3 / R1-B2: rsync reads its own options (rsyncOperands: a value is no operand and no dry-run flag, `-t` is no target directory)
-      let dests;
-      let sources;
-      if (name === 'rsync') {
-        const r = rsyncOperands(words, ctx, c.quotedWords);
-        if (r.dry) return false;
-        if (r.pos.length < 2) return false;
-        dests = [r.pos[r.pos.length - 1]];
-        sources = r.expanded.slice(0, -1);
-      } else {
-        const r = splitOperands(words, name);
-        dests = r.dests;
-        sources = r.sources.map((s) => (RUNTIME_PART.test(s) ? expandRefs(s, ctx) : s)); // (R1-B4: the source as the shell will pass it)
-      }
-      if (!dests.some(hit)) return false;
-      return sources.some((src) => {
+      const contents = (dests, sources) => dests.some(hit) && sources.some((src) => {
         const s = toPosix(src);
         if (s.endsWith('/') && (name === 'rsync' || ctx.platform === 'darwin')) return true;
         // R1-B4: a source only known at run time may be a folder with a trailing slash (an rsync call only: `cp "$f" ~/` is an everyday copy of one file)
         if (name === 'rsync' && RUN_TIME.test(s) && (/[`]|\$\(/.test(s) || RUN_TIME.test(s.slice(s.lastIndexOf('/') + 1)))) return true;
         const b = posix.basename(trimSlashes(s));
         return b === '.' || /^\.[^/]*[*?[]/.test(b);
+      });
+      if (name !== 'rsync') {
+        const r = splitOperands(words, name);
+        return contents(r.dests, r.sources.map((s) => (RUNTIME_PART.test(s) ? expandRefs(s, ctx) : s))); // (R1-B4: the source as the shell will pass it)
+      }
+      // R3-F1: bash and zsh read a changed unquoted word differently; each reading that is no dry run is judged, and either one finding a contents merge counts
+      return [true, false].some((split) => {
+        const r = rsyncOperands(words, ctx, c.quotedWords, split);
+        return !r.dry && r.pos.length >= 2 && contents([r.pos[r.pos.length - 1]], r.expanded.slice(0, -1));
       });
     };
     const homeWriter = cmds.find((c) => {

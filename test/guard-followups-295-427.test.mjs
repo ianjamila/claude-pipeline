@@ -216,6 +216,14 @@ describe('#300: a contents merge into the home directory (or a parent of it) is 
     ['#459: two sources in one name', "S='/tmp/x/ /tmp/y'; rsync -a $S ~/"],
     ['#459: an empty last word is dropped, not the destination', "X=; rsync -a /tmp/x/ ~/ $X"],
   ]);
+  // R3-F1 / R3-B1: zsh does not split an unquoted name, bash does: both readings are judged, and the line is a dry run only when both say so
+  decide('deny', [
+    ['R3-F1: zsh reads --exclude=… --dry-run as one exclude pattern', "OPTS='--exclude=node_modules --dry-run'; rsync -a $OPTS /tmp/x/ ~/"],
+    ['R3-F1: the same with -n', "OPTS='--exclude=node_modules -n'; rsync -a $OPTS /tmp/x/ ~/"],
+    ['R3-F1: a backtick substitution is no place for a dry-run piece', "SRC=/tmp/backups; rsync -a $SRC/`ls -t $SRC | head -n 1`/ ~/"],
+    ['R3-B1: a no-break space is no blank to the shell (-a NBSP -n is not a dry run)', "OPTS='-a\u00a0-n'; rsync $OPTS /tmp/x/ ~/"],
+    ['R3-B1: an exclude value that holds a no-break space then -n', "FLAGS='--exclude=foo\u00a0-n'; rsync -a $FLAGS /tmp/x/ ~/"],
+  ]);
   decide('allow', [
     ['R2-B1: a flags name, a folder by name', "OPTS='-a --info=progress2'; rsync $OPTS /tmp/x ~/"],
     ['R2-B1: a flags name that is a real dry run', "OPTS='-an'; rsync $OPTS /tmp/x/ ~/"],
