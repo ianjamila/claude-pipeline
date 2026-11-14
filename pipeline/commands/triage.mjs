@@ -28,7 +28,7 @@ import {
   isProtectedFinal, markLightLane, reviewedRoundCount, roundAdmission, roundOutcome, rulingContentDigest, secondReviewRefusal, settleSecondReview, substituteAgentFor, validateSecondReview, validateTriage,
 } from '../lib/triage.mjs';
 import {
-  currentContentHash, ensureRoundDir, findItem, findRound, readFileOrFail, refreshBaseRef, requireState, reviewBaseRef, roundDir, sha256, withRouteLock, withStateLock, writeFileAtomic, writeJson,
+  currentContentHash, ensureRoundDir, findItem, findRound, readFileOrFail, refreshBaseRef, refreshTrustedDefault, requireState, reviewBaseRef, roundDir, sha256, withRouteLock, withStateLock, writeFileAtomic, writeJson,
 } from '../lib/review-context.mjs';
 import { assertCurrentAttempt, finishAttempt, readRoute, startAttempt, substituteEligibility, superseded, writeFinalRoute } from '../lib/route-record.mjs';
 import { headMoved, routeConfigFor } from '../lib/review-round.mjs';
@@ -529,6 +529,7 @@ async function secondReview(rest, ctx) {
     return refuse('a second review is run only with owner_approval: chat in pipeline.yml; in label mode the owner clears needs-human by label');
   }
   const o = { cwd: root };
+  refreshTrustedDefault(root, config); // the trusted model is read at the fork point from origin/<the remote's default branch>: best effort, a failed fetch keeps the cached ref
   const sub = routeConfigFor(root, config); // the stricter of the working tree's and the trusted base config's review.substitute
   const model = sub.codexModel; // the trusted model (the base config's, else the built-in default), never the working tree's (#389)
 
@@ -695,6 +696,7 @@ async function secondReviewApply(values, ctx) {
   const n = Number(m[1]);
   const id8 = m[2];
   if (config.owner_approval !== 'chat') throw fail(EXIT.FAILED, 'label-mode', 'a second review is run only with owner_approval: chat in pipeline.yml');
+  refreshTrustedDefault(root, config);
   const gates = routeConfigFor(root, config);
   if (gates.mode === 'off') throw fail(EXIT.FAILED, 'mode-off', `review.substitute.mode is off: no substitute reviewer (${gates.modeOffFrom})`, { modeOffFrom: gates.modeOffFrom });
   const env = ctx.env ?? process.env;

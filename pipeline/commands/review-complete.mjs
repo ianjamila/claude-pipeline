@@ -25,14 +25,14 @@ import { verifyOwnerGrants } from '../lib/owner-grants.mjs';
 import { docsExemptFrom } from '../lib/docs-exempt.mjs';
 import { REVIEW_COMPLETE_MARKER } from '../lib/review-marker.mjs';
 import { closingKeywordProblem, multiIssueClosingLines } from '../lib/closing-keywords.mjs';
-import { currentContentHash, refreshBaseRef, reviewBaseRef, withReviewLock } from '../lib/review-context.mjs';
+import { currentContentHash, refreshBaseRef, refreshTrustedDefault, reviewBaseRef, withReviewLock } from '../lib/review-context.mjs';
 import { publishTriage, readPublished, reviewContentHash } from '../lib/review-publish.mjs';
 
 export const meta = {
   summary: 'post the review-complete comment (and remove awaiting-review) once the review is valid for the current content',
   usage: [
     'pipeline review-complete --pr N [--repo DIR]   -> exit 0 {ok:true, posted|reused, comment:{id, url}, review, removed, recheck, recheckError?, warnings?}; exit 1 {ok:false, reason} when the review is not valid',
-    '  origin/<default_branch> is fetched first (best effort: offline keeps the cached ref, and a coverage refusal then says it could not be refreshed), so a PR updated',
+    '  origin/<default_branch> (and the remote\'s own default branch when that is another one: the trusted fork point of the model and lanes) is fetched first (best effort: offline keeps the cached ref, and a coverage refusal then says it could not be refreshed), so a PR updated',
     '  from its base branch and pulled is judged against the main that was merged in',
     '  after the validity checks it also refuses (exit 1) while a Claude-ruled follow-up has no issue or a fix made outside the file the finding names is not yet',
     '  confirmed by a later round, and (exit 1 {error:closing-keywords}) a PR body that lists several issues after one closing keyword ("Closes #1, #2" closes only #1),',
@@ -241,6 +241,7 @@ export const run = guarded(async (argv, ctx) => {
       // The hash is measured from origin/<default_branch>; after `update-branch` + `git pull --ff-only` that ref is older than the main that
       // was merged in, so refresh it first (best effort: offline keeps the cached ref and the round's own hash is what it is compared to).
       const refresh = refreshBaseRef(root, config);
+      refreshTrustedDefault(root, config, { except: config.default_branch }); // the trusted fork point (model, lanes) is measured from the remote's default branch, which can be another one
       const hash = currentContentHash(root, config);
       // The review is valid for the content as it is, or (review.docs_exempt_paths) the content is the reviewed one plus lines added to
       // listed documents. The same helper decides it in the final gate; everything below (grants, Fable, the lane) runs either way.
