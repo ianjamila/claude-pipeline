@@ -1666,8 +1666,9 @@ const POSITIONALS = /\$\{?@|\[@\]/;
 const mayVanish = (a, ctx, fromFile, unq, quoted, quotedPat) => {
   const e = fromFile ? a : expandRefs(a, ctx);
   if (!(e === '' || /[$`*?[(^<]/.test(e))) return false;
-  // (#425 R1-F3: a quoted word with a glob in it may still expand to nothing under nullglob: the raw-text test below, as before #380)
-  if (quoted && !quotedPat?.has(a)) return !quoted.has(a) || POSITIONALS.test(a);
+  // (#425 R1-F3 / R2-B1: a quoted word with an unquoted glob in it (`"$dir"/*.sh`, `""*`) may still expand to nothing under nullglob, whatever its quoted part says: the parser's mark settles it)
+  if (quoted && quotedPat?.has(a)) return true;
+  if (quoted) return !quoted.has(a) || POSITIONALS.test(a);
   return unq === null || unq.includes(a);
 };
 const unquotedText = (raw) => (typeof raw === 'string' ? raw.replace(/"(?:[^"\\]|\\[\s\S])*"|'[^']*'/g, ' ') : null);

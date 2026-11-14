@@ -157,7 +157,11 @@ describe('#380 / #383: which argument words may vanish at run time (AUTO_CD: a l
     ['a quoted word that is also the stem of an unquoted redirect target', '"$BIN" "$f" > $f.log; find . -delete', at],
     ['a quoted scalar is an empty word, not a vanished one', '$D "$X"; find . -delete', at],
     ['a partly quoted word never vanishes', '$D "a"$X; find . -delete', at],
-    ['#425 R1-F3: the everyday quoted-dir glob stays allowed (R1-F3 must not deny it)', '$RUNNER "$dir"/*.sh; find . -delete', at],
+    ['#425 R2-B1: the everyday quoted-dir glob alone stays allowed', '$RUNNER "$dir"/*.sh', runner],
+    ['#425 R2-B1: the everyday quoted-dir glob then a command that writes nothing relative', '$RUNNER "$dir"/*.sh && echo ok', runner],
+    ['#425 R2-B1: the quoted-dir glob with an unset runner, alone and then an echo', '$RUNNER "$dir"/*.sh && echo ok', at],
+    ['#425 R2-B1: the quoted-dir glob alone with an unset runner', '$RUNNER "$dir"/*.sh', at],
+    ['#425 R2-F1: an empty quote glued to a variable is a kept (empty) word', '$D ""$X; rm -f settings.json', runner],
   ]);
   decide('deny', [
     ['the same variable unquoted can vanish', '$D $P; find . -delete', at],
@@ -167,6 +171,10 @@ describe('#380 / #383: which argument words may vanish at run time (AUTO_CD: a l
     ['a quoted "${arr[@]}" vanishes with an empty array', '"$RUNNER" "${arr[@]}"; rm -f settings.json', runner],
     ['an unquoted $@', '$RUNNER $@; rm -f settings.json', runner],
     ['#425 R1-F3: an empty quote then a glob (nullglob: no match, no word)', '$D ""*.nomatch; rm -f settings.json', runner],
+    ['#425 R2-B1: a quoted dir then a glob may vanish (nullglob), a relative write follows', '$RUNNER "$dir"/*.sh; rm -f settings.json', runner],
+    ['#425 R2-B1: the quoted-dir glob, then a relative destructive write from a cwd that reaches a protected folder (r19 / #383 precedent)', '$RUNNER "$dir"/*.sh; find . -delete', at],
+    ['#425 R2-B1: a quoted word then a glob (nullglob)', '$D "x"*; rm -f settings.json', runner],
+    ['#425 R2-F1: an empty quote glued to a zsh numeric range (nullglob)', '$D ""<->; rm -f settings.json', runner],
   ]);
 });
 
