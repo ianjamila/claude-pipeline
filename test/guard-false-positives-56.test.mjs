@@ -81,12 +81,12 @@ test('#56 repro 5/6 and the chained shapes: one assignment that may not run is j
   for (const cmd of [
     'cd $W && S=abc; node /tmp/a.mjs $S', // (repro 5)
     'for f in a b; do F=/tmp/$f; node a.mjs $F; done', // (repro 6)
-    'cd sub && F=src/a.ts; sed -n 1,9p $F',
+    'cd ./sub && F=src/a.ts; sed -n 1,9p $F',
     'true && P=src/a.ts && node -e "console.log(1)" $P',
     'if true; then S=src; fi; node a.mjs $S/a.ts',
     'cd d && SK=src; bash $SK/../ok.sh',
     'true || X=a; bash $X',
-    'cd src && T=a.ts; cp $T /tmp/a.bak && sed -i.bak s/a/b/ $T',
+    'cd ./src && T=a.ts; cp $T /tmp/a.bak && sed -i.bak s/a/b/ $T',
   ]) allowBoth(cmd, SPEC);
 });
 
@@ -96,7 +96,7 @@ test('#56: the same shapes with a value that names a bad script stay refused (th
     'true && X=run.sh; bash $X',
     'true || X=run.sh; bash $X',
     'if true; then S=run; fi; bash $S.sh',
-    'cd sub && SK=..; bash $SK/run.sh',
+    'cd ./sub && SK=..; bash $SK/run.sh',
     'while true; do X=run.sh; done; bash $X',
   ]) denyBoth(cmd, SPEC);
   // git / gh read the value too: the reading where it did not run leaves an unknown push argument

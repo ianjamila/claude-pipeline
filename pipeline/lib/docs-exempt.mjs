@@ -25,6 +25,7 @@
 //    word in it that is not fixed was already reviewed as a file name. A row with a note, or any other line, needs a round.
 import { posix } from 'node:path';
 import { DEFAULTS, docsExemptProblem } from './config.mjs';
+import { hashBranch } from './risk.mjs';
 import { isAgentInstructionPath } from './doc-paths.mjs';
 import { contentHash, diffFiles, diffModes, git, isAncestor, mergeBase, revParse, reviewBaseRef, showFile } from './git.mjs';
 import { reviewValidFor } from './triage.mjs';
@@ -328,15 +329,16 @@ function fileProblem(f, mode) {
  * -> { exempt: true, files: [paths], reviewedHead } | { exempt: false, files: [], reason, off? } (off: the feature is not configured, so the caller
  * should not mention it).
  */
-export function docsExemptFrom(state, { root, config, hash }) {
+// `branch` (optional): the trusted default branch the merge-base check measures from (risk.mjs#hashBranch); the merge gate passes the one it resolved.
+export function docsExemptFrom(state, { root, config, hash, branch }) {
   try {
-    return decide(state, { root, config, hash });
+    return decide(state, { root, config, hash, branch });
   } catch (err) {
     return { exempt: false, files: [], reason: `the docs-only exemption could not be checked: ${oneLine(err)}` };
   }
 }
 
-function decide(state, { root, config, hash }) {
+function decide(state, { root, config, hash, branch: given }) {
   const no = (reason, extra = {}) => ({ exempt: false, files: [], reason, ...extra });
   const o = { cwd: root };
   const last = state?.rounds?.at(-1);
@@ -377,7 +379,7 @@ function decide(state, { root, config, hash }) {
     return no('the last review round is not clean (an item is unresolved, a Fable pass is owed, or accepted fixes still need a round)');
   }
 
-  const branch = config?.default_branch ?? DEFAULTS.default_branch;
+  const branch = given ?? hashBranch(root, config); // the trusted default branch, never the working-tree value a PR can edit (a partial or null config is tolerated)
   const base = reviewBaseRef(branch, o);
   const agentLog = config?.agent_log ?? DEFAULTS.agent_log;
   const exclude = typeof agentLog === 'string' && agentLog !== '' ? [agentLog] : [];

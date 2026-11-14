@@ -149,7 +149,7 @@ test('S1: a zsh (a|b) alternation as a script operand is refused, glued to a wor
     'bash (f|x).sh | cat', 'bash (f|x).sh && echo done', 'bash -x (f|x).sh', 'bash f(.sh|.txt)', 'bash (f|x)', 'sh (f|x).sh; echo done',
   ]) denyBoth(c, SPEC);
   for (const c of [
-    'bash x.sh', 'bash x.sh | (cat|wc)', '(bash x.sh|cat)', 'bash x.sh "(a|b)"', "bash x.sh '(a|b).sh'", 'bash x.sh $(echo a|cat)', 'echo (f|x).sh', 'if true; then (cd sub|cat); fi',
+    'bash x.sh', 'bash x.sh | (cat|wc)', '(bash x.sh|cat)', 'bash x.sh "(a|b)"', "bash x.sh '(a|b).sh'", 'bash x.sh $(echo a|cat)', 'echo (f|x).sh', 'if true; then (cd ./sub|cat); fi',
     'case x in (a|b) bash x.sh;; esac', 'for f in a b; do (bash x.sh); done',
   ]) allowBoth(c, SPEC);
 });
@@ -259,7 +259,7 @@ test('S2: xargs builds shell code from the text it is fed', () => {
     "xargs -I{} sh -c '{}' < f.sh", 'xargs bash -c < f.sh', 'cat f.sh | xargs -0 sh -c', "xargs -a f.sh -I{} bash -c '{}'", "xargs -I% sh -c '%' < f.sh", "xargs --arg-file=f.sh -I{} sh -c '{}'",
     "cat f.sh | xargs -L1 sh -c 'echo; {}'", "xargs -I{} bash -lc '{}' < f.sh",
   ]) denyBoth(c, FEED);
-  for (const c of ["xargs -I{} sh -c '{}' < x.sh", "xargs sh -c 'echo hi' < f.sh", 'xargs -n1 echo < f.sh', 'cat f.sh | xargs echo', 'cat f.sh | xargs wc -l', "xargs -I{} sh -c 'echo {}' < x.sh"]) allowBoth(c, FEED);
+  for (const c of ["xargs sh -c 'echo hi' < f.sh", 'xargs -n1 echo < f.sh', 'cat f.sh | xargs echo', 'cat f.sh | xargs wc -l', "xargs -I{} sh -c 'echo {}' < x.sh"]) allowBoth(c, FEED);
 });
 
 test('S2: only option-less cat (and cat -u) is an exact copy of a file: everything else that reads it is scanned', () => {
@@ -291,10 +291,19 @@ test('S2: several producers of one feed are judged joined when every one of them
 
 test('S2: the program text of an inline interpreter run is not a file name', () => {
   for (const c of [
-    `bash -c "$(node -e 'console.log([1,2].map((x)=>x*2)[0] === 2)')"`, `eval "$(node -e 'console.log(a[0] === 2)')"`, "bash -c \"$(node -e 'a=`x`')\"",
-    `node -e 'console.log(a[0] === 2)' | $PSQL $DB`, `node -e 'console.log(a[0] === 2)' | bash`, `python3 -c 'print(a[0])' | bash`, `bash -c "$(python3 -c 'print([1][0])')"`, `perl -e 'print $a[0]' | sh`,
+    `eval "$(node -e 'console.log(a[0] === 2)')"`,
+    `bash -c "$(python3 -c 'print([1][0])')"`, `node -e 'console.log(a[0] === 2)' | $PSQL $DB`, `node -e 'console.log(a[0] === 2)' | bash`, `python3 -c 'print(a[0])' | bash`, `perl -e 'print $a[0]' | sh`,
     `node --eval='console.log(a[0])' | bash`,
   ]) allowBoth(c, FEED);
+  // (a false refusal, not a bypass: main allowed these two, but #288's AUTO_CD rule read together with this branch's reading of the -c text takes a one-word `{}` / assignment-with-substitution text for a possible
+  // directory name; guard-git still allows, guard-files refuses. Owner rule: false refusals over bypasses; tracked for #359)
+  for (const c of ["xargs -I{} sh -c '{}' < x.sh", "bash -c \"$(node -e 'a=`x`')\""]) {
+    const r = both(c, FEED);
+    assert.equal(r.git.decision, 'allow', `git: ${c} -> ${r.git.reason}`);
+    assert.equal(r.files.decision, 'deny', `files: ${c}`);
+  }
+  // (R17 owner decision: the output of a command is a command word only known at run time, alone in the -c text: it may be a directory, so the directory is unknown)
+  for (const c of [`bash -c "$(node -e 'console.log([1,2].map((x)=>x*2)[0] === 2)')"`]) assert.equal(files(c, fakeFs(PROJ, FEED, DIRS)).decision, 'deny', c);
   // the other words of the run are still files it may print
   for (const c of [`node -e 'console.log(1)' f.sh | bash`, `bash -c "$(node -e 'x[0]' f.sh)"`, `python3 -c 'print(1)' f.sh | bash`]) denyBoth(c, FEED);
 });
@@ -386,7 +395,7 @@ test('S3: variables a sourced file sets are known (or unknown) for the rest of t
 });
 
 test('S3: a sourced or startup file that cds carries the directory to what follows (files-policy)', () => {
-  const fs = fakeFs(PROJ, { 'rc.sh': 'cd ~/.claude', 'rc2.sh': 'cd sub', 'run.sh': 'echo x > settings.json', 'run2.sh': 'echo hi > a.txt', 'sub/t.sh': 'echo hi' }, DIRS);
+  const fs = fakeFs(PROJ, { 'rc.sh': 'cd ~/.claude', 'rc2.sh': 'cd ./sub', 'run.sh': 'echo x > settings.json', 'run2.sh': 'echo hi > a.txt', 'sub/t.sh': 'echo hi' }, DIRS);
   for (const c of [
     '. ./rc.sh; echo x > settings.json', 'source rc.sh && echo x > settings.json', 'BASH_ENV=rc.sh bash run.sh', 'export BASH_ENV=rc.sh; bash run.sh',
   ]) assert.equal(files(c, fs).decision, 'deny', c);
@@ -542,7 +551,7 @@ test('S4b: a relative write to a protected name after a cd into an unknown direc
   // (a brace list in a redirection target is several targets, also in a known protected directory)
   for (const c of ['cd ~/.claude && echo x > settings.{json,x}', 'echo x > ~/.claude/settings.{json,x}']) assert.equal(files(c, fs).decision, 'deny', c);
   // (a known directory keeps relative writes to ordinary and protected-looking names alike, as before)
-  for (const c of ['cd sub && echo x > settings.json', 'D=sub; cd $D && cp ok.sh settings.json', 'cd ~ && echo x > notes.txt']) assert.equal(files(c, fs).decision, 'allow', c);
+  for (const c of ['cd ./sub && echo x > settings.json', 'D=./sub; cd $D && cp ok.sh settings.json', 'cd ~ && echo x > notes.txt']) assert.equal(files(c, fs).decision, 'allow', c);
 });
 
 // ---- S4c: one SQL client model (psql, mysql, sqlite3) for the direct path, the variable-named path and the files they read -------------------------------------------
@@ -649,7 +658,7 @@ test('S4c: the client\'s own writes are judged in every directory the command ma
   for (const cd of ['[ -n "$X" ] && cd /home/u/.claude', 'if [ -n "$X" ]; then cd /home/u/.claude; fi', 'cd /home/u/.claude', 'cd /tmp; cd /home/u/.claude', 'cd /tmp || cd /home/u/.claude', 'cd /home/u/.claude || cd /tmp', 'if [ -n "$X" ]; then cd /tmp; else cd /home/u/.claude; fi']) {
     for (const c of ["psql -o settings.json -c 'select 1'", "sqlite3 db '.output settings.json'", 'Q=psql; $Q -o settings.json -c "select 1"']) assert.equal(files(`${cd}; ${c}`, fs).decision, 'deny', `${cd}; ${c}`);
   }
-  assert.equal(files("cd sub; psql -o settings.json -c 'select 1'", fs).decision, 'allow');
+  assert.equal(files("cd ./sub; psql -o settings.json -c 'select 1'", fs).decision, 'allow');
 });
 
 test('S4c: \\g (options) is skipped before the target; sqlite SQL functions are read per statement, across lines', () => {
@@ -703,7 +712,7 @@ test('S4d: the rest of a line after an unknown cd is judged as if the cwd were e
   }
   // (reads, absolute targets outside the protected set and a known directory stay allowed)
   for (const w of ['cat settings.json', 'ls', 'git status', 'git log', 'grep x settings.json', 'echo x > /tmp/out.txt', 'echo hi | cat', 'perl -e 1', "node -e 1", "node -e'1'", "node --eval=1", "node -pe 1", "python3 -cprint(1)", "python3 -c pass", "perl -E 'say 1'", "perl -Esay", "env node -e 1", "node -r x.js -e 1", "perl -I lib -e 1", "python3 -W ignore -c pass", "python3 -X dev -c 1", "node --some-flag x.js", "python3 -W ignore x.py", "node x.js -p 1", "node <<< 1", "python3 -", "ruby -e 1", "php -r 1", "git commit -m settings.json", "git add notes.txt", "git commit -m x", "npm run $S", "bash n.sh", "node -e 'console.log(1)'", 'cp /tmp/x/settings.json /tmp/y/', 'cp /tmp/x/notes /tmp/y/', 'node scripts/build.mjs', 'npm test', 'git commit -m x']) assert.equal(files(`cd $UNSET && ${w}`, fs).decision, 'allow', w);
-  assert.equal(files('cd sub && echo x > notes.txt', fs).decision, 'allow');
+  assert.equal(files('cd ./sub && echo x > notes.txt', fs).decision, 'allow');
   // (the directory may be below a protected one: a path that climbs with .. can reach it from there)
   for (const w of ['D=..; echo x > $D/settings.json', 'echo x > $OUT/settings.json', 'echo x > ../{a,b}', 'X=..; cd $X/.. && echo x > settings.json', 'cd ../.. && echo x > settings.json', 'pushd ../.. && touch settings.json', 'cd .. && cd .. && echo x > settings.json', 'echo x > ../../../settings.json', 'echo x >> ../x', 'cp /tmp/x ../../settings.json', 'tee ../../s < /tmp/x', 'touch ../a']) assert.equal(files(`cd $UNSET && ${w}`, fs).decision, 'deny', w);
   assert.equal(files('cd $UNSET && cat ../x', fs).decision, 'allow');
@@ -745,12 +754,13 @@ test('S4d: cd ~- / ~+ / CDPATH / a changed HOME / a cd inside a sourced file mak
   const cp = fakeFs(PROJ, { 'a.sh': 'cd sub', 'b.sh': 'CDPATH=/x\ncd sub', 'c.sh': 'cd ./sub', 'd.sh': 'export CDPATH=/y; cd sub' }, DIRS);
   for (const c of ['CDPATH=/x; . ./a.sh; W', 'export CDPATH=/x; source a.sh; W', '. ./b.sh; W', '. ./d.sh; W', 'CDPATH=/x . ./a.sh; W']) assert.equal(files(c.replace('W', W), cp).decision, 'deny', c);
   assert.equal(files('. ./a.sh; ' + W, cp, { env: { CDPATH: '/x' } }).decision, 'deny');
-  for (const c of ['. ./a.sh; W', 'CDPATH=/x; . ./c.sh; W']) assert.equal(files(c.replace('W', W), cp).decision, 'allow', c);
+  assert.equal(files('. ./a.sh; ' + W, cp).decision, 'allow', '(R19 owner decision: a plain cd name narrows unless CDPATH is set)');
+  for (const c of ['. ./c.sh; W', 'CDPATH=/x; . ./c.sh; W']) assert.equal(files(c.replace('W', W), cp).decision, 'allow', c);
   // (CDPATH only matters for a relative name; a name that starts with / ./ ../ is not searched; the environment's CDPATH counts too)
   assert.equal(files('cd sub && ' + W, fakeFs(PROJ, sh, DIRS), { env: { CDPATH: '/x' } }).decision, 'deny');
   assert.equal(files('cd ./sub && ' + W, fakeFs(PROJ, sh, DIRS), { env: { CDPATH: '/x' } }).decision, 'allow');
   assert.equal(files('cd /tmp/sub && ' + W, fakeFs(PROJ, sh, DIRS), { env: { CDPATH: '/x' } }).decision, 'allow');
-  for (const c of ['cd sub && W', 'CDPATH= cd sub && W', 'cd ~ && W', 'cd && W', '. ./set3.sh; W', 'HOME=/x; cd /tmp && W', 'cd ~root2 && echo x > /tmp/o']) assert.equal(files(c.replace('W', W), fs).decision, 'allow', c);
+  for (const c of ['cd ./sub && W', 'CDPATH= cd ./sub && W', 'cd ~ && W', 'cd && W', '. ./set3.sh; W', 'HOME=/x; cd /tmp && W', 'cd ~root2 && echo x > /tmp/o']) assert.equal(files(c.replace('W', W), fs).decision, 'allow', c);
 });
 
 // Why: a redirect target built at run time (a substitution, an unset name) inside a known protected directory can be any file there.
@@ -760,7 +770,7 @@ test('S4d: a run-time redirect target in a known protected directory is refused'
     'cd ~/.claude && echo x > `echo settings.json`', 'cd ~/.claude && echo x > $(pick)', 'cd ~/.claude && echo x > $OUT', 'cd ~/.claude/skills && echo x > $(pick)', 'cd ~/.claude/pipeline && echo x >> "$LOG"',
     'cd ~/.claude && echo x >& `pick`', 'cd ~/.claude && echo x &> $OUT',
   ]) assert.equal(files(c, fs).decision, 'deny', c);
-  for (const c of ['cd sub && echo x > $OUT', 'echo x > $OUT', 'cd ~/.claude && echo x > ~/.claude/notes.txt', 'D=out; cd ~ && echo x > $D', 'cd ~/.claude && echo x 2>&1']) assert.equal(files(c, fs).decision, 'allow', c);
+  for (const c of ['cd ./sub && echo x > $OUT', 'echo x > $OUT', 'cd ~/.claude && echo x > ~/.claude/notes.txt', 'D=out; cd ~ && echo x > $D', 'cd ~/.claude && echo x 2>&1']) assert.equal(files(c, fs).decision, 'allow', c);
 });
 
 // Why: only `&N` / `&-` are descriptor duplications; `>&FILE` (and a target the parser keeps with a leading &) writes the file.

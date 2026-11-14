@@ -12,14 +12,16 @@ import { loadConfig } from '../lib/config.mjs';
 import { summarySections } from '../lib/render.mjs';
 import { recordForOutcome } from '../lib/run-record.mjs';
 import { costReport, guardLogFile, readGuardLog } from '../lib/run-cost.mjs';
-import { readSummaryComment, writeSummaryComment } from '../lib/summary-comment.mjs';
+import { writeRunRecord } from '../lib/run-progress.mjs';
+import { readSummaryComment } from '../lib/summary-comment.mjs';
 import { DEFAULT_OUTCOME, buildAgentLogLine } from '../lib/agentlog.mjs';
+import { codexUsage, codexUsageSuffix } from '../lib/codex-usage.mjs';
 import { inlineOptionValues } from '../lib/cmd-io.mjs';
 import { readModelProofs } from '../lib/review-context.mjs';
 
 export const meta = {
   summary: 'upsert the PR summary comment and print the agent-log line',
-  usage: 'pipeline summary --pr N --outcome O [--built TEXT] [--session ID]... [--repo DIR]   -> {ok, url, agentLogLine, pendingLogLine?, cost}   (pendingLogLine: only for --outcome merged, the same line with outcome "merged — prod smoke pending")',
+  usage: 'pipeline summary --pr N --outcome O [--built TEXT] [--session ID]... [--repo DIR]   -> {ok, url, agentLogLine, pendingLogLine?, cost, codexUsage}   (pendingLogLine: only for --outcome merged, the same line with outcome "merged — prod smoke pending"; both lines end with " · Codex 7d: N runs (H high[, X xhigh])" when the pipeline ran Codex in the last 7 days, any repo: codexUsage {runs, high, xhigh, failed}, from <home>/.claude/pipeline-state/codex-usage.jsonl)',
 };
 
 // These stops never reach a review round (verify red three times, Codex out in round 1) or happen after the run's state
@@ -100,7 +102,10 @@ export const run = guarded(async (argv, ctx) => {
     const view = gh.prView(pr, ['title', 'headRefName', 'baseRefName', 'headRefOid']);
     const { title } = view;
     const sections = summarySections(state, { outcome: detail ? `${outcome} — ${detail}` : outcome, built: values.built, followups: followupsOf(state), modelProofs: readModelProofs(root, state) });
-    const agentLogLine = buildAgentLogLine({ state, pr, title, outcome });
+    // The weekly Codex spend rides at the end of the line (agent-log close's pending-line match tolerates it).
+    const usage = codexUsage({ env: ctx.env, ...(ctx.home ? { home: ctx.home } : {}) });
+    const usageText = codexUsageSuffix(usage);
+    const agentLogLine = buildAgentLogLine({ state, pr, title, outcome }) + usageText;
     // The run record rides in the same comment: keep the one a checkpoint wrote, set how the run ended.
     const existing = readSummaryComment(gh, pr);
     if (existing.status === 'unsupported') throw new UsageError('the summary comment carries a run record from a newer pipeline version: update the pipeline CLI first');
@@ -110,10 +115,10 @@ export const run = guarded(async (argv, ctx) => {
       outcome, detail, agentLogLine, host: hostname(), now: Date.now(), sessions: values.session, guardBlocks: guard.blocks, guardBySession: guard.bySession,
     });
     warnings.push(...guard.warnings);
-    const posted = writeSummaryComment(gh, pr, { record, sections, existing });
-    const output = { ok: true, url: posted.url, action: posted.action, agentLogLine, step: record.step, cost: costReport(record.cost), warnings };
+    const posted = writeRunRecord(gh, pr, { record, sections, firstRead: existing });
+    const output = { ok: true, url: posted.url, action: posted.action, agentLogLine, step: posted.record.step, cost: costReport(posted.record.cost), codexUsage: usage, warnings };
     // A merged run under `production.watch: workflow` logs the line `agent-log close` later resolves from the CI smoke result.
-    if (outcome === 'merged') output.pendingLogLine = buildAgentLogLine({ state, pr, title, outcome: DEFAULT_OUTCOME });
+    if (outcome === 'merged') output.pendingLogLine = buildAgentLogLine({ state, pr, title, outcome: DEFAULT_OUTCOME }) + usageText;
     return { exitCode: EXIT.OK, output };
   });
 });

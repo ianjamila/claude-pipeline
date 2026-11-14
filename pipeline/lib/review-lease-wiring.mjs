@@ -44,7 +44,7 @@ import { claudeCodeAncestorPid } from './claude-ancestry.mjs';
 
 export const LEASED_COMMANDS = new Set([
   'agent-log', 'arbiter', 'checkpoint', 'ci-wait', 'codex-review', 'comment', 'cost', 'final-gate', 'followups', 'job', 'merge', 'merge-hold',
-  'redraft', 'review-complete', 'smoke', 'state', 'summary', 'triage', 'update-branch', 'verify',
+  'redraft', 'review-complete', 'smoke', 'state', 'substitute', 'summary', 'triage', 'update-branch', 'verify',
 ]);
 export const ADMISSION_WAIT_ENV = 'PIPELINE_ADMISSION_WAIT_MS';
 

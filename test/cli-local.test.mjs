@@ -161,6 +161,26 @@ test('risk: a small UI change is low risk and qualifies for the light lane', (t)
   assert.deepEqual(r.json.hardStops, []);
 });
 
+test('risk --pr-base: a stacked PR is also rated over the default branch range, so the parent branch\'s hard stop makes it high and Fable', (t) => {
+  const repo = project();
+  t.after(() => repo.cleanup());
+  repo.branch('parent');
+  repo.write('supabase/migrations/2_x.sql', 'DROP TABLE t;\n');
+  repo.commit('parent drops a table');
+  repo.branch('child');
+  repo.write('src/components/Button.tsx', 'export const Button = () => "hi";\n');
+  repo.commit('child tweak');
+  // the child alone (what a plain `pipeline risk --base parent` sees) is a small low change
+  const plain = cli(repo.dir, ['risk', '--base', 'parent', '--head', 'child']);
+  assertExit(plain, 0);
+  assert.deepEqual([plain.json.level, plain.json.reviewer], ['low', 'judge']);
+  // told it is stacked on parent, it reports what codex-review records: the default branch range holds the parent's hit
+  const stacked = cli(repo.dir, ['risk', '--base', 'parent', '--head', 'child', '--pr-base', 'parent']);
+  assertExit(stacked, 0);
+  assert.deepEqual([stacked.json.level, stacked.json.reviewer, stacked.json.sizeOnly], ['high', 'fable', false]);
+  assert.ok(stacked.json.hardStops.some((h) => h.rule.startsWith('R1')), JSON.stringify(stacked.json.hardStops));
+});
+
 test('risk: needs config, --base and --head; a bad ref is exit 2', (t) => {
   const repo = project();
   t.after(() => repo.cleanup());

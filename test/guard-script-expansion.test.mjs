@@ -963,8 +963,9 @@ test('guard-files: a program named by a variable or a default word is judged wit
     '"${X:-bash}" w.sh', '${X:-bash} w.sh', '${X-bash} w.sh', '${X:=bash} w.sh', 'X=x; ${X:+bash} w.sh', 'G=bash; $G w.sh', 'G=bash; "$G" w.sh', 'G=bash; ${G} w.sh',
     'G="bash -x"; $G w.sh', 'G="bash -c"; $G ./w.sh', '${X:-bash -x} w.sh', '${X:-sh} w.sh', ': ${G:=bash}; $G w.sh',
   ]) assert.equal(files(c).decision, 'deny', c);
-  for (const c of ['"${X:-bash}" ok.sh', 'G=bash; $G ok.sh', 'G="bash -x"; $G ok.sh', '${X:-bash -x} ok.sh', '${X:-./ok.sh}', 'G=./ok.sh; $G', 'G=bash; $G', 'G=ls; $G w.sh'])
+  for (const c of ['"${X:-bash}" ok.sh', 'G=bash; $G ok.sh', 'G="bash -x"; $G ok.sh', '${X:-bash -x} ok.sh', 'G=./ok.sh; $G', 'G=bash; $G', 'G=ls; $G w.sh'])
     assert.equal(files(c).decision, 'allow', c);
+  assert.equal(files('${X:-./ok.sh}').decision, 'deny', '(R17 owner decision: a lone run-time command word may be a directory)');
   assert.equal(files(`${'${A:-'.repeat(20)}bash${'}'.repeat(20)} ok.sh`).decision, 'deny');
 });
 

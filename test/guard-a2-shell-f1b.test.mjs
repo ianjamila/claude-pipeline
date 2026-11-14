@@ -93,7 +93,7 @@ test('F1b 87: a sourced file whose command may bind a name (zsh binders, functio
     assert.equal(files('F=ok.sh; source set.sh; bash $F', fs).decision, 'deny', b);
   }
   // (data commands, name setters and cds the file does stay modelled)
-  for (const calm of ['echo hi', 'set -eu', 'export G=1', 'G=2', 'print -r -- hi', 'printf "%s" x', 'cd sub', 'ls >/dev/null; test -d sub', 'print $F']) {
+  for (const calm of ['echo hi', 'set -eu', 'export G=1', 'G=2', 'print -r -- hi', 'printf "%s" x', 'cd ./sub', 'ls >/dev/null; test -d sub', 'print $F']) {
     const fs = fakeFs(PROJ, { 'set.sh': `${calm}\n`, 'evil.sh': BAD_WRITE, 'ok.sh': 'echo ok' }, DIRS);
     assert.equal(files('F=ok.sh; source set.sh; bash $F', fs).decision, 'allow', calm);
   }

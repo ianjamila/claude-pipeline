@@ -17,11 +17,11 @@ Into `~/.claude` (or `$CLAUDE_CONFIG_DIR`):
 | Piece | What it does |
 |---|---|
 | skills `review`, `verify`, `pipeline-setup` | the process: review builds the change and runs the cross-model review, then asks you to merge; verify runs the quick check; pipeline-setup onboards a repo |
-| agents `implementer`, `verifier` (Sonnet), `judge` (Opus), `arbiter` and `arbiter-fix` (Fable; `arbiter-fix` is the lower-effort variant `arbiter needed` picks for a fix round) | the judgment; models are pinned in the agent files and proven from transcripts |
+| agents `implementer`, `verifier` (Sonnet), `judge` (Opus), `substitute-opus` / `substitute-fable` (read-only stand-ins for Codex on a round it could not review: `pipeline substitute`), `arbiter` and `arbiter-fix` (Fable; `arbiter-fix` is the lower-effort variant `arbiter needed` picks for a fix round) | the judgment; models are pinned in the agent files and proven from transcripts |
 | `pipeline/bin/pipeline.mjs` | one zero-dependency Node CLI that makes every deterministic decision (hard-stops, final gate, merge) |
 | hook `guard-git` (matcher `Bash\|PowerShell\|Monitor\|mcp__.*`) | blocks pushes/force-pushes to `main`, admin merges, protection edits, approval-label changes, whether typed in a shell, a `Monitor` command, a script file or an MCP tool call |
 | hook `guard-files` (matcher `Edit\|Write\|MultiEdit\|NotebookEdit\|Bash\|PowerShell\|Monitor\|mcp__.*`) | blocks agents editing the pipeline's own files and settings — **installed last**, after the proofs |
-| hook `owner-go` (UserPromptSubmit) | records your chat "merge" (a prompt that starts with "merge"), your typed ruling when you override one (a ruling request) and your `extra round` (a prompt that starts with `extra round` or `grant round`: one more review round past `review.max_rounds`) against the PR, head and owner items the reply before it showed, so `P merge` and the guards can tell your approval from the agent's word (`owner_approval: chat`, resumed runs); never blocks or changes a prompt |
+| hook `owner-go` (UserPromptSubmit; PostToolUse on `AskUserQuestion`) | records your click on a merge / extra-round / ruling dialog the pipeline issued (`--ask`; only a human click Claude Code stamps as yours counts, see docs/cli.md `owner-go`), and records your chat "merge" (a prompt that starts with "merge"), your typed ruling when you override one (a ruling request) and your `extra round` (a prompt that starts with `extra round` or `grant round`: one more review round past `review.max_rounds`) against the PR, head and owner items the reply before it showed, so `P merge` and the guards can tell your approval from the agent's word (`owner_approval: chat`, resumed runs); never blocks or changes a prompt |
 | hook `stack-register` (PreToolUse on `Bash` and the write tools `Edit\|Write\|MultiEdit\|NotebookEdit`, 30 s) | records which private Supabase stack a session is about to use, before the tool runs; **fail-closed** like the guards (an unloadable file blocks with exit 2) |
 | hook `stack-dev-bind` (PostToolUse on `Bash`, 10 s) | notes which stack a dev server you started is bound to; non-blocking |
 | hook `update-notice` (SessionStart, 5 s) | prints one line at the start of a session when the automatic update has something to say (see Automatic updates); it only reads a small status file, never touches the network, and never blocks a session; non-blocking |
@@ -352,6 +352,9 @@ head you did not review (the receipt names the head the event carried).
   `PIPELINE_GH`, `PIPELINE_CODEX`, `PIPELINE_VERCEL`, `PIPELINE_TEST_MODE` or `PIPELINE_UPDATE_REMOTE` on a `pipeline.mjs` command;
   the installed CLI ignores those five seam variables altogether (they exist for the test suite).
   The stack-stop seams `PIPELINE_DOCKER`, `PIPELINE_PS`, `PIPELINE_LSOF`, `PIPELINE_SUPABASE`, `PIPELINE_STACKS_DEADLINE_MS` and `PIPELINE_INSTALL_WORKER_WAIT_MS` follow a stricter rule: an installed copy ignores them always; in the repo checkout they count only when `PIPELINE_STACKS_HOME` points somewhere other than the default `~/.claude/pipeline-state/stacks` **and** `PIPELINE_STACKS_ONLY` names the projects that isolated run may touch.
+- **What blocks a change to a guard.** A guard change is held back only for (a) allowing on the branch what `main` denies, (b) missing a command an agent would plausibly write unprompted,
+  (c) denying an everyday command, or (d) failing open on a timeout for plausible input. A deliberately evasive construction (non-default shell options, a crafted sourced file) is not a merge blocker: it goes
+  to a follow-up issue (#373).
 - **Your chat "merge" is checked locally.** The owner-go hook records only prompts you type (Claude Code never runs it for
   the model or a subagent), and `P merge` and guard-git trust only those records. But the agent runs as your OS user and with
   your GitHub token: a program the guards cannot see into (a script that builds the record path at run time, a test that
@@ -379,6 +382,8 @@ head you did not review (the receipt names the head the event carried).
 
 ## Project settings and environment
 
+**Substitute review (Codex quota spent).** When Codex stops on its usage limit, or a small fix-check meets the PR's `review.codex_round_budget` (default 6) or the weekly `review.codex_budget.hard` (default 90 %), a read-only Claude agent reviews that round instead: `substitute-opus`, `substitute-fable` once the PR was ever high risk (`review.substitute.mode` auto|off, `min_wait_minutes`, `max_packet_mb`; `review.effort.small_fix`, `small_fix_lines`). Only your typed "merge" accepts such a PR (the `substitute` area; never the gated route, never label mode). A review state that holds one is version 4: run `pipeline update` on every machine before the first substitute round, and finish or park those PRs before rolling the pipeline back (an older CLI cannot read them). `pipeline codex-status` shows the weekly use and the PRs waiting for Codex (`--usage`: where the tokens went); a new session says "Codex is back" once the outage is over.
+
 `.claude/pipeline.yml` is documented in its template (`pipeline/templates/pipeline.yml`). Three keys deserve a
 mention: `owner_approval` (`label` by default; `chat` drops the approval labels: blocking hard-stops and test-integrity
 violations no longer fail CI, the review skill stops before the merge, lists them in a PR comment and merges when you say
@@ -386,8 +391,9 @@ violations no longer fail CI, the review skill stops before the merge, lists the
 required on top of `ci.required_checks`; `false` only for a repo that does not run `pipeline-guards.yml`), `ci.review_check`
 (default `false`; `true` makes the guards also post `Cross-model review`, green only when the newest review-complete comment
 names the head's content hash, and every required-check list includes it; turn it on together with branch protection), `ci.draft_while_iterating` (default `false`; `true` makes `pipeline redraft` turn a ready PR back to draft before a fix push, so
-the heavy CI runs once when it is marked ready again; set it only when every heavy required workflow skips drafts and lists
-`converted_to_draft` in its `pull_request` types or shares one concurrency group per PR)
+the heavy CI runs once when it is marked ready again; set it only when every heavy required workflow skips drafts, lists
+`ready_for_review` and `converted_to_draft` in its `pull_request` types (a bare `pull_request:` gets neither) and puts one PR's
+runs in one concurrency group with `cancel-in-progress`)
 and `ci.approvers` (logins whose approval labels count; required for org-owned repos, otherwise approvals
 fail closed with `org-repo-needs-ci.approvers`). `pipeline config` prints `warnings` for config that is valid
 but suspicious. Documentation and test files are exempt from the content rules (sensitive terms, SQL, auth) but keep

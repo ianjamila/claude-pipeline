@@ -15,8 +15,8 @@
 import { existsSync, readFileSync, statSync, realpathSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { sourcePathSearch, commandName, simpleCommands, splitArgs, scriptFileOf, scriptFeedsOf, sqlShellEscapes, startupFilesOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, splicesOptions, spliceText, implicitBindsOf, ZSH_NAME_BINDERS, SHELL_SET_NAMES, withoutLiteralText, INDIRECT_EXPANSION, indirectExpansionOnLine, arithAssignedNames, envUnset } from './shell-parse.mjs';
-export { withoutLiteralText, INDIRECT_EXPANSION };
+import { UNDECIDABLE_HEREDOC, plainExit, sourcePathSearch, commandName, simpleCommands, splitArgs, scriptFileOf, scriptFeedsOf, sqlShellEscapes, startupFilesOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, splicesOptions, spliceText, implicitBindsOf, ZSH_NAME_BINDERS, SHELL_SET_NAMES, withoutLiteralText, INDIRECT_EXPANSION, indirectExpansionOnLine, arithAssignedNames, envUnset, refusalAdvice } from './shell-parse.mjs';
+export { withoutLiteralText, INDIRECT_EXPANSION, SETS_BY_NAME };
 import { PM_RUN_ALIASES, PM_WRAPPERS, pmScriptOf, pmCannotRunScript, pmCall, pmMoverName, packageScripts, localBin, nameAtRunTimeIn, markPackageState, pkgOwnWrite, pkgMarkersFor, pmStartDirs, binIsProgram, binSite, binInterpreter, MAX_BIN_INTERPRETERS, lineNames, defaultLexists } from './package-scripts.mjs';
 import { catchAllReason, guardedCommandText, dataLessArgs } from './guarded-text.mjs';
 import { REVIEW_MARKER_TEXT } from '../../lib/review-marker.mjs';
@@ -407,7 +407,21 @@ const CURRENT_BRANCH_WORD = new RegExp(`(^|:)${CURRENT_BRANCH_IDIOM.source.slice
 // `unset`), set in the environment, or a sourced script that may have set variables.
 // A name can be written without the letters IFS in a row (`eval "I""FS=,"`, `read $N`, `printf -v $N`, `declare I""FS=,`, `N=IFS; export $N`),
 // so the commands that assign a variable by a computed or split-up name count as well.
-const SETS_BY_NAME = /\b(?:eval|read|mapfile|readarray|getopts|source)\b|\bprintf\s+-[A-Za-z]*v|(?:^|[\s;&|(])\.\s|\b(?:export|unset|declare|typeset|local|readonly)\b[^;&|\n]*[$`'"]/;
+const SETS_BY_NAME_HEAD = /\b(?:eval|read|mapfile|readarray|getopts|source)\b|\bprintf\s+-[A-Za-z]*v|(?:^|[\s;&|(])\.\s/;
+const DECLARING_WORD = /\b(?:export|unset|declare|typeset|local|readonly)\b/;
+// (#288 R3-F3: the declaring words used to be one pattern, `\b(?:export|…)\b[^;&|\n]*[$`'"]`, which rescans the rest of the segment from EVERY declaring word: 27,000 `export` words took 7 s. A segment holds a name-setting
+// declaration when its FIRST declaring word is followed by a quote, `$` or backtick before the segment ends -- the same answer, one pass per segment.)
+const SETS_BY_NAME = {
+  test(text) {
+    const s = String(text);
+    if (SETS_BY_NAME_HEAD.test(s)) return true;
+    for (const seg of s.split(/[;&|\n]/)) {
+      const k = DECLARING_WORD.exec(seg);
+      if (k && /[$`'"]/.test(seg.slice(k.index + k[0].length))) return true;
+    }
+    return false;
+  },
+};
 // Both the text as written and with its quotes and backslashes removed (`printf -vI""FS ,` spells the name only once they are gone).
 // Why (#81 Codex R1-B1 follow-up): a script the guard opens is judged with its own text too -- `bash wrapper.sh` hid `declare -n r=IFS; r=x` from the outer line. Whole-line comments are left out of
 // the binder test only (a comment that says "read" is no binder); the name IFS anywhere, a comment included, still counts.
@@ -1416,7 +1430,7 @@ function cdTargets(cmds, startDir, ctx) {
   const dirs = startDir === null ? [] : [startDir];
   for (const c of cmds) {
     const nm = c.argv.length ? baseName(c.argv[0]) : '';
-    if (nm !== 'cd' && nm !== 'pushd') continue;
+    if (nm !== 'cd' && nm !== 'chdir' && nm !== 'pushd') continue;
     const t = c.argv.slice(1).find((a) => !a.startsWith('-'));
     const e = t === undefined ? '~' : expandVars(t, ctx).replace(/^\$\{?HOME\}?(?=\/|$)/, () => lineHome(ctx) ?? '$HOME');
     if (DYNAMIC.test(e) || e === '-') continue;
@@ -1980,9 +1994,11 @@ function loopEndDirs(cmds, loop, from, ctx, cdp) {
     const nm = c.argv.length ? baseName(c.argv[0]) : '';
     if (!DIR_CHANGERS.includes(nm) || (c.grp?.length ?? 0) > own || c.spawn || c.up?.some((u) => u.proc && !cmds[loop.start].up.includes(u))) continue; // (a cd in a text a new process runs, or in a command a wrapper started, is lost when it ends: one in a text the loop is itself in is not, R10-B1)
     const next = cmds[j + 1];
-    const orExits = next?.sep === '||' && ['exit', 'return'].includes(next.argv[0]) && cmds[j + 2]?.sep !== '|' && cmds[j + 2]?.sep !== '&';
+    // (#427: the same rule as the files guard's cd narrowing: only a plain `exit` leaves, and no redirection on the closer of its group, `{ exit 1; } < f`)
+    const orExits = next?.sep === '||' && plainExit(next) && cmds[j + 2]?.sep !== '|' && cmds[j + 2]?.sep !== '&'
+      && !(cmds[j + 2] !== undefined && cmds[j + 2].argv.length === 0 && (cmds[j + 2].redirects ?? []).length > 0);
     const may = c.ctl?.cond || c.sep === '&&' || c.sep === '||' || c.sep === '&' || c.sep === '|' || next?.sep === '&' || next?.sep === '|' || (next?.sep === '||' && !orExits);
-    let moved = dirs.map((d) => nextDir(d, nm, c.argv, ctx, cdp, c.env ?? {}));
+    let moved = dirs.map((d) => (nm === 'chdir' ? null : nextDir(d, nm, c.argv, ctx, cdp, c.env ?? {}))); // (#425 R1-F2: chdir leaves the directory unknown)
     // (`cd a && cd b`: the second runs only when the first did, so the pair either moves twice or not at all)
     if (!may && next?.sep === '&&' && next.argv.length && DIR_CHANGERS.includes(baseName(next.argv[0])) && (next.grp?.length ?? 0) <= own && !next.ctl?.cond) {
       const after = moved.map((d) => nextDir(d, baseName(next.argv[0]), next.argv, ctx, cdp, next.env ?? {}));
@@ -2446,7 +2462,7 @@ const UNSURE_OK = new Set([
   'break', 'continue', 'return', 'exit', 'shift',
   ...VAR_BUILTINS, ...VALUE_BINDERS,
 ]);
-const DIR_CHANGERS = ['cd', 'pushd', 'popd'];
+const DIR_CHANGERS = ['cd', 'chdir', 'pushd', 'popd']; // (#372: zsh's chdir is cd)
 
 // A line that defines a function (its body is parsed as if it ran — `f(){ cd /safe; }; git push` never runs the cd),
 // an alias, a trap (`trap "cd …" DEBUG` runs before every command) or changes shell options / builtins can change
@@ -3026,7 +3042,8 @@ function evalString(str, startDir, ctx, level, child = false) {
   const cmds = simpleCommands(str, { env: ctx.env, bashState: ctx.bashState, expired: () => ctx.budget.now() > ctx.budget.deadline }); // a scan that outlasts the deadline gives up: truncated, so denied
   // Truncated means part of the line was never looked at, so nothing on it can be called harmless (`g''it push` after
   // 500 `true;` must not slip through on a word match).
-  if (cmds.truncated) return deny('command too complex to verify (the parser gave up). Split it into simpler commands.');
+  if (cmds.undecidable) return deny(UNDECIDABLE_HEREDOC);
+  if (cmds.truncated) return deny(cmds.refused ? `the command uses ${cmds.refused}, which the guard does not read. ${refusalAdvice(cmds.refused).replace(/^./, (c) => c.toUpperCase())}.` : 'command too complex to verify (the parser gave up). Split it into simpler commands.');
   if (cmds.dynamic && GUARDED_WORDS.test(str)) {
     return deny('the command that runs is only known at run time ($VAR / $(...) / piped into a shell) and the line mentions a guarded operation, so it cannot be verified. Rewrite: write the command out literally (`git push origin agent/x`, not `$G push` or `... | sh`); if the guarded words are only text (a commit message, a PR body), put that text in a file (`git commit -F msg.txt`, `gh pr create --body-file body.md`).');
   }
@@ -3064,7 +3081,7 @@ function evalString(str, startDir, ctx, level, child = false) {
   };
   // For command c: the operator before the item of a tracker's list that holds it (c itself, or the group / text / subshell that holds c): && keeps the change certain, ; and everything else ends a conditional one,
   // || any (`cd d || exit 1`: nothing after it runs when the change failed).
-  const settle = (c) => {
+  const settle = (c, i) => {
     trackers = trackers.filter((x) => {
       if (!x.up.every((e, k) => c.up[k] === e)) return false; // (its level has ended: the rule of that level took over)
       const deeper = c.up.length > x.up.length;
@@ -3072,7 +3089,8 @@ function evalString(str, startDir, ctx, level, child = false) {
       // (#352 R11-F2: a later stage of a pipeline takes the operator before the pipeline's FIRST stage (lead): that stage may not have come out before this one)
       const op = own.sep === '|' ? (own.lead ?? ';') : own.sep;
       if (op === '&&') return true;
-      if (op === '||' && !deeper && ['exit', 'return'].includes(c.argv[0]) && !c.pipe && !c.bg) return true;
+      // (#427: only a plain `exit` leaves (not `return`, not one with a redirection or extra words), and no redirection on the closer of its group right after it)
+      if (op === '||' && !deeper && plainExit(c) && !c.pipe && !c.bg && !(cmds[i + 1] !== undefined && cmds[i + 1].argv.length === 0 && (cmds[i + 1].redirects ?? []).length > 0)) return true;
       if (op === '||' || x.cond) forget(x);
       return false;
     });
@@ -3180,7 +3198,7 @@ function evalString(str, startDir, ctx, level, child = false) {
       }
     }
     if (hazard) forgetState();
-    settle(c); // (what a subshell saves is the SETTLED state: the rule is applied for the operator before it first, so a state the subshell's own commands forget cannot be given back as certain)
+    settle(c, i); // (what a subshell saves is the SETTLED state: the rule is applied for the operator before it first, so a state the subshell's own commands forget cannot be given back as certain)
     if (levels) for (let k = levels.length; k < c.up.length; k++) levels.push({ e: c.up[k], dir, lost: false, state: false, al: { git: { ...ctx.gitAliases }, gh: { ...ctx.ghAliases } } });
     // (R7-F1: a loop's frame is taken once the subshells this command ends or opens are settled, above: the directory, the open subshells and the state it holds are what the loop's FIRST command starts with,
     // and what every further pass restarts from. Before it, a pass restored a subshell that had ended (`(true); for ...`) or lacked the one the loop is in (`( for ...; done ); push`).)
@@ -3219,7 +3237,7 @@ function evalString(str, startDir, ctx, level, child = false) {
     } else if (name === 'for' && pinsAt(ctx, level)?.get(argv[1])?.expand) verdict = loopWordAt(argv[1], ctx);
     else if (name === 'for' && computedLoopWord(c) !== null) setVar(ctx, argv[1], computedLoopWord(c), level);
     else if (childCd) { /* the child's own directory */ }
-    else if (name === 'cd' || name === 'pushd' || name === 'popd') dir = nextDir(dir, name, argv, ctx, cdp, c.env ?? {});
+    else if (name === 'cd' || name === 'chdir' || name === 'pushd' || name === 'popd') dir = name === 'chdir' ? null : nextDir(dir, name, argv, ctx, cdp, c.env ?? {}); // (#425 R1-F2: chdir is zsh only, in bash the line goes on in the old directory: the directory after it is unknown, as after popd)
     else if (name === 'git' || name === 'gh') {
       // (Fable attacker pass: a remote or gh's default repository changed on the line: see directMergeVerdict)
       if (name === 'git' && argv.includes('remote') && argv.some((w) => ['add', 'set-url', 'rename', 'remove', 'rm'].includes(w))) ctx.ghRepoDirty = true;

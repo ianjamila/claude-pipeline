@@ -120,6 +120,10 @@ const stackRegisters = (home) => [
   { matcher: 'Bash', hooks: [stackRegisterHandler(home)] },
   { matcher: 'Edit|Write|MultiEdit|NotebookEdit', hooks: [stackRegisterHandler(home)] },
 ];
+// (#261) the same recorder after an AskUserQuestion: the owner's click, plain handler, matcher AskUserQuestion
+const ownerGoClick = (home) => ({
+  matcher: 'AskUserQuestion', hooks: [{ type: 'command', command: 'node', args: [joinNative(home, 'pipeline', 'hooks', 'owner-go.mjs')], timeout: 10 }],
+});
 const stackDevBind = (home) => ({
   matcher: 'Bash', hooks: [{ type: 'command', command: 'node', args: [joinNative(home, 'pipeline', 'hooks', 'stack-dev-bind.mjs')], timeout: 10 }],
 });
@@ -176,7 +180,7 @@ test('fresh install into an empty home (path with a space): files, manifest, hoo
 
   for (const rel of [
     'skills/review/SKILL.md', 'skills/review/reference/notes.md', 'skills/verify/SKILL.md', 'skills/pipeline-setup/SKILL.md',
-    'agents/implementer.md', 'agents/verifier.md', 'agents/judge.md', 'agents/arbiter.md', 'agents/arbiter-fix.md', 'agents/Explore.md',
+    'agents/implementer.md', 'agents/verifier.md', 'agents/judge.md', 'agents/arbiter.md', 'agents/arbiter-fix.md', 'agents/substitute-opus.md', 'agents/substitute-fable.md', 'agents/Explore.md',
     'pipeline/bin/pipeline.mjs', 'pipeline/hooks/guard-git.mjs', 'pipeline/hooks/guard-files.mjs',
     'pipeline/hooks/stack-register.mjs', 'pipeline/hooks/stack-dev-bind.mjs', 'pipeline/hooks/stack-session-end.mjs',
     'pipeline/lib/answer.mjs', 'pipeline/templates/example.md', 'pipeline/VERSION', 'pipeline/INSTALLED.json',
@@ -198,7 +202,7 @@ test('fresh install into an empty home (path with a space): files, manifest, hoo
 
   const s = readSettings(home);
   assert.deepEqual(s.hooks.PreToolUse, [...stackRegisters(home), guardGit(home), guardFiles(home)]);
-  assert.deepEqual(s.hooks.PostToolUse, [stackDevBind(home)]);
+  assert.deepEqual(s.hooks.PostToolUse, [stackDevBind(home), ownerGoClick(home)]);
   assert.deepEqual(s.hooks.SessionStart, [updateNotice(home)], 'the update notice is the only SessionStart entry');
   assert.equal(existsSync(join(home, 'pipeline', 'hooks', 'session-version.mjs')), false);
   assert.deepEqual(s.hooks.SessionEnd, [stackSessionEnd(home)]);
@@ -236,7 +240,7 @@ test('existing settings: every other key survives unchanged, ours is appended on
 
   const expected = structuredClone(before);
   expected.hooks.PreToolUse.push(...stackRegisters(home), guardGit(home), guardFiles(home));
-  expected.hooks.PostToolUse.push(stackDevBind(home)); // (after the owner's tab-event.sh and memory-index.js)
+  expected.hooks.PostToolUse.push(stackDevBind(home), ownerGoClick(home)); // (after the owner's tab-event.sh and memory-index.js)
   expected.hooks.SessionEnd.push(stackSessionEnd(home)); // (after the owner's heartbeat.mjs)
   expected.hooks.UserPromptSubmit.push(ownerGo(home)); // (after the owner's own)
   expected.hooks.SessionStart.push(updateNotice(home)); // (after the owner's echo start)
@@ -262,7 +266,7 @@ test('a second install changes nothing: settings, manifest files and hooks are i
   assert.deepEqual(readManifest(home).files, m1.files);
   const s = readSettings(home);
   assert.equal(s.hooks.PreToolUse.filter((g) => g.hooks.some((h) => isOurHandler(h, home))).length, 4, 'two stack-register groups and the two guards');
-  assert.equal(s.hooks.PostToolUse.filter((g) => g.hooks.some((h) => isOurHandler(h, home))).length, 1);
+  assert.equal(s.hooks.PostToolUse.filter((g) => g.hooks.some((h) => isOurHandler(h, home))).length, 2, 'dev-bind and the owner-go click');
   assert.equal(s.hooks.SessionEnd.filter((g) => g.hooks.some((h) => isOurHandler(h, home))).length, 1);
   for (const e of allowEntries(home)) assert.equal(s.permissions.allow.filter((x) => x === e).length, 1);
   const report = JSON.parse(r2.stdout);
@@ -315,7 +319,7 @@ test('an older install in the string command form is replaced, not duplicated', 
   const after = readSettings(home);
   const expected = structuredClone(ownersSettings());
   expected.hooks.PreToolUse.push({ matcher: 'Bash', hooks: [{ type: 'command', command: 'echo mine' }] }, ...stackRegisters(home), guardGit(home), guardFiles(home));
-  expected.hooks.PostToolUse.push(stackDevBind(home));
+  expected.hooks.PostToolUse.push(stackDevBind(home), ownerGoClick(home));
   expected.hooks.SessionEnd.push(stackSessionEnd(home));
   expected.hooks.UserPromptSubmit.push(ownerGo(home)); // (after the owner's own)
   expected.hooks.SessionStart.push(updateNotice(home));
@@ -451,6 +455,39 @@ test('--check: clean after install, names an edited file, notices a deleted hook
   const noRecorder = install(home, ['--check']);
   assert.equal(noRecorder.status, 1);
   assert.match(noRecorder.stdout, /hook missing: owner-go is not in hooks\.UserPromptSubmit/);
+});
+
+// #261: the owner-go recorder also runs after an AskUserQuestion (the owner's click); without it clicks are never recorded and the owner types the closing words
+test('#261 owner-go click hook: install registers it once on PostToolUse (matcher AskUserQuestion), a reinstall changes nothing, --check warns when it is missing', () => {
+  const home = newHome();
+  assert.equal(install(home).status, 0);
+  const s = readSettings(home);
+  assert.deepEqual(s.hooks.PostToolUse.filter((g) => g.matcher === 'AskUserQuestion'), [ownerGoClick(home)]);
+  assert.deepEqual(s.hooks.PostToolUse.at(-1).hooks[0].args, [joinNative(home, 'pipeline', 'hooks', 'owner-go.mjs')], 'the plain handler: never the fail-closed loader');
+  const found = inspectHooks(s, home);
+  assert.ok(found['owner-go-click'].length === 1 && found['owner-go-click'][0].exact);
+  assert.ok(found['owner-go'].length === 1 && found['owner-go'][0].exact, 'the typed-words entry is still its own');
+  assert.deepEqual(found.unknown, []);
+  const before = readFileSync(settingsPath(home), 'utf8');
+  const again = install(home, ['--json']);
+  assert.equal(JSON.parse(again.stdout).settings.changed, false);
+  assert.equal(readFileSync(settingsPath(home), 'utf8'), before, 'byte-identical after a reinstall');
+  assert.equal(install(home, ['--check']).status, 0);
+
+  const gone = readSettings(home);
+  gone.hooks.PostToolUse = gone.hooks.PostToolUse.filter((g) => g.matcher !== 'AskUserQuestion');
+  writeSettings(home, gone);
+  const check = install(home, ['--check']);
+  assert.equal(check.status, 1);
+  assert.match(check.stdout, /hook missing: owner-go-click is not in hooks\.PostToolUse \(click approvals fall back to typing the closing words\)/);
+  assert.equal(install(home).status, 0, 'a reinstall puts it back');
+  assert.deepEqual(readSettings(home).hooks.PostToolUse.filter((g) => g.matcher === 'AskUserQuestion'), [ownerGoClick(home)]);
+
+  // the wrong matcher is "differs", not a second hook
+  const wrong = readSettings(home);
+  wrong.hooks.PostToolUse.find((g) => g.matcher === 'AskUserQuestion').matcher = 'Bash';
+  writeSettings(home, wrong);
+  assert.match(install(home, ['--check']).stdout, /hook differs: the owner-go-click entry/);
 });
 
 test('--check also reports a missing file, a duplicated hook, a missing allow entry and a removed-from-source file', () => {
@@ -910,7 +947,7 @@ test('buildPlan and walkFiles read the fixture: sorted, excluded names skipped, 
   assert.ok(plan.files.has('skills/review/reference/notes.md'));
   assert.ok(plan.files.has('agents/arbiter.md'));
   assert.deepEqual(plan.units.map((u) => u.rel), [
-    'pipeline', 'agents/implementer.md', 'agents/verifier.md', 'agents/judge.md', 'agents/arbiter.md', 'agents/arbiter-fix.md', 'agents/Explore.md',
+    'pipeline', 'agents/implementer.md', 'agents/verifier.md', 'agents/judge.md', 'agents/arbiter.md', 'agents/arbiter-fix.md', 'agents/substitute-opus.md', 'agents/substitute-fable.md', 'agents/Explore.md',
     'skills/review', 'skills/verify', 'skills/pipeline-setup',
   ]);
   const walked = walkFiles(join(FIXTURE, 'skills'));
@@ -1316,7 +1353,7 @@ test('--uninstall from the previous release\'s shape leaves no pipeline files an
   makeOldShape(home, owner);
   const r = install(home, ['--uninstall', '--json']);
   assert.equal(r.status, 0, r.stderr);
-  assert.equal(JSON.parse(r.stdout).hooks.removed, 8, 'stack-register x2 (one on the old matcher), dev-bind, session-end, guard-git, guard-files, session-version, owner-go (the old shape has no update notice)');
+  assert.equal(JSON.parse(r.stdout).hooks.removed, 9, 'stack-register x2 (one on the old matcher), dev-bind, session-end, guard-git, guard-files, session-version, owner-go (typed), owner-go (click) (the old shape has no update notice)');
   assert.deepEqual(readSettings(home), owner);
   assert.deepEqual(listTree(home).filter((f) => !f.startsWith('backups/')), ['settings.json']);
 });
@@ -1840,7 +1877,7 @@ test('fresh install adds exactly one stack-register group per matcher, one PostT
   const s = readSettings(home);
   assert.deepEqual(ourEntries(s.hooks.PreToolUse, home), [...stackRegisters(home), guardGit(home), guardFiles(home)]);
   assert.equal(s.hooks.PreToolUse.at(-1).matcher, GUARD_FILES_MATCHER, 'guard-files is the last PreToolUse entry');
-  assert.deepEqual(s.hooks.PostToolUse, [stackDevBind(home)]);
+  assert.deepEqual(s.hooks.PostToolUse, [stackDevBind(home), ownerGoClick(home)]);
   assert.deepEqual(s.hooks.SessionEnd, [stackSessionEnd(home)]);
   const found = inspectHooks(s, home);
   assert.equal(found['stack-register'].length, 2);
@@ -1860,7 +1897,7 @@ test('the owner\'s foreign PostToolUse and SessionEnd entries (tab-event.sh, hea
   assert.equal(install(home).status, 0);
   const afterInstall = readFileSync(settingsPath(home), 'utf8');
   const s = JSON.parse(afterInstall);
-  assert.deepEqual(s.hooks.PostToolUse, [...before.hooks.PostToolUse, stackDevBind(home)]);
+  assert.deepEqual(s.hooks.PostToolUse, [...before.hooks.PostToolUse, stackDevBind(home), ownerGoClick(home)]);
   assert.deepEqual(s.hooks.SessionEnd, [heartbeat, stackSessionEnd(home)]);
   assert.deepEqual(s.hooks.PostToolUse[1], tab);
 
@@ -1882,7 +1919,7 @@ test('a foreign hook sharing a group with ours on PostToolUse / SessionEnd survi
   writeSettings(home, before);
   assert.equal(install(home).status, 0);
   const s = readSettings(home);
-  assert.deepEqual(s.hooks.PostToolUse, [{ matcher: 'Bash', hooks: [{ type: 'command', command: 'echo mine' }] }, stackDevBind(home)]);
+  assert.deepEqual(s.hooks.PostToolUse, [{ matcher: 'Bash', hooks: [{ type: 'command', command: 'echo mine' }] }, stackDevBind(home), ownerGoClick(home)]);
   assert.deepEqual(s.hooks.SessionEnd, [{ hooks: [{ type: 'command', command: 'echo bye' }] }, stackSessionEnd(home)]);
   assert.equal(driftOf(home).status, 0);
   assert.equal(install(home, ['--uninstall']).status, 0);
@@ -1920,7 +1957,7 @@ test('--check: a missing, duplicated or edited stack-dev-bind is reported; so is
   const gone = structuredClone(base);
   delete gone.hooks.PostToolUse;
   writeSettings(home, gone);
-  assert.deepEqual(driftOf(home).items.map((i) => [i.kind, i.path]), [['hook-missing', 'stack-dev-bind']]);
+  assert.deepEqual(driftOf(home).items.map((i) => [i.kind, i.path]), [['hook-missing', 'owner-go-click'], ['hook-missing', 'stack-dev-bind']]);
 
   const dup = structuredClone(base);
   dup.hooks.PostToolUse.push(stackDevBind(home));
@@ -2010,7 +2047,7 @@ test('an install from before the stack hooks existed reports the stack hooks mis
   writeSettings(home, s);
   const d = driftOf(home);
   assert.equal(d.status, 1);
-  assert.deepEqual(d.items.map((i) => i.kind), ['hook-missing', 'hook-missing', 'hook-missing', 'hook-missing']);
+  assert.deepEqual(d.items.map((i) => i.kind), ['hook-missing', 'hook-missing', 'hook-missing', 'hook-missing', 'hook-missing']);
   assert.equal(install(home).status, 0);
   assert.equal(driftOf(home).status, 0);
 });
@@ -2020,7 +2057,7 @@ test('--uninstall removes our three stack hooks, drops the PostToolUse / Session
   assert.equal(install(home).status, 0);
   const r = install(home, ['--uninstall', '--json']);
   assert.equal(r.status, 0, r.stderr);
-  assert.equal(JSON.parse(r.stdout).hooks.removed, 8, 'stack-register x2, dev-bind, session-end, guard-git, guard-files, owner-go, update-notice');
+  assert.equal(JSON.parse(r.stdout).hooks.removed, 9, 'stack-register x2, dev-bind, session-end, guard-git, guard-files, owner-go (typed), owner-go (click), update-notice');
   assert.equal(existsSync(settingsPath(home)) ? JSON.stringify(readSettings(home)) : '{}', '{}');
 
   const home2 = newHome();

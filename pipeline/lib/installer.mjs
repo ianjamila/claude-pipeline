@@ -20,7 +20,7 @@ export const SKILLS = ['review', 'verify', 'pipeline-setup'];
 export const RETIRED_HOOKS = Object.freeze(['session-version']);
 export const RETIRED_SKILLS = Object.freeze(['ship']);
 // Explore: a Haiku stand-in for Claude Code's built-in Explore agent (same name, so it takes the built-in's place).
-export const AGENTS = ['implementer', 'verifier', 'judge', 'arbiter', 'arbiter-fix', 'Explore'];
+export const AGENTS = ['implementer', 'verifier', 'judge', 'arbiter', 'arbiter-fix', 'substitute-opus', 'substitute-fable', 'Explore'];
 export const EXCLUDED_NAMES = new Set(['node_modules', '.DS_Store']);
 // Skipped only directly under the walked root (pipeline/, skills/<name>/): a nested reference/test/ is content.
 export const EXCLUDED_TOP_LEVEL = new Set(['test']);
@@ -40,8 +40,10 @@ export const RETIRED_STACK_REGISTER_MATCHERS = Object.freeze(['Read|Edit|Write|G
 export const STACK_REGISTER_TIMEOUT_S = 30;
 export const STACK_HOOK_TIMEOUT_S = 10;
 export const STACK_DEV_BIND_MATCHER = 'Bash';
+// (#261) click-to-approve: the owner-go recorder also runs after an AskUserQuestion, to record the owner's click on a dialog the pipeline issued.
+export const OWNER_GO_CLICK_MATCHER = 'AskUserQuestion';
 // The events whose hooks this installer manages: guard hooks and stack-register on PreToolUse, stack-dev-bind on PostToolUse,
-// stack-session-end on SessionEnd, the owner-go recorder (#58: the owner's chat "merge") on UserPromptSubmit, the update notice on
+// stack-session-end on SessionEnd, the owner-go recorder (#58: the owner's chat "merge") on UserPromptSubmit and (#261, the owner's click) on PostToolUse for AskUserQuestion, the update notice on
 // SessionStart (the retired session-version script was found and removed there too; its name stays retired).
 export const HOOK_EVENTS = ['PreToolUse', 'PostToolUse', 'SessionStart', 'SessionEnd', 'UserPromptSubmit'];
 export const STAGING_REL = 'backups/.staging';
@@ -577,6 +579,9 @@ export const ourPromptGroups = (home) => [{ hooks: [ownerGoHandlerFor(home)] }];
 // Our own SessionStart group (no matcher): the update notice, appended after the owner's own.
 export const ourSessionStartGroups = (home) => [{ hooks: [updateNoticeHandlerFor(home)] }];
 
+// (#261) Our own PostToolUse group for the owner's click: the same plain handler (never the fail-closed loader: it only adds a line to the agent's context), matcher AskUserQuestion.
+export const ourClickGroups = (home) => [{ matcher: OWNER_GO_CLICK_MATCHER, hooks: [ownerGoHandlerFor(home)] }];
+
 function assertShape(settings) {
   if (!isPlainObject(settings)) throw new SettingsShapeError('settings.json must contain a JSON object');
   if ('hooks' in settings && !isPlainObject(settings.hooks)) throw new SettingsShapeError('settings.json: "hooks" is not an object');
@@ -627,7 +632,7 @@ export function mergeSettings(settings, { home, skipFileGuard = false }) {
   out.hooks.PreToolUse ??= [];
   out.hooks.PreToolUse.push(...stack.PreToolUse, ...ourHookGroups(home, { skipFileGuard }));
   out.hooks.PostToolUse ??= [];
-  out.hooks.PostToolUse.push(...stack.PostToolUse);
+  out.hooks.PostToolUse.push(...stack.PostToolUse, ...ourClickGroups(home));
   out.hooks.SessionEnd ??= [];
   out.hooks.SessionEnd.push(...stack.SessionEnd);
   out.hooks.UserPromptSubmit ??= [];
@@ -684,12 +689,13 @@ const scriptOf = (handler) => {
 // hooks.SessionEnd; one of ours under the wrong event is `unknown`. `retired` holds what an earlier install wrote and this one
 // no longer does (a RETIRED_HOOKS script on any event, stack-register on a RETIRED_STACK_REGISTER_MATCHERS matcher): update drops it.
 export function inspectHooks(settings, home) {
-  const out = { 'guard-git': [], 'guard-files': [], 'owner-go': [], 'update-notice': [], 'stack-register': [], 'stack-dev-bind': [], 'stack-session-end': [], retired: [], unknown: [] };
+  const out = { 'guard-git': [], 'guard-files': [], 'owner-go': [], 'owner-go-click': [], 'update-notice': [], 'stack-register': [], 'stack-dev-bind': [], 'stack-session-end': [], retired: [], unknown: [] };
   const stack = ourStackGroups(home);
   const expected = {
     'guard-git': { event: 'PreToolUse', matcher: GUARD_GIT_MATCHER, handler: handlerFor(home, 'guard-git') },
     'guard-files': { event: 'PreToolUse', matcher: GUARD_FILES_MATCHER, handler: handlerFor(home, 'guard-files') },
     'owner-go': { event: 'UserPromptSubmit', matcher: undefined, handler: ownerGoHandlerFor(home) },
+    'owner-go-click': { event: 'PostToolUse', matcher: OWNER_GO_CLICK_MATCHER, handler: ownerGoHandlerFor(home) },
     'update-notice': { event: 'SessionStart', matcher: undefined, handler: updateNoticeHandlerFor(home) },
     'stack-register': { event: 'PreToolUse', matchers: STACK_REGISTER_MATCHERS, handler: stack.PreToolUse[0].hooks[0] },
     'stack-dev-bind': { event: 'PostToolUse', matcher: STACK_DEV_BIND_MATCHER, handler: stack.PostToolUse[0].hooks[0] },
@@ -702,7 +708,9 @@ export function inspectHooks(settings, home) {
       if (!isPlainObject(group) || !Array.isArray(group.hooks)) continue;
       for (const handler of group.hooks) {
         if (!isOurHandler(handler, home)) continue;
-        const script = scriptOf(handler);
+        // (the owner-go script is registered twice: the typed words on UserPromptSubmit, the click on PostToolUse)
+        const found = scriptOf(handler);
+        const script = found === 'owner-go' && event === 'PostToolUse' ? 'owner-go-click' : found;
         if (script && (RETIRED_HOOKS.includes(script) || (script === 'stack-register' && RETIRED_STACK_REGISTER_MATCHERS.includes(group.matcher)))) {
           out.retired.push({ script, event, matcher: group.matcher, handler });
           continue;
@@ -794,7 +802,7 @@ export function computeDrift({ home, plan, manifest, settings, settingsProblem, 
   const before = drift.length;
   const hookCheck = (script, expected, event = 'PreToolUse') => {
     const list = found[script];
-    if (expected && list.length === 0) add('hook-missing', script, `hook missing: ${script} is not in hooks.${event}`);
+    if (expected && list.length === 0) add('hook-missing', script, `hook missing: ${script} is not in hooks.${event}${script === 'owner-go-click' ? ' (click approvals fall back to typing the closing words)' : ''}`);
     else if (expected && list.length > 1) add('hook-duplicated', script, `hook duplicated: ${script} appears ${list.length} times in hooks.${event}`);
     else if (expected && !list[0].exact) add('hook-differs', script, `hook differs: the ${script} entry is not what install writes (path, matcher or timeout)`);
     else if (!expected && list.length > 0) add('hook-unexpected', script, `unexpected hook: ${script} is installed but this install omits it (--skip-file-guard)`);
@@ -802,6 +810,7 @@ export function computeDrift({ home, plan, manifest, settings, settingsProblem, 
   hookCheck('guard-git', true);
   hookCheck('guard-files', expectGuardFiles);
   hookCheck('owner-go', true, 'UserPromptSubmit');
+  hookCheck('owner-go-click', true, 'PostToolUse');
   hookCheck('update-notice', true, 'SessionStart');
   hookCheck('stack-dev-bind', true, 'PostToolUse');
   hookCheck('stack-session-end', true, 'SessionEnd');

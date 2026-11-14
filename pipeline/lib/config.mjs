@@ -35,6 +35,10 @@ export const DEFAULTS = deepFreeze({
   // owner adds human-approved / test-change-approved; 'chat' = no label and CI does not fail on those: the review skill stops
   // before the merge, asks in chat, and runs the merge when the owner says "merge".
   owner_approval: 'label',
+  // owner_go: click-to-approve (#261). click 'on' (default) = under owner_approval: chat the review skill may offer the owner's "merge" / "extra round" / rulings as a click on a choice dialog
+  // (`--ask` on `merge --dry-run` and `triage round-request|ruling-request`); the owner may still type. 'off' = typed words only. It can only switch clicks OFF: the Claude Code builds a click is trusted on
+  // are installed code, never this file. Needs `P owner-go approve-dialog-hooks` run once by the owner.
+  owner_go: { click: 'on' },
   default_branch: 'main',
   worktree_dir: '.worktrees',
   // worktrees: `pipeline worktrees prune`. mode 'report' (default) only reports; nothing is removed until 'on'.
@@ -87,8 +91,15 @@ export const DEFAULTS = deepFreeze({
   },
   review: {
     codex_model: 'gpt-6-astra',
-    effort: { low: 'medium', medium: 'medium', high: 'high', followup: 'medium' },
+    // low|medium|high: round 1 by the PR's risk; followup: every later round. small_fix: the effort of a fix-check round whose reviewed range is at most
+    // small_fix_lines changed lines, adds no new file and touches no sensitive path (also used for every non-protected round when the weekly Codex governor is soft).
+    // The review command refuses an --effort that is not the configured one for the round.
+    effort: { low: 'medium', medium: 'medium', high: 'high', followup: 'medium', small_fix: 'low', small_fix_lines: 40 },
     max_rounds: 2,
+    // Codex runs (rounds and second reviews the state records) one PR may use before a small fix-check goes to the substitute instead.
+    codex_round_budget: 6,
+    // The weekly Codex quota used, in percent (P codex-status): soft lowers every non-protected round to small_fix effort; hard sends small fix-checks to the substitute. Unreadable = off.
+    codex_budget: { soft: 75, hard: 90 },
     light_lane_max_lines: 50,
     // Who reviews after Codex when a PR is medium ONLY for its size (no hard-stop hit of any kind, no sensitive path): 'judge' (Sonnet) or 'fable'.
     size_only_medium_reviewer: 'judge',
@@ -99,6 +110,10 @@ export const DEFAULTS = deepFreeze({
     // A commit after the last review round that only ADDS lines to these files needs no new round (lib/docs-exempt.mjs).
     // Empty = off.
     docs_exempt_paths: [],
+    // The stand-in reviewer used for a round Codex refuses with a real quota error (plan 2026-11-11-codex-substitute-reviewer).
+    // mode: auto = use it, off = park as before. min_wait_minutes: 0 never waits for Codex; above 0, a reset that near is waited for instead
+    // (no substitute, the output says waitUntil). max_packet_mb: the evidence a substitute needs may not pass this size.
+    substitute: { mode: 'auto', min_wait_minutes: 0, max_packet_mb: 8 },
   },
   agent_log: 'docs/agent-log.md',
 });
@@ -121,9 +136,11 @@ export function requiredChecks(ci) {
   return [...new Set([...configured, ...guards, ...review])];
 }
 
-const EFFORTS = ['low', 'medium', 'high', 'xhigh'];
-const EFFORT_LANES = ['low', 'medium', 'high', 'followup'];
+// Lowest to highest: the order the stricter-of-two readers of review.effort compare in (review-round.mjs#strictestRouteConfig).
+export const EFFORTS = Object.freeze(['low', 'medium', 'high', 'xhigh']);
+export const EFFORT_LANES = Object.freeze(['low', 'medium', 'high', 'followup', 'small_fix']);
 const OWNER_APPROVALS = ['label', 'chat'];
+const OWNER_GO_CLICKS = ['on', 'off'];
 const PROVIDERS = ['vercel', 'github-deployments', 'other'];
 // Who owns the production smoke: a session or a CI workflow that posts the result on the merged PR.
 // `preview` and `production` are validated exactly as before, but the final gate and `pipeline merge` no longer read them;
@@ -160,10 +177,12 @@ export const SAFE_STEP = /^[A-Za-z0-9_.:-]+$/;
 // the PR ahead, the provider's own release of that PR, or the provider's own override.
 export const MERGE_HOLD_KEYS = ['hold_command', 'hold_release_command', 'hold_check_command'];
 export const BEHIND_BASE_MODES = Object.freeze(['update', 'disjoint']);
+export const SUBSTITUTE_MODES = Object.freeze(['auto', 'off']);
 
 // Allowed keys per mapping. Anything else is a typo (or a removed option) and is rejected.
 const KEYS = {
   top: [...Object.keys(DEFAULTS), 'project'],
+  owner_go: ['click'],
   worktrees: ['mode', 'protect', 'min_idle_hours', 'min_merged_hours', 'delete', 'archive', 'memory_dirs'],
   verify: ['full', 'quick', 'report', 'screenshots', 'expected_steps', 'skippable_steps', 'stop_queue_wait_minutes', 'after_fix', 'after_fix_steps_by_path', 'after_fix_never', 'max_parallel_full', 'max_load', 'max_load_wait_minutes', 'deferrable_steps', 'ci_proof', 'ci_proof_inputs', 'ci_proof_wait_minutes'],
   ci_proof: ['workflow', 'job', 'event', 'steps'],
@@ -176,7 +195,9 @@ const KEYS = {
   hard_stops: ['paths', 'patterns', 'auth_calls', 'disable_rules', 'report_only_rules', 'report_only_paths'],
   pattern: ['name', 'regex', 'paths'],
   integrity: ['test_globs'],
-  review: ['codex_model', 'effort', 'max_rounds', 'light_lane_max_lines', 'size_only_medium_reviewer', 'arbiter_always_paths', 'docs_exempt_paths'],
+  review: ['codex_model', 'effort', 'max_rounds', 'light_lane_max_lines', 'size_only_medium_reviewer', 'arbiter_always_paths', 'docs_exempt_paths', 'substitute', 'codex_round_budget', 'codex_budget'],
+  review_codex_budget: ['soft', 'hard'],
+  review_substitute: ['mode', 'min_wait_minutes', 'max_packet_mb'],
   smoke: ['path', 'status', 'contains', 'location_contains'],
 };
 
@@ -622,6 +643,9 @@ export function validateConfig(obj) {
   if (!['github', 'gate'].includes(config.enforcement)) errors.push('enforcement must be github|gate');
   if (!OWNER_APPROVALS.includes(config.owner_approval)) errors.push(`owner_approval must be ${OWNER_APPROVALS.join('|')}`);
 
+  const ownerGo = section(config, 'owner_go', errors);
+  if (ownerGo && !OWNER_GO_CLICKS.includes(ownerGo.click)) errors.push(`owner_go.click must be ${OWNER_GO_CLICKS.join('|')}`);
+
   const verify = section(config, 'verify', errors);
   if (verify) {
     if (!isStr(verify.full)) errors.push('verify.full is required (the full verify command)');
@@ -691,9 +715,28 @@ export function validateConfig(obj) {
     if (!isObj(review.effort)) errors.push('review.effort must be a mapping');
     else {
       for (const lane of Object.keys(review.effort)) {
-        if (!EFFORT_LANES.includes(lane)) errors.push(`unknown key: review.effort.${lane} (lanes are ${EFFORT_LANES.join('|')})`);
+        if (lane === 'small_fix_lines') {
+          if (!inRange(review.effort.small_fix_lines, 1, 10000)) errors.push('review.effort.small_fix_lines must be an integer 1..10000');
+        } else if (!EFFORT_LANES.includes(lane)) errors.push(`unknown key: review.effort.${lane} (lanes are ${EFFORT_LANES.join('|')}, plus small_fix_lines)`);
         else if (!EFFORTS.includes(review.effort[lane])) errors.push(`review.effort.${lane} must be one of ${EFFORTS.join('|')}`);
       }
+    }
+    if (!inRange(review.codex_round_budget, 1, 100)) errors.push('review.codex_round_budget must be an integer 1..100');
+    const cb = review.codex_budget;
+    if (!isObj(cb)) errors.push('review.codex_budget must be a mapping');
+    else {
+      unknownKeys(cb, KEYS.review_codex_budget, 'review.codex_budget.', errors);
+      if (!inRange(cb.soft, 1, 100)) errors.push('review.codex_budget.soft must be an integer 1..100');
+      if (!inRange(cb.hard, 1, 100)) errors.push('review.codex_budget.hard must be an integer 1..100');
+      else if (inRange(cb.soft, 1, 100) && cb.soft > cb.hard) errors.push('review.codex_budget.soft must not be above review.codex_budget.hard');
+    }
+    const sub = review.substitute;
+    if (!isObj(sub)) errors.push('review.substitute must be a mapping');
+    else {
+      unknownKeys(sub, KEYS.review_substitute, 'review.substitute.', errors);
+      if (!SUBSTITUTE_MODES.includes(sub.mode)) errors.push(`review.substitute.mode must be one of ${SUBSTITUTE_MODES.join('|')}`);
+      if (!inRange(sub.min_wait_minutes, 0, 720)) errors.push('review.substitute.min_wait_minutes must be an integer 0..720');
+      checkPosInt(sub.max_packet_mb, 'review.substitute.max_packet_mb', errors);
     }
   }
 

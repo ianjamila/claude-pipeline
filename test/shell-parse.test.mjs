@@ -1023,3 +1023,297 @@ test('subshell: set for a top-level ( group however the quotes around it are wri
   ];
   for (const c of no) assert.equal(simpleCommands(c).subshell, false, c);
 });
+
+// #269 R20: arithmetic holding something the parser does not read as the shell does is refused with the arithmetic reason (never lexed on as ordinary text)
+test('R20: in $(( )) and (( )), a ${…} the parser cannot span, a bare { in ${…} and a case pattern are refused as arithmetic', () => {
+  const notRefused = [];
+  for (const open of ['echo $((', '((']) {
+    for (const body of [
+      ' ${x:-\n0))} + 1 ', // R20-F1: newline in the ${…}
+      ' ${x:-<(:)0))} + 1 ', // <(
+      ' ${x:->(:)0))} + 1 ', // >(
+      ' ${x:-=(:)0))} + 1 ', // =(
+      ' ${x:-$(:)0))} + 1 ', // a $( inside
+      ' ${x:-{a} + 1 ', // R20-F3: a bare {
+      ' ${x:-${y:-{b}}} + 1 ',
+      ' case x in\n# note\n(a) 1 ', // R20-F2: the comment skip of the case-pattern reader
+      ' case x in (a) 1 ',
+    ]) {
+      const r = simpleCommands(open + body + '))');
+      if (!(r.truncated && /arithmetic/.test(r.refused ?? ''))) notRefused.push(open + body + '))');
+    }
+  }
+  assert.deepEqual(notRefused, [], 'these were not refused as arithmetic');
+  // plain arithmetic still reads
+  for (const c of ['echo $(( x + 1 ))', '(( i++ ))', 'echo $(( ${x:-1} + 1 ))', 'echo $(( ${x:-${y:-1}} + ${#z} ))', '(( ${x:-1} > 0 )) && echo y']) {
+    assert.equal(simpleCommands(c).truncated, false, c);
+  }
+});
+
+// #269 R21: a ${…} paramSpan declines is no command text (no comment, heredoc or newline in it); a (( does not read the outer line's heredoc; unmatched [ ] in arithmetic is refused
+test('R21: outside arithmetic, a declined ${…} holding a comment start, a << or a newline is refused; a plain one still parses', () => {
+  const notRefused = [];
+  for (const c of [
+    'echo ${x:-$(date) # $(date)}', // R21-F1 (a): `#` after a blank
+    'echo ${x:-$(date) <<\'E\'}', // (b): a heredoc opener
+    'echo ${x:-$(date) <<E}',
+    "cat <<'E' ${x:-$(true)\n$(date)}\nbody\nE", // (c): a newline with a heredoc pending
+    'echo ${x:-\nfoo}', // a newline alone is declined too
+    'echo ${x:-{a $(date) # b}}', // a bare { nests: still inside after the first }
+    'echo $(echo ${x:-$(a) ) # $(b)})', // a stray ) would end the outer $( ) early, hiding the rest from the lexer
+    'echo ${x:-$(a) (b # c) $(d)}', // a ( group inside keeps the tracking
+  ]) {
+    const r = simpleCommands(c);
+    if (!(r.truncated && r.refused)) notRefused.push(c);
+  }
+  assert.deepEqual(notRefused, [], 'these were not refused');
+  for (const c of ['echo ${x:-$(date)}', 'echo "${x:-$(date)}"', 'echo ${x:-$(date)} # a $(comment)', 'echo ${x:-$(date)}; echo ${y:-$(date)} b', 'echo a#b ${x:-$(date)#2}', 'echo ${x:-$(\n a # note\n)}', 'echo ${x:-(b)$(a)} # z']) {
+    const r = simpleCommands(c);
+    assert.equal(r.truncated, false, c);
+  }
+  assert.ok(argvs('echo ${x:-$(date)}').includes('date'));
+});
+
+test('R21: a (( or for (( with a newline in it does not read the heredoc pending on the outer line', () => {
+  const cp = 'cp /tmp/payload ~/.x/y';
+  for (const c of [
+    "cat <<'E'; (( 1 +\n$(" + cp + ')\nE\n ))\nbody\nE',
+    "cat <<'E'; for (( i=0; i<1;\n$(" + cp + ')\nE\n i++ )); do :; done\nbody\nE',
+  ]) assert.ok(argvs(c).includes(cp), c + ' => ' + JSON.stringify(argvs(c)));
+  assert.equal(simpleCommands("cat <<'E'\nbody\nE\n(( i++ ))").truncated, false);
+  assert.ok(argvs("cat <<'E'\nbody (not code)\nE\n(( i++ )); echo after").includes('echo after'));
+});
+
+test('R21: $(( )) and (( )) holding an unmatched [ or ] are refused as arithmetic; balanced brackets still read', () => {
+  const notRefused = [];
+  for (const open of ['echo $((', '((']) {
+    for (const body of [' 1 ] > out ', ' a[1 > out ', ' a[1] ] > out ', ' [ ']) {
+      const r = simpleCommands(open + body + '))');
+      if (!(r.truncated && /arithmetic/.test(r.refused ?? ''))) notRefused.push(open + body + '))');
+    }
+  }
+  assert.deepEqual(notRefused, [], 'these were not refused as arithmetic');
+  for (const c of ['echo $(( a[1] + 2 ))', '(( a[i] > 0 )) && echo y', 'echo $(( a[b[1]] + 1 ))']) assert.equal(simpleCommands(c).truncated, false, c);
+});
+
+test('R21: the arithmetic refusal names its causes', () => {
+  const r = simpleCommands('echo $(( ${x:-$(date)} + 1 ))');
+  assert.ok(r.truncated);
+  for (const word of ['\\$\\( \\)', 'newline', 'process substitution', 'case', 'unmatched']) assert.match(r.refused, new RegExp(word));
+});
+
+// #269 R22: a case inside a declined ${…}; brackets counted per region; a bare { nests in ${…}; heredocs and newlines in array literals and assignment subscripts
+test('R22-B1: a case statement inside a declined ${…} is refused (it has comments and reads heredocs the shell does not see there); case outside still parses', () => {
+  const cp = 'd=.clau; cp /tmp/payload ~/${d}de/settings.json';
+  const notRefused = [];
+  for (const c of [
+    'echo ${x:-$(true); case x in # $(' + cp + ')}', // after `;`
+    'echo ${x:-$(true) | case x in # $(' + cp + ')}', // after `|`
+    'echo ${x:-$(true) && case x in # $(' + cp + ')}', // after `&&`
+    'echo ${x:-$(true); (case x in # $(' + cp + ')}', // the subshell `(` path
+    "cat <<'E' ${x:-$(true); case x in\n$(" + cp + ')}\nbody\nE', // a pending heredoc read at the newline in the case gap
+    'echo ${x:-$(true); case x in\n a) $(' + cp + ');; esac}',
+  ]) {
+    const r = simpleCommands(c);
+    if (!(r.truncated && r.refused)) notRefused.push(c);
+  }
+  assert.deepEqual(notRefused, [], 'these were not refused');
+  assert.match(simpleCommands('echo ${x:-$(true); case x in # c\n}').refused, /case/);
+  for (const c of ['case x in a) echo hi;; esac', 'echo ${x:-$(date)}; case x in # note\n a) echo hi;; esac', 'echo ${x:-$(case y in a) echo 1;; esac)}']) {
+    assert.equal(simpleCommands(c).truncated, false, c);
+  }
+});
+
+test('R22-F1: brackets in arithmetic are counted per region, so a bracket inside a nested ${…} or $( ) never balances one outside', () => {
+  const notRefused = [];
+  for (const open of ['echo $((', '((']) {
+    for (const body of [
+      ' ${x:-[} 1 ] > out ', // [ inside the expansion, ] outside
+      ' [ ${x:-]} 1 > out ', // [ outside, ] inside
+      ' $(echo [) 1 ] > out ', // the same through a nested $( )
+      ' [ $(echo ]) 1 > out ',
+      ' ${x:-${y:-[}} 1 ] > out ',
+    ]) {
+      const r = simpleCommands(open + body + '))');
+      if (!(r.truncated && /arithmetic/.test(r.refused ?? ''))) notRefused.push(open + body + '))');
+    }
+  }
+  assert.deepEqual(notRefused, [], 'these were not refused as arithmetic');
+  for (const c of ['echo $(( ${arr[1]} + 1 ))', 'echo $(( ${#arr[@]} ))', '(( ${a[i]} > 0 )) && echo y', 'echo $(( a[${i}] + 1 ))', 'echo $(( a[${b[1]}] + 1 ))', 'echo $(( $(wc -l <f) + 1 ))', 'echo $(( $(echo a[1]) + 1 ))']) {
+    assert.equal(simpleCommands(c).truncated, false, c);
+  }
+});
+
+test('R22-F2: a ${…} holding a bare { goes the nesting path: zsh closes it at a later }, so a comment or a substitution after the first } is inside the word', () => {
+  const notRefused = [];
+  for (const c of [
+    'echo ${x:-{} # $(touch ran)}',
+    'echo ${x:-{} # $(touch ran)}; true',
+    "cat <<'E' ${x:-{}\n$(touch ran)}\nbody\nE",
+    'echo ${x:-$(true) ${y:-{} # $(touch ran)}}',
+  ]) {
+    const r = simpleCommands(c);
+    if (!(r.truncated && r.refused)) notRefused.push(c);
+  }
+  assert.deepEqual(notRefused, [], 'these were not refused');
+  for (const c of ['echo ${x:-{}}', 'echo ${x:-{}} # $(touch ran)', 'echo ${x:-{a,b}}', 'echo ${x:-{a,b}} # $(touch ran)', 'echo ${{ expr }}', 'echo ${x:-{a}b} c', 'f() { echo ${x:-{}}; }']) {
+    assert.equal(simpleCommands(c).truncated, false, c);
+  }
+  assert.deepEqual(argvs('echo ${x:-{}} # $(touch ran)'), ['echo ${x:-{}}']); // (a real comment after the closed expansion)
+});
+
+test('R22-F3: a newline inside a NAME=( … ) array literal or a glob group while a heredoc is pending is refused; without a pending heredoc it parses', () => {
+  const notRefused = [];
+  for (const c of [
+    "cat <<'E' >/dev/null; a=(\nx\nE\n)\ntouch ran\nE\n",
+    "cat <<'E' >/dev/null; a+=(\nx\nE\n)\ntouch ran\nE\n",
+    "cat <<'E'; ls *(\n.)\nbody\nE",
+  ]) {
+    const r = simpleCommands(c);
+    if (!(r.truncated && r.refused)) notRefused.push(c);
+  }
+  assert.deepEqual(notRefused, [], 'these were not refused');
+  assert.ok(argvs('a=(\nx\ny\n)\ntouch ran').includes('touch ran'));
+  assert.equal(simpleCommands('a=(\nx\ny\n)\ntouch ran').truncated, false);
+  assert.equal(simpleCommands("cat <<'E'\nbody\nE\na=(\nx\ny\n)\ntouch ran").truncated, false);
+  assert.ok(argvs("cat <<'E'\nbody\nE\na=(\nx\ny\n)\ntouch ran").includes('touch ran'));
+  assert.equal(simpleCommands("cat <<'E'; a=(x y)\nbody\nE\ntouch ran").truncated, false);
+});
+
+test('R22-F4: a newline inside an unclosed NAME[ … of an assignment word while a heredoc is pending is refused (bash reads the subscript across it)', () => {
+  const notRefused = [];
+  for (const c of [
+    "cat <<'E' >/dev/null; a[0\n+$(touch ran)]=1\nE\ntrue\n",
+    "cat <<'E' >/dev/null; a[0\n+1]=1\nE\ntrue\n",
+    "cat <<'E' >/dev/null; x=1 a[0\n+1]=1\nE\ntrue\n",
+  ]) {
+    const r = simpleCommands(c);
+    if (!(r.truncated && r.refused)) notRefused.push(c);
+  }
+  assert.deepEqual(notRefused, [], 'these were not refused');
+  for (const c of ["cat <<'E'\nbody\nE\na[0]=1\ntouch ran", "cat <<'E' > f; a[0]=1\nbody\nE\ntouch ran", 'a[0\n+1]=1\ntouch ran', "cat <<'E'\nbody [not a subscript\nE\ntouch ran"]) {
+    assert.equal(simpleCommands(c).truncated, false, c);
+  }
+});
+
+// #269 R23: a declined ${ in a case pattern; the subscript check over the whole logical line; nested $( ) regions in arithmetic; one-pass subscript scan
+test('R23-F1: a ${…} that paramSpan declines inside a case pattern is refused (its ) is no end of the pattern); an ordinary ${…} pattern still parses', () => {
+  const cp = 'd=.clau; cp /tmp/payload ~/${d}de/settings.json';
+  const notRefused = [];
+  for (const c of [
+    'case x in ${y:-{) # $(' + cp + ')}}) true;; esac',
+    'case x in ${y:-{) # $(' + cp + ')}}) true;; esac # tail',
+    'case x in a|${y:-$(true)) # $(' + cp + ')}) true;; esac',
+  ]) {
+    const r = simpleCommands(c);
+    if (!(r.truncated && r.refused)) notRefused.push(c);
+  }
+  assert.deepEqual(notRefused, [], 'these were not refused');
+  for (const c of ['case x in ${y:-a}) echo hi;; esac', 'case x in a|${y}) echo hi;; esac', 'case "$x" in ${y:-a}|b) echo hi;; esac']) {
+    assert.equal(simpleCommands(c).truncated, false, c);
+  }
+});
+
+test('R23-B1 / R23-F2: the unclosed-subscript check joins continuations and reads the whole logical line, not the current segment; a subscript newline earlier on the line counts too', () => {
+  const cp = 'd=.clau; cp /tmp/payload ~/${d}de/settings.json';
+  const notRefused = [];
+  for (const c of [
+    "cat <<'E' >/dev/null; a\\\n[0\n+$(" + cp + ')]=1\nE\ntrue\n', // continuation between the name and [
+    "cat <<'E' >/dev/null; a\\\r\n[0\n+$(" + cp + ')]=1\nE\ntrue\n',
+    "cat <<'E' >/dev/null; a[0;\n+$(" + cp + ')]=1\nE\ntrue\n', // ; & | ) inside the subscript before the newline
+    "cat <<'E' >/dev/null; a[0&&\n+$(" + cp + ')]=1\nE\ntrue\n',
+    "cat <<'E' >/dev/null; a[0|\n+$(" + cp + ')]=1\nE\ntrue\n',
+    "cat <<'E' >/dev/null; a[0)\n+$(" + cp + ')]=1\nE\ntrue\n',
+    "a[0; cat <<'E' >/dev/null\n+$(" + cp + ')]=1\nE\ntrue\n', // the heredoc is opened after the ;
+    "a[0\nb; cat <<'E' >/dev/null\n+$(" + cp + ')]=1\nE\ntrue\n', // the subscript newline came on an earlier line
+  ]) {
+    const r = simpleCommands(c);
+    if (!(r.truncated && r.refused)) notRefused.push(c);
+  }
+  assert.deepEqual(notRefused, [], 'these were not refused');
+  for (const c of ["cat <<'E' > f; a[0]=1\nbody\nE\ntouch ran", "cat <<'E' > f; a\\\n[0]=1\nbody\nE\ntouch ran", "cat <<'E'; echo a[1]; echo b;\nbody\nE\ntouch ran", 'a[0\n+1]=1\ntouch ran']) {
+    assert.equal(simpleCommands(c).truncated, false, c);
+  }
+});
+
+test('R23-F3: arithmetic holding a nested $( ) with a case, a #, a << or a newline is not proven arithmetic (the shell does not count its parentheses like the raw count does)', () => {
+  const notRefused = [];
+  for (const open of ['echo $((', '((']) {
+    for (const body of [
+      ' $(case x in a) echo ${x:-(} [ ;; esac) ] > out ',
+      ' $(echo hi # ) ${x:-(}\n) [ ) ] > out ',
+      ' $(cat <<E\nx )\nE\n echo ${x:-(} [ ) ] > out ',
+      ' $(echo a; case x in a) echo ;; esac; echo ${x:-(} [) ] > out ',
+    ]) {
+      const r = simpleCommands(open + body + '))');
+      if (!(r.truncated && r.refused)) notRefused.push(open + body + '))');
+    }
+  }
+  assert.deepEqual(notRefused, [], 'these were not refused');
+  for (const c of ['echo $(( $(echo a[1]) + 1 ))', 'echo $(( $(wc -l <f) + 1 ))', '(( $(echo a[1]) > 0 )) && echo y', 'echo $(( $(echo $(echo 1)) + 1 ))']) {
+    assert.equal(simpleCommands(c).truncated, false, c);
+  }
+});
+
+test('R23-F4: the unclosed-subscript scan is one pass: a ~4000-char line of nested closed name[ openers with a heredoc pending parses fast', () => {
+  const line = 'a[ '.repeat(1000) + ']'.repeat(1000);
+  const cmd = "cat <<'E' > f; " + line + '\nbody\nE\ntouch ran';
+  const t0 = performance.now();
+  const r = simpleCommands(cmd);
+  const ms = performance.now() - t0;
+  assert.ok(ms < 200, 'took ' + ms + ' ms');
+  assert.equal(typeof r.truncated, 'boolean');
+});
+
+// #269 R24: the subscript check runs at every newline the lexer consumes (case-gap, array literal) and reads the line the LEXER ended, not a raw-text guess
+test('R24-B1 / R24-F1: a newline consumed by a case-pattern gap, a quoted string or an array literal after a subscript opener, or after a line ending in an escaped backslash / a comment ending in a backslash, is refused with a heredoc pending', () => {
+  const cp = 'd=.clau; cp /tmp/payload ~/${d}de/settings.json';
+  const tail = '\n+$(' + cp + ')]=1\nE\ntrue\n';
+  const notRefused = [];
+  for (const c of [
+    "cat <<'E' >/dev/null; a[0; case x in " + tail, // R24-B1: the newline goes through caseGap (note the blank after `in`)
+    "cat <<'E' >/dev/null; a[0; case x in\n+$(" + cp + ')]=1\nE\ntrue\n',
+    "cat <<'E' >/dev/null; a[0 \"x\ny\"" + tail, // R24-F1a: a newline in a quote after the opener
+    "cat <<'E' >/dev/null; a[0 'x\ny'" + tail,
+    "a[0 \"x\ny\" <<'E'" + tail, // (same simple command)
+    "x=1 a[0 'x\ny' <<'E'" + tail,
+    "cat <<'E' >/dev/null; a[0 b=(x\ny)" + tail, // R24-F1a: a newline in an array literal after the opener
+    "a[0 b=(x\ny); cat <<'E' >/dev/null" + tail,
+    "a[0 b=(x\ny) <<'E'" + tail,
+    "echo x\\\\\na[0 <<'E'" + tail, // R24-F1b: the previous line ends in an escaped backslash (a real line end)
+    "echo x\\\\\na[0; cat <<'E' >/dev/null" + tail,
+    "# c\\\na[0 <<'E'" + tail, // R24-F1b: a comment ending in a backslash ends its line
+    "# c\\\na[0; cat <<'E' >/dev/null" + tail,
+    "echo hi # c\\\na[0; cat <<'E' >/dev/null" + tail,
+  ]) {
+    const r = simpleCommands(c);
+    if (!(r.truncated && r.refused)) notRefused.push(c);
+  }
+  assert.deepEqual(notRefused, [], 'these were not refused');
+  // a real continuation still joins the lines; ordinary lines after the name are fine
+  for (const c of ["echo x\\\\\na[0]=1 <<'E'\nbody\nE\ntouch ran", "# c\\\necho hi <<'E'\nbody\nE\ntouch ran", "cat <<'E'; case x in \nbody\nE\n a) true;; esac"]) {
+    assert.equal(simpleCommands(c).truncated, false, c);
+  }
+});
+
+test('R24-F2: many short lines ending in an escaped backslash, or comment lines ending in a backslash, parse in linear time (no per-newline walk back over the whole text)', () => {
+  for (const unit of ['ab\\\\\n', '# c\\\n']) {
+    const cmd = unit.repeat(40000) + 'true\n';
+    const { r, ms } = cpuTimed(() => simpleCommands(cmd));
+    assert.ok(ms < 1500, JSON.stringify(unit) + ' took ' + ms + ' ms');
+    assert.equal(typeof r.truncated, 'boolean');
+  }
+});
+
+test('R24-F3: the sticky refusal (an earlier line holds a `name[` the guard cannot prove closed) says so, and the advice fits it', async () => {
+  const { refusalAdvice } = await import('../pipeline/hooks/lib/shell-parse.mjs');
+  const r = simpleCommands("arr[$i]=1\ncat <<'E'\nbody\nE\ntouch ran");
+  assert.equal(r.truncated, true);
+  assert.match(r.refused, /earlier line/);
+  assert.match(r.refused, /name\[/);
+  assert.match(refusalAdvice(r.refused), /separate command|its own line/);
+  assert.doesNotMatch(refusalAdvice(r.refused), /before the command that opens the here-document/);
+  // the same-line refusal keeps its own text
+  const same = simpleCommands("cat <<'E' >/dev/null; a[0\n+1]=1\nE\ntrue\n");
+  assert.match(same.refused, /while a here-document is pending on the line/);
+});

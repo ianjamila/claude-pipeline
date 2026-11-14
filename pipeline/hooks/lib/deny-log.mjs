@@ -31,6 +31,9 @@ const REASON_CODES = [
   ['inline-string', /was given a string that contains a guarded command/],
   ['force', /force/i],
   ['plugin-cache', /plugin/],
+  // #295: two fail-closed gates of the files guard that read as "protected" before; counted apart, to measure how often each fires
+  ['heredoc-expansion', /heredoc whose text contains an expansion that can evaluate/],
+  ['arith', /holds an arithmetic context/],
   ['protected', /protected pipeline file|refers to a protected|PIPELINE_ADMIN/],
   ['script-blocked', /would run a blocked command|would run:/],
   ['budget', /too complex|too long|time budget|deadline/],

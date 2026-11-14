@@ -12,6 +12,7 @@ import { createFakeGh, pipelineYml, REPO_VIEW } from './helpers/fakegh-env.mjs';
 import { DEFAULTS, validateConfig } from '../pipeline/lib/config.mjs';
 import { parseYaml } from '../pipeline/lib/yaml.mjs';
 import { contentHash } from '../pipeline/lib/git.mjs';
+import { addOrigin, breakOrigin } from './helpers/origin.mjs';
 import { isDocPath } from '../pipeline/lib/doc-paths.mjs';
 import { isUniversalHardStopPath } from '../pipeline/lib/hardstops.mjs';
 import { docsExemptFrom } from '../pipeline/lib/docs-exempt.mjs';
@@ -92,6 +93,29 @@ test('several commits after the round, all documents-only, are exempt', (t) => {
   w.append(LEDGER, row(3));
   w.repo.commit('two');
   assert.equal(w.exempt().exempt, true);
+});
+
+// The merge-base check measures from the trusted default branch (risk.mjs#trustedDefaultBranch, #448): a working-tree default_branch edit cannot move it; only a clone whose
+// anchor is the working tree itself (an origin remote that answers nothing) reads the config value.
+test('the merge-base check uses the trusted default branch under a working-tree default_branch edit', (t) => {
+  const w = world(t);
+  addOrigin(t, w.repo);
+  w.repo.git(['branch', 'evil', 'HEAD']); // the edit names a branch that holds the reviewed head: measured from it, the round's hash could never match
+  w.append(LEDGER, row(2));
+  w.repo.commit('ledger row');
+  const r = w.exempt({ ...baseline(), default_branch: 'evil' });
+  assert.equal(r.exempt, true, r.reason);
+});
+
+test('under an untrusted anchor (origin remote, no origin/HEAD, ls-remote fails) the merge-base check reads the config value', (t) => {
+  const w = world(t);
+  addOrigin(t, w.repo, { head: false });
+  breakOrigin(w.repo);
+  w.append(LEDGER, row(2));
+  w.repo.commit('ledger row');
+  assert.equal(w.exempt(baseline()).exempt, true);
+  // the config value is the only anchor left, and this one resolves nowhere: refused, never a manufactured base
+  refused(w.exempt({ ...baseline(), default_branch: 'no-such-branch' }), /could not be checked/);
 });
 
 // ---- refusals ---------------------------------------------------------------------------------------------------------

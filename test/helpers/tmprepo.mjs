@@ -33,7 +33,15 @@ process.on('exit', () => {
 
 // Returns { dir, write(rel, content), rm(rel), commit(msg) -> sha, branch(name), checkout(ref), git(args), cleanup() }.
 // branch(name) creates AND switches to the branch. git(args) returns raw stdout and throws on a non-zero exit.
-export function createTmpRepo() {
+// highEffort: every review.effort the config can pick is `high` (written into .claude/pipeline.yml unless it sets `effort:` itself), so the `--effort high` the review
+// tests pass is always the configured effort (codex-review refuses any other; the effort rule has its own tests: test/cli-codex-review-effort.test.mjs).
+const HIGH_EFFORT = '  effort: {low: high, medium: high, high: high, followup: high, small_fix: high}\n';
+const withHighEffort = (yml) => {
+  if (typeof yml !== 'string' || /^ {2}effort:/m.test(yml)) return yml;
+  return /^review:[ \t]*\n/m.test(yml) ? yml.replace(/^review:[ \t]*\n/m, (m) => m + HIGH_EFFORT) : `${yml}${yml.endsWith('\n') ? '' : '\n'}review:\n${HIGH_EFFORT}`;
+};
+
+export function createTmpRepo({ highEffort = false } = {}) {
   const dir = realpathSync.native(mkdtempSync(join(tmpdir(), 'cp-git-')));
   made.add(dir);
 
@@ -62,7 +70,7 @@ export function createTmpRepo() {
     write(rel, content) {
       const abs = join(dir, rel);
       mkdirSync(dirname(abs), { recursive: true });
-      writeFileSync(abs, content);
+      writeFileSync(abs, highEffort && rel === '.claude/pipeline.yml' ? withHighEffort(content) : content);
     },
     rm(rel) {
       rmSync(join(dir, rel), { recursive: true, force: true });

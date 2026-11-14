@@ -11,6 +11,7 @@ import { pipelineStateDir } from './repo.mjs';
 import { withLock } from './locks.mjs';
 import { agentLogLine } from './render.mjs';
 import { isInside } from './paths.mjs';
+import { isSubstituteRound } from './state.mjs';
 
 // Same text as pipeline/templates/agent-log.md, which `pipeline-setup` copies into new projects.
 export const AGENT_LOG_HEADER = [
@@ -98,6 +99,13 @@ export function countFixVerifyCalls(state) {
   return (state?.rounds ?? []).filter((r) => r?.arbiter?.brief === 'fix-verify' && r.arbiter.proofOk === true).length;
 }
 
+// How many reviews a Claude stand-in gave for Codex: its rounds, plus its second reviews (a Codex second review is not one).
+export function countSubstituteCalls(state) {
+  const rounds = state?.rounds ?? [];
+  const second = rounds.flatMap((r) => r?.items ?? []).filter((i) => typeof i?.secondReview?.by === "string" && i.secondReview.by.startsWith("substitute")).length;
+  return rounds.filter(isSubstituteRound).length + second;
+}
+
 export function buildAgentLogLine({ state, pr, title, outcome, now = new Date() }) {
   return agentLogLine({
     date: now.toISOString().slice(0, 10),
@@ -107,6 +115,7 @@ export function buildAgentLogLine({ state, pr, title, outcome, now = new Date() 
     rounds: state?.rounds?.length ?? 0,
     arbiterCalls: countArbiterCalls(state),
     fixVerifyCalls: countFixVerifyCalls(state),
+    substituteCalls: countSubstituteCalls(state),
     outcome,
   });
 }

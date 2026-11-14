@@ -85,7 +85,7 @@ const allowedWithMention = (cmd, extra) => {
 
 // Work-tree changes earlier on the line, a bulk writer, a background job: judged exactly as `bash run.sh` is, with and without a mention of a guarded operation
 const TREE_CHANGES = ['git checkout other', 'git switch -c y', 'git pull --ff-only', 'git merge x', 'git rebase x', 'git stash pop', 'git reset --hard', 'git cherry-pick abc', 'git apply p.diff', 'git clone u d', 'git -C sub checkout x',
-  'git worktree add -b x .worktrees/x origin/main && cd .worktrees/x'];
+  'git worktree add -b x .worktrees/x origin/main && cd ./.worktrees/x'];
 const BULK = ['tar xf a.tgz', 'unzip a.zip', 'patch -p1 -i p.diff', 'rsync -a src/ .'];
 const PLAIN = { 'run.sh': 'echo hi\n' };
 // the verdict of `PRELUDE && npm test` equals the verdict of `PRELUDE && bash run.sh` (both guards, with and without a guarded mention); returns the git and files verdicts of the npm line
@@ -114,7 +114,7 @@ test('t2 a git work tree change earlier on the line does not make `npm test` unk
     if (!b.includes(' -C ')) sameAsPlainScript(b); // (a manager starts in the shell's directory, not in a `git -C` one: the plain script is also looked up there)
   }
   for (const b of TREE_CHANGES.filter((x) => !x.includes('worktree'))) allowedWithMention(`${b} && npm test`); // (a mention alone is no reason: nothing was written)
-  allowed('git worktree add -b x .worktrees/x origin/main && cd .worktrees/x && npm ci');
+  allowed('git worktree add -b x .worktrees/x origin/main && cd ./.worktrees/x && npm ci');
   allowed('git pull --ff-only && npm run build');
 });
 test('t2 twins of the work tree changes: a guarded script, a literal write, a maybe-writer with a mention stay refused', () => {
@@ -128,7 +128,7 @@ test('t2 twins of the work tree changes: a guarded script, a literal write, a ma
     refusedWithMention(`${b} && cp x $T && npm test`); // (a copy to a place only known at run time may be package.json)
   }
   // a git worktree add of the directory the manager then runs in writes a package.json there: a maybe, refused with a mention (as for `bash run.sh` in it)
-  refusedWithMention('git worktree add -b x .worktrees/x origin/main && cd .worktrees/x && npm test');
+  refusedWithMention('git worktree add -b x .worktrees/x origin/main && cd ./.worktrees/x && npm test');
 });
 
 test('t2 a bulk writer earlier on the line does not make `npm test` unknown; its maybe-write + a mention does, as for a plain script', () => {
@@ -249,7 +249,7 @@ test('t2 (security) a package.json the line only MAY write does not hide the one
     git: git(cmd, { ...tree(sub, bad ? BAD_GIT : null) }, { cwd: '/work/repo/sub', ...o }),
     files: filesGuard(cmd, { ...tree(sub, bad ? BAD_FILES : null) }, { cwd: '/home/u/proj/sub', ...o }),
   });
-  for (const cmd of ['cp x $T && npm test', 'tar xf a.tgz && npm test', 'git worktree add -b x w origin/main && cd w && npm test']) {
+  for (const cmd of ['cp x $T && npm test', 'tar xf a.tgz && npm test', 'git worktree add -b x w origin/main && cd ./w && npm test']) {
     const bad = inSub(cmd.replace('cd w && ', ''), true);
     assert.equal(bad.git.decision, 'deny', `git: ${cmd} -> allowed`);
     assert.equal(bad.files.decision, 'deny', `files: ${cmd} -> allowed`);

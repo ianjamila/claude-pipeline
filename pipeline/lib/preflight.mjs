@@ -9,6 +9,7 @@ import { isClean } from './git.mjs';
 import { run, codexCommand } from './proc.mjs';
 import { createGitHub } from './github.mjs';
 import { claudeCodeStatus } from './claude-code-version.mjs';
+import { evaluateBashForFiles } from '../hooks/lib/files-policy.mjs';
 import { MIN_FABLE, readFloor, readableAllowedIds, standingBypasses } from './model-floor.mjs';
 
 const CODEX_TIMEOUT_MS = 15_000;
@@ -139,6 +140,17 @@ export async function runPreflight({ cwd, env = process.env, gh = createGitHub({
     warnings.push(`this terminal runs Claude Code ${claudeCode.running} but ${claudeCode.installed} is installed: restart it before a review's Fable pass`);
   }
 
+  // #161: the guard refuses a script an agent runs when the script's text spells the config-root path (even in a comment) and writes. The rule stays strict (no
+  // comment exemption), so say so BEFORE an agent is refused: run the guard on verify.quick from the repo root and carry its line-and-reword reason. Informational:
+  // it never changes canMerge, and a guard that cannot judge (any error) says nothing. (vendor --check has no loaded config here, so it does not run this.)
+  if (config.ok && typeof cfg?.verify?.quick === 'string') {
+    try {
+      const home = env.HOME || env.USERPROFILE || undefined;
+      const verdict = evaluateBashForFiles(cfg.verify.quick, { cwd: root, env, ...(home ? { home } : {}) });
+      if (verdict.decision === 'deny') warnings.push(`verify.quick (\`${cfg.verify.quick}\`) would be refused by the guard when an agent runs it: ${verdict.reason}`);
+    } catch { /* the guard could not judge it: nothing to warn about */ }
+  }
+
   // A standing owner allowance or a hold below MIN_FABLE lets a Fable proof through that the shipped floor would refuse: say so until it is cleared.
   // Informational like the build check: it never changes canMerge (an unreadable registry is for arbiter apply to report).
   try {
@@ -162,6 +174,12 @@ export async function runPreflight({ cwd, env = process.env, gh = createGitHub({
   if (off) reasons.push('PIPELINE_OFF=1 is set: the pipeline is switched off');
   reasons.push(...issueReasons('pipeline-pause', pause), ...issueReasons('pipeline-rollback', rollback));
   if (config.ok && !enforcementOk) reasons.push(protectionReason(enforcement));
+  // #430: the pipeline supports only GitHub's default branch as its main (the gate, the guard and branch protection all read it); a pipeline.yml naming another one is reported here and
+  // refused at the merge gate, with the fix. A config that did not load (cfg null) or a default branch GitHub did not answer for says nothing.
+  const defaultBranchMismatch = cfg && typeof enforcement.branch === 'string' && cfg.default_branch !== enforcement.branch
+    ? `pipeline.yml names default_branch "${cfg.default_branch}" but GitHub's default branch is "${enforcement.branch}": the pipeline supports only GitHub's default branch as its main — set default_branch: ${enforcement.branch}, or make ${cfg.default_branch} the default branch on GitHub`
+    : null;
+  if (defaultBranchMismatch !== null) reasons.push(defaultBranchMismatch);
 
   return {
     ok: config.ok && authed,
@@ -174,7 +192,7 @@ export async function runPreflight({ cwd, env = process.env, gh = createGitHub({
     codex: codexState,
     clean,
     claudeCode,
-    canMerge: config.ok && authed && !off && !pause.open && !rollback.open && enforcementOk,
+    canMerge: config.ok && authed && !off && !pause.open && !rollback.open && enforcementOk && defaultBranchMismatch === null,
     reasons,
     warnings,
   };

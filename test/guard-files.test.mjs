@@ -34,9 +34,15 @@ test('protectedRoots lists the pipeline files under <home>/.claude in POSIX form
     '/home/u/.claude/agents/judge.md',
     '/home/u/.claude/agents/arbiter.md',
     '/home/u/.claude/agents/arbiter-fix.md',
+    '/home/u/.claude/agents/substitute-opus.md',
+    '/home/u/.claude/agents/substitute-fable.md',
     '/home/u/.claude/pipeline',
     '/home/u/.claude/settings.json',
+    '/home/u/.claude/hooks', // (#261)
+    '/home/u/.claude/settings.local.json', // (#261)
     '/home/u/.claude/pipeline-state/owner-go',
+    '/home/u/.claude/pipeline-state/codex',
+    '/home/u/.codex/sessions',
   ]);
   assert.equal(protectedRoots('C:\\Users\\u\\')[0], 'C:/Users/u/.claude/skills/ship');
 });
@@ -47,6 +53,8 @@ const FILE_DENY = [
   ['Edit ship skill via ~', 'Edit', { file_path: '~/.claude/skills/ship/SKILL.md', old_string: 'a', new_string: 'b' }],
   ['Write arbiter agent', 'Write', { file_path: '/home/u/.claude/agents/arbiter.md', content: 'x' }],
   ['Write arbiter-fix agent', 'Write', { file_path: '/home/u/.claude/agents/arbiter-fix.md', content: 'x' }],
+  ['Write substitute-opus agent', 'Write', { file_path: '/home/u/.claude/agents/substitute-opus.md', content: 'x' }],
+  ['Edit substitute-fable agent via ~', 'Edit', { file_path: '~/.claude/agents/substitute-fable.md', old_string: 'a', new_string: 'b' }],
   ['Edit arbiter-fix agent via ~', 'Edit', { file_path: '~/.claude/agents/arbiter-fix.md', old_string: 'a', new_string: 'b' }],
   ['Edit installed hook', 'Edit', { file_path: '/home/u/.claude/pipeline/hooks/guard-git.mjs', old_string: 'a', new_string: 'b' }],
   ['Write global settings', 'Write', { file_path: '/home/u/.claude/settings.json', content: '{}' }],
@@ -981,7 +989,7 @@ test('#58 owner-go: running the recorder by hand (installed or a source copy) is
 // Phase 3b (Fable attacker pass on #107): review-complete trusts .review/state.json, so a repo's review state and the proofs beside it
 // are written only by the pipeline commands (their own process, which the hook never sees), in any checkout or worktree.
 test('Phase 3b: a repo\'s review state is protected from every write, wherever the checkout is', () => {
-  for (const p of ['/repo/.review/state.json', '.review/state.json', '/other/wt/.review/round-2/codex.json', '.review/round-1/model-proof.json', '.review/final-gate.json', '.review/preview-smoke.json', '.review/prod-before.json', '.review/published-baseline.json', '.review/published-baseline.json.123.tmp', '/other/wt/.review/published-baseline.json', '.review/state.json.123.tmp']) {
+  for (const p of ['/repo/.review/state.json', '.review/state.json', '/other/wt/.review/round-2/codex.json', '.review/round-1/model-proof.json', '.review/final-gate.json', '.review/preview-smoke.json', '.review/prod-before.json', '.review/published-baseline.json', '.review/published-baseline.json.123.tmp', '/other/wt/.review/published-baseline.json', '.review/state.json.123.tmp', '.review/substitute-attempts.json', '/repo/.review/substitute-attempts.json.9.tmp']) {
     assert.equal(file('Write', { file_path: p, content: '{}' }), 'deny', p);
     assert.equal(file('Edit', { file_path: p, old_string: 'a', new_string: 'b' }), 'deny', p);
   }
@@ -1242,6 +1250,9 @@ test('#128 R2-B1: ~/.claude-eaglewatch (any home-level .claude* folder) is a tra
     'rsync -a x/ /home/u/proj/.claude-eaglewatch/',
   ]) assert.equal(bash(cmd), 'allow', cmd);
   assert.equal(file('Edit', { file_path: '/repo/.claude/settings.local.json', old_string: 'a', new_string: 'b' }), 'allow');
+  // (#261: a permissions edit of the project's local settings stays allowed; one that adds hooks is denied, see guard-click-hooks.test.mjs)
+  assert.equal(file('Write', { file_path: '/repo/.claude/settings.local.json', content: '{"permissions":{"allow":["Bash(ls:*)"]}}' }), 'allow');
+  assert.equal(file('Write', { file_path: '/repo/.claude/settings.local.json', content: '{"hooks":{"PreToolUse":[]}}' }), 'deny');
 });
 
 // R2-B2: a wildcard segment is asked whether it can stand for ANY name that starts with .claude, not for two sample names.
@@ -1385,10 +1396,10 @@ test('#128 R4-B2/F2: a trailing zsh glob qualifier (/) does not hide the config 
   ]) assert.equal(bash(cmd, { env }), 'deny', cmd);
   for (const cmd of [
     'tar -xf x -C /tmp/out?(/)',
-    'tar -xf x -C /tmp/out(/)',
-    'tar -xf x -C /home/u/claude-config-old(/)',
     'rsync -a /tmp/f/ /home/u/claude-confi?-old(/)',
   ]) assert.equal(bash(cmd, { env }), 'allow', cmd);
+  // (R17 owner decision: the parser reads `(/)` as a command named `/`, a word that ends in a slash may be a directory (autocd): the directory is unknown)
+  for (const cmd of ['tar -xf x -C /tmp/out(/)', 'tar -xf x -C /home/u/claude-config-old(/)']) assert.equal(bash(cmd, { env }), 'deny', cmd);
 });
 
 // Codex finding 1: dropping a trailing (...) may only WIDEN the match; a real folder whose name ends in (...) is still that folder.
@@ -1859,7 +1870,9 @@ test('#128 R6-F1: program text naming a bare config root is refused whatever it 
     "python3 -c \"import shutil; shutil.rmtree('/mnt/home/u/claude-config')\"",
     "node -e \"require('fs').writeFileSync('/tmp/x',JSON.stringify({a:1}))\"",
     "python3 -c \"import shutil; shutil.rmtree('/repo/.claude/cache')\"",
-    "node -e \"require('fs').writeFileSync('.claude/settings.local.json','{}')\"",
+    // (#261 R2-F7: .claude/settings*.json can declare hooks, so an inline write to it is refused now — test/guard-click-hooks.test.mjs R2-F7;
+    // the point here, a repo's own .claude/ is not a config root, is kept with a file that declares nothing)
+    "node -e \"require('fs').writeFileSync('.claude/notes.json','{}')\"",
     "python3 -c \"import os,shutil; shutil.rmtree(os.path.join('/repo','.claude','cache'))\"",
   ]) assert.equal(bash(cmd, { env }), 'allow', cmd);
   // (a literal root that is not configured is just a folder)
@@ -1898,12 +1911,20 @@ test('#128 R7-F1: the home .claude folder spelled as a quoted piece with a path 
   ]) assert.equal(bash(cmd), 'deny', cmd);
 });
 
-test('#128 R7-F3: a repo path with a home word, and text naming no root, stay open', () => {
+test('#128 R7-F3: text naming no root stays open (the repo settings.local.json write moved to #269 R26-F3)', () => {
+  const env = { CLAUDE_CONFIG_DIR: '/home/u/claude-config' };
+  for (const cmd of [
+    "python3 -c \"print('x', 'a')\"",
+  ]) { assert.equal(bash(cmd, { env }), 'allow', cmd); assert.equal(bash(cmd), 'allow', cmd); }
+});
+
+test("#269 R26-F3: a run-time-built path to a repo's .claude/settings.local.json is refused (moved from the R7-F3 allow list)", () => {
   const env = { CLAUDE_CONFIG_DIR: '/home/u/claude-config' };
   for (const cmd of [
     "python3 -c \"import os; open(os.path.join('/home/u/repo', '.claude', 'settings.local.json'), 'w').write('{}')\"",
-    "python3 -c \"print('x', 'a')\"",
-  ]) { assert.equal(bash(cmd, { env }), 'allow', cmd); assert.equal(bash(cmd), 'allow', cmd); }
+    "node -e \"fs.writeFileSync(join(dir, '.claude', 'settings.local.json'), '{}')\"",
+    "node -e \"fs.writeFileSync(['..', '.claude', 'settings.local.json'].join('/'), '{}')\"",
+  ]) { assert.equal(bash(cmd, { env }), 'deny', cmd); assert.equal(bash(cmd), 'deny', cmd); }
 });
 
 // R5-F1: a wildcard root/projects segment with a literal folder below the project is the session folder the literal rule protects (mirrors TRANSCRIPT_BELOW).
@@ -1928,4 +1949,73 @@ test('#128 R5-F1: a glob root or projects segment followed by a literal session 
     'cp -R /tmp/forged/. ~/.cache/*/projects/-repo/abc',
     'cat ~/.claud?/projects/-repo/abc/subagents/agent-1.jsonl',
   ]) assert.equal(bash(cmd, { env }), 'allow', cmd);
+});
+
+// ---- cp #256: the substitute reviewer's evidence is written by pipeline commands only ------------------------------------------------------------
+
+test('#256 route.json, attempt folders, substitute packets and second-review inputs under .review/round-N are protected from every write; reading them is open', () => {
+  const names = [
+    'route.json', 'route-2nd-0a1b2c3d.json', 'attempt-0123456789abcdef/codex-raw.json', 'attempt-0123456789abcdef/prompt.md', 'substitute/diff.patch',
+    'substitute/rules/AGENTS.md', 'substitute-input.md', 'second-review-input.md', 'second-review-0a1b2c3d.md',
+  ];
+  for (const n of names) {
+    const p = `/repo/.review/round-2/${n}`;
+    assert.equal(file('Write', { file_path: p, content: '{}' }), 'deny', `Write ${n}`);
+    assert.equal(file('Edit', { file_path: p, old_string: 'a', new_string: 'b' }), 'deny', `Edit ${n}`);
+    for (const cmd of [`echo '{}' > ${p}`, `cp /tmp/forged.json ${p}`, `rm ${p}`, `tee ${p} < /tmp/x`]) assert.equal(bash(cmd), 'deny', cmd);
+    assert.equal(bash(`cat ${p}`), 'allow', `cat ${n}`);
+  }
+  // a hand-written route.json (plan test 17), relative and through a glob spelling of the folder
+  for (const cmd of [
+    'echo \'{"evidence":"quota"}\' > .review/round-1/route.json',
+    "printf '{}' > .review/round-1/route.json",
+    'cp /tmp/forged.json .rev*/round-1/route.json',
+    "sed -i 's/pending/quota/' .review/round-1/route.json",
+    'rm -rf .review/round-1/attempt-0123456789abcdef',
+  ]) assert.equal(bash(cmd), 'deny', cmd);
+});
+
+test('#256 the machine-wide Codex record and Codex\'s session logs are protected from every write; reading them stays open', () => {
+  const R = '/home/u/.claude/pipeline-state/codex';
+  const S = '/home/u/.codex/sessions';
+  for (const p of [`${R}/status.json`, `${S}/2026/11/11/rollout-a.jsonl`]) {
+    assert.equal(file('Write', { file_path: p, content: '{}' }), 'deny', p);
+    assert.equal(file('Edit', { file_path: p, old_string: 'a', new_string: 'b' }), 'deny', p);
+  }
+  for (const cmd of [
+    `echo '{}' > ${R}/status.json`, `cp /tmp/forged.json ${R}/status.json`, `rm -rf ${R}`, `rm ${R}/status.json`,
+    `cp /tmp/forged.jsonl ${S}/2026/11/11/rollout-a.jsonl`, `echo x >> ${S}/2026/11/11/rollout-a.jsonl`, `rm -rf ${S}`, 'rm -rf ~/.codex/sessions',
+    "echo '{}' > ~/.claude/pipeline-state/codex/status.json",
+  ]) assert.equal(bash(cmd), 'deny', cmd);
+  for (const cmd of [`cat ${R}/status.json`, `ls ${S}`, `grep token_count ${S}/2026/11/11/rollout-a.jsonl`, 'ls ~/.codex', 'cat ~/.codex/config.toml']) assert.equal(bash(cmd), 'allow', cmd);
+});
+
+test('#256 R5-B1 the ~/.codex folder itself is a protected reference: a recursive copy, move, remove or cd+relative write into it is denied, plain reads stay open', () => {
+  for (const cmd of [
+    'cp -R /tmp/forged/. ~/.codex', 'cp -r /tmp/forged/. /home/u/.codex/', 'cp -a /tmp/forged/sessions ~/.codex/',
+    'mv ~/.codex /tmp/x && mv /tmp/forged ~/.codex', 'rm -rf ~/.codex', 'rsync -a /tmp/forged/ ~/.codex/',
+    'cd ~/.codex && cp -R /tmp/forged/sessions .', 'cd /home/u/.codex && tar -xf /tmp/forged.tar',
+    // R6-F1: the same with a home prefix only known at run time
+    'cp -R /tmp/forged/. "$(echo ~)/.codex"', 'rsync -a /tmp/forged/ "$(printenv HOME)/.codex/"', 'tar -xf /tmp/forged.tar -C `echo ~`/.codex',
+    'mv "$(echo ~)/.codex" /tmp/x && mv /tmp/forged "$(echo ~)/.codex"', 'cp -R /tmp/forged/. $H/.codex', 'rsync -a /tmp/forged/ $H/.codex/',
+    'mv $H/.codex /tmp/x && mv /tmp/forged $H/.codex', 'rm -rf "$(echo ~)/.codex"',
+    // R6-F1 hardening: the same folder spelled with `.`, `//` or `x/..` segments
+    'cp -R /tmp/forged/. $H/.codex/.', 'cp -R /tmp/forged/. $H/./.codex', 'rsync -a /tmp/forged/ "$(echo ~)/.codex/./"', 'cp -R /tmp/forged/. $H/.codex/x/..',
+    'tar -xf /tmp/f.tar -C "$(echo ~)//.codex//"',
+    // R6-F1 hardening: nesting deeper than any fixed collapse count
+    `cp -R /tmp/f/. $H/.codex/` + 'a/'.repeat(30) + '../'.repeat(30),
+  ]) assert.equal(bash(cmd), 'deny', cmd);
+  for (const cmd of ['ls ~/.codex', 'ls -la /home/u/.codex/', 'cat ~/.codex/config.toml', 'cd ~/.codex && ls', 'cd ~/.codex && cat config.toml', 'echo x > ~/.codex/notes.txt',
+    'ls "$(echo ~)/.codex"', 'cat "$H/.codex/sessions/x.jsonl"', 'cat "$H/.codex/config.toml"', 'codex --version', 'echo the .codex folder']) assert.equal(bash(cmd), 'allow', cmd);
+});
+
+test('#256 R5-F4 a Codex session-log write whose home prefix is only known at run time is denied', () => {
+  for (const cmd of [
+    `echo x >> "$(echo ~)/.codex/sessions/2026/11/12/rollout-x.jsonl"`,
+    'echo x >> "$(printenv HOME)/.codex/sessions/2026/11/12/rollout-x.jsonl"',
+    'echo x >> $H/.codex/sessions/2026/11/12/rollout-x.jsonl',
+    'cp /tmp/f.jsonl `echo ~`/.codex/sessions/2026/11/12/rollout-x.jsonl',
+    'bash -c "echo x >> $(echo ~)/.codex/sessions/2026/11/12/rollout-x.jsonl"',
+  ]) assert.equal(bash(cmd), 'deny', cmd);
+  for (const cmd of ['cat "$(echo ~)/.codex/sessions/2026/11/12/rollout-x.jsonl"', 'echo ".codex is a folder"']) assert.equal(bash(cmd), 'allow', cmd);
 });

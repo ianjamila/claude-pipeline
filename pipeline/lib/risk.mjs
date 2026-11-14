@@ -11,7 +11,7 @@ import { diffStats } from './diff.mjs';
 import { matchAny } from './glob.mjs';
 import { DEFAULTS, RISK_IGNORABLE_RULES, baseConfigAt } from './config.mjs';
 import { collectHardStops } from './hardstops.mjs';
-import { diffFiles, mergeBase, reviewBaseRef } from './git.mjs';
+import { diffFiles, hasOriginRemote, lsRemoteDefaultBranch, mergeBase, remoteDefaultBranch, reviewBaseRef } from './git.mjs';
 
 const LEVELS = ['low', 'medium', 'high'];
 export const SIZE_ONLY_NOTE = 'medium for size only: Sonnet judge (review.size_only_medium_reviewer)';
@@ -165,36 +165,107 @@ export function reviewLane({ level, files, config, sizeOnly = false }) {
   return { reviewer: reasons.length > 0 ? 'fable' : 'judge', reasons, sensitivePaths };
 }
 
+// The default branch every review-path decision measures "is this the default branch" against (#398, #377): what the remote calls its default, from a source a PR cannot edit
+// (anchor 'origin-head': refs/remotes/origin/HEAD; 'ls-remote': `git ls-remote --symref origin HEAD`, asked once per process, read-only, best effort, only when origin/HEAD is
+// absent). Only a clone with no origin remote at all (a local-only repo, a fixture) takes the working-tree config's default_branch, anchor 'config', trusted as before. A clone WITH
+// an origin remote that neither source answers for (offline, no origin/HEAD) also falls back to the config value, but that value is the PR's to edit (a working tree naming branch X
+// whose commit also names X would pass the mismatch check): it is returned as `untrusted` (a sentence naming the remedy), which trustedBase turns into the same refusal as a
+// mismatch (Fable, substitute off, a lane reason). admitRound's base rule (what counts as merged in from the default branch, the base a missing baseRefName falls back to),
+// review-complete's lane and rateBranch's stacked test all read it through here, so a PR that names its own base branch as default_branch cannot make that branch's commits
+// read as the default branch's. `remote`: the remote's default branch when it anchored, else null.
+// -> { branch, remote, anchor: 'origin-head'|'ls-remote'|'config', untrusted: string | null }
+export function trustedDefaultBranch(root, config) {
+  const o = { cwd: root };
+  const configured = config?.default_branch ?? DEFAULTS.default_branch; // a partial or null config is tolerated (Fable F7)
+  const fromHead = remoteDefaultBranch(o);
+  if (fromHead !== null) return { branch: fromHead, remote: fromHead, anchor: 'origin-head', untrusted: null };
+  if (!hasOriginRemote(o)) return { branch: configured, remote: null, anchor: 'config', untrusted: null };
+  const asked = lsRemoteDefaultBranch(o);
+  if (asked !== null) return { branch: asked, remote: asked, anchor: 'ls-remote', untrusted: null };
+  return {
+    branch: configured, remote: null, anchor: 'config',
+    untrusted: `the default branch could not be anchored on the remote (no refs/remotes/origin/HEAD, and \`git ls-remote --symref origin HEAD\` named none), so the working-tree config's default_branch ${JSON.stringify(configured)} is the only source and a PR can edit it (fix: \`git remote set-head origin -a\`)`,
+  };
+}
+
+// The ONE branch every content-hash and behind-base site measures from (#448): trustedDefaultBranch's answer, never the working-tree config's default_branch a PR can edit (that value is
+// only the fallback of a clone with no origin remote). `config` may be partial or null. -> string
+export function hashBranch(root, config) {
+  return trustedDefaultBranch(root, config).branch;
+}
+
+// The branch a PR is read as targeting, for the commands that fetch / measure a range from it: GitHub's answer (the PR's baseRefName) wins; without one, the TRUSTED default branch
+// (trustedDefaultBranch), never a config value a PR can edit. `untrusted` is set only when that fallback was needed AND its anchor is the working tree's (an origin remote that did
+// not answer): that branch is the PR's to choose and must not be what narrows a reviewed range, so the callers refuse (or keep what they recorded) instead of using it (S1).
+// -> { branch, untrusted: string | null }
+export function prBaseBranch(view, root, config) {
+  if (typeof view?.baseRefName === 'string' && view.baseRefName !== '') return { branch: view.baseRefName, untrusted: null };
+  const { branch, untrusted } = trustedDefaultBranch(root, config);
+  return { branch, untrusted };
+}
+
+// The trust anchor of the rating, shared with the status display (round-status.mjs#trustedBaseConfig): the default branch is what the remote calls its default
+// (refs/remotes/origin/HEAD; only a clone without that ref falls back to the working-tree config's default_branch, which a PR can edit), the trusted fork point is
+// mergeBase(origin/<that>, head), and the trusted config is the one committed there. A committed config that names a different default_branch than the
+// working-tree config is not fully trusted (the PR moved the anchor): its rules are still evaluated (a PR must not lose them by editing default_branch), but
+// the mismatch is returned apart as `mismatch` and the callers require Fable. `remoteDefault` is the remote's default branch when it was used and differs from
+// the working-tree config's default_branch (a repo where they disagree on purpose, or origin/HEAD is stale), else null.
+// `trustedFork` (optional): the fork point when the caller already has it (adm.rated.trustedFork, from rateBranch); the merge base is then not worked out again.
+// `mismatch` also carries an anchor that came from the working tree although an origin remote exists (trustedDefaultBranch's `untrusted`): the callers read it as "no trusted base config".
+// `untrusted` is trustedDefaultBranch's (a sentence, or null): it tells a mismatch whose ANCHOR is genuine (the remote named the default branch; only the working tree's default_branch moved, so
+// the fork point and the config committed there are the real ones) from one whose anchor the PR could have chosen (no trusted fork point at all).
+// -> { defaultBranch, anchor, untrusted, trustedFork, trusted: { ok: true, config } | { ok: false, reason }, mismatch: string | null, remoteDefault: string | null }. Throws what git throws (no fork point).
+export function trustedBase({ root, head, config, trustedFork: given }) {
+  const o = { cwd: root };
+  const { branch: defaultBranch, remote, anchor, untrusted } = trustedDefaultBranch(root, config);
+  const trustedFork = given ?? mergeBase(reviewBaseRef(defaultBranch, o), head, o);
+  const trusted = baseConfigAt(trustedFork, root);
+  const mismatch = untrusted ?? (trusted.ok && trusted.config.default_branch !== config.default_branch
+    ? `the config at the fork point names default_branch ${JSON.stringify(trusted.config.default_branch)}, the working-tree config ${JSON.stringify(config.default_branch)}`
+    : null);
+  return { defaultBranch, anchor, untrusted, trustedFork, trusted, mismatch, remoteDefault: remote !== null && remote !== config.default_branch ? remote : null };
+}
+
 // ---- the whole decision, under the working-tree config AND the trusted base config ------------------------------------------------
 //
 // One shared function for codex-review, review-complete and `pipeline risk`: the hard-stop scan, the level and the lane are worked out twice, once with
-// the working-tree config and once with the config COMMITTED at mergeBase(origin/<default_branch>, head) (never the PR's own base branch), and the
+// the working-tree config and once with the config COMMITTED at mergeBase(origin/<default branch>, head) (never the PR's own base branch), and the
 // stricter result wins on every axis. A PR (committed, staged or unstaged edits of .claude/pipeline.yml) therefore cannot loosen the thresholds, the
 // sensitive paths, the hard-stop paths, the ignore list or the size-only reviewer that rate it. The same config twice is evaluated once. A base config
 // that is missing, unreadable or invalid means the rating cannot be trusted: the reviewer is Fable, whatever the level.
-// A PR whose base branch is not the default branch (a stack) never gets the size-only judge: it is rated from the default branch's fork point by
-// review-complete, and from its own base by codex-review, and the two must agree.
+// The default branch that anchors the trusted fork point is never taken from the working-tree config (a PR can edit it): it is what the remote calls its
+// default (refs/remotes/origin/HEAD); only a clone without that ref falls back to the config's default_branch. Whichever is used, a config committed at
+// that fork point that names a different default_branch than the working-tree config is no trusted base config either (Fable).
+// A PR whose base branch is not the default branch (a stack) never gets the size-only judge, and is rated over BOTH ranges, its own (`base`, what
+// codex-review reviews) and the default branch's fork point (what review-complete rates, parent branch included), stricter wins: codex-review therefore
+// records the Fable round review-complete will ask for.
 // `base` (optional) is the ref the diff starts from; it defaults to the trusted fork point (codex-review passes its own, stack-aware, fork point).
 // Throws what the scan throws (the callers decide how to fail closed). -> {
 //   level, reasons, changedLines, fileCount, drivers, sizeOnly, reviewer, laneReasons, sensitivePaths, sizeOnlyJudge, note, hits, files, lightLane,
-//   trustedFork, baseConfig: { ok, reason? }, stacked }
-export async function rateBranch({ root, head, config, defaultBranch = config.default_branch, prBase = defaultBranch, base }) {
+//   trustedFork, baseConfig: { ok, reason? }, stacked, defaultBranch, anchor, untrusted }
+// `defaultBranch` is the trusted one and `anchor` where it came from ('origin-head' | 'ls-remote' | 'config', trustedDefaultBranch), for a caller that decides "is the PR's base the default branch" (admitRound's base rule, #398); `untrusted` (a sentence, or null) says the anchor came from the working tree although an origin remote exists:
+// such a default branch is the PR's to choose and must not narrow a reviewed range (S1).
+export async function rateBranch({ root, head, config, prBase, base }) {
   const o = { cwd: root };
-  const trustedFork = mergeBase(reviewBaseRef(defaultBranch, o), head, o);
+  const { defaultBranch, anchor, untrusted, trustedFork, trusted, mismatch, remoteDefault } = trustedBase({ root, head, config });
+  const trustedOk = trusted.ok && mismatch === null;
+  prBase ??= defaultBranch;
   const from = base ?? trustedFork;
   const stacked = prBase !== defaultBranch;
-  const trusted = baseConfigAt(trustedFork, root);
   const sameConfig = trusted.ok && JSON.stringify(trusted.config) === JSON.stringify(config);
   const configs = [['', config], ...(trusted.ok && !sameConfig ? [['base config: ', trusted.config]] : [])];
   const files = diffFiles(from, head, o);
+  const ranges = [['', from, files], ...(stacked && from !== trustedFork ? [['default branch range: ', trustedFork, diffFiles(trustedFork, head, o)]] : [])];
 
   const rated = [];
-  for (const [label, cfg] of configs) {
-    const hits = await collectHardStops({ base: from, head, cwd: root, config: cfg });
-    const risk = assessRisk({ files, hits, config: cfg });
-    const lane = reviewLane({ level: risk.level, files, config: cfg, sizeOnly: risk.sizeOnly && !stacked });
-    const lightLane = isLightLane({ level: risk.level, changedLines: risk.changedLines, hits, config: cfg });
-    rated.push({ label, hits, risk, lane, lightLane });
+  for (const [rangeLabel, rangeBase, rangeFiles] of ranges) {
+    for (const [label, cfg] of configs) {
+      const hits = await collectHardStops({ base: rangeBase, head, cwd: root, config: cfg });
+      const risk = assessRisk({ files: rangeFiles, hits, config: cfg });
+      const lane = reviewLane({ level: risk.level, files: rangeFiles, config: cfg, sizeOnly: risk.sizeOnly && !stacked });
+      const lightLane = isLightLane({ level: risk.level, changedLines: risk.changedLines, hits, config: cfg });
+      rated.push({ label: rangeLabel + label, hits, risk, lane, lightLane });
+    }
   }
 
   const level = LEVELS[Math.max(...rated.map((r) => LEVELS.indexOf(r.risk.level)))];
@@ -215,6 +286,11 @@ export async function rateBranch({ root, head, config, defaultBranch = config.de
   const sizeCandidate = rated.some((r) => r.risk.sizeOnly);
   if (stacked && sizeCandidate) reasons.push(`stacked PR: base is ${prBase} (no size-only judge)`);
   if (!trusted.ok) laneReasons.push(`trusted base config unreadable: ${trusted.reason}`);
+  else if (mismatch !== null) laneReasons.push(`trusted base config unreadable: ${mismatch}`);
+  if (remoteDefault !== null) {
+    const source = anchor === 'ls-remote' ? 'the remote (git ls-remote --symref origin HEAD; origin/HEAD is not set)' : 'origin/HEAD';
+    laneReasons.push(`${source} names default branch ${JSON.stringify(remoteDefault)}, pipeline.yml names ${JSON.stringify(config.default_branch)}: the rating follows ${anchor === 'ls-remote' ? 'the remote' : 'origin/HEAD'}. The pipeline supports only GitHub's default branch as its main: set default_branch: ${remoteDefault} in pipeline.yml, or make ${JSON.stringify(config.default_branch)} the default branch on GitHub (fix a stale origin/HEAD with \`git remote set-head origin -a\`)`);
+  }
   // The collector's own identity (hardstops.mjs makeSink: rule, file, line; the detail when there is no line), and the stricter status
   // (blocking > ownerMerge > report-only) when both configs report the same hit.
   const strength = (h) => (h?.advisory !== true ? 2 : h.ownerMerge === true ? 1 : 0);
@@ -228,13 +304,13 @@ export async function rateBranch({ root, head, config, defaultBranch = config.de
   const sensitivePaths = [...new Set(rated.flatMap((r) => r.lane.sensitivePaths))];
   // Size alone raised the level in at least one evaluation and every other evaluation is plainly low (no raw hit, no sensitive path): the judge
   // lane review-complete accepts. A low evaluation next to a size-only medium one (the configs disagree on a threshold) must not deadlock it.
-  const sizeOnly = trusted.ok && !stacked && rated.some((r) => r.risk.sizeOnly)
+  const sizeOnly = trustedOk && !stacked && rated.some((r) => r.risk.sizeOnly)
     && rated.every((r) => r.risk.sizeOnly || (r.risk.level === 'low' && r.hits.length === 0));
   // A medium that is not size-only overall (one evaluation's size-only judge lane next to another's low-with-a-hit) is Fable: review-complete
   // accepts a recorded medium on judge rounds only when sizeOnly is true, so the lane and that check must agree.
   const mediumNotSizeOnly = level === 'medium' && !sizeOnly;
   if (mediumNotSizeOnly && !laneReasons.some((x) => x.endsWith('medium risk'))) laneReasons.push('medium risk');
-  const reviewer = !trusted.ok || mediumNotSizeOnly || rated.some((r) => r.lane.reviewer === 'fable') ? 'fable' : 'judge';
+  const reviewer = !trustedOk || mediumNotSizeOnly || rated.some((r) => r.lane.reviewer === 'fable') ? 'fable' : 'judge';
   const sizeOnlyJudge = reviewer === 'judge' && rated.some((r) => r.lane.sizeOnlyJudge === true);
   const first = rated[0].risk;
   return {
@@ -244,6 +320,6 @@ export async function rateBranch({ root, head, config, defaultBranch = config.de
       path: rated.some((r) => r.risk.drivers.path), size: rated.some((r) => r.risk.drivers.size),
     },
     sizeOnly, reviewer, laneReasons, sensitivePaths, ...(sizeOnlyJudge ? { sizeOnlyJudge: true, note: SIZE_ONLY_NOTE } : {}),
-    hits, files, lightLane: rated.every((r) => r.lightLane), trustedFork, baseConfig: trusted.ok ? { ok: true, same: sameConfig } : { ok: false, reason: trusted.reason }, stacked,
+    hits, files, lightLane: rated.every((r) => r.lightLane), trustedFork, baseConfig: trustedOk ? { ok: true, same: sameConfig } : { ok: false, reason: trusted.ok ? mismatch : trusted.reason }, stacked, defaultBranch, anchor, untrusted,
   };
 }

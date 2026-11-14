@@ -26,13 +26,13 @@ verify:
   deferrable_steps: [tests]
   ci_proof:
     tests: { workflow: .github/workflows/ci.yml, job: "test (ubuntu)", event: pull_request }
-  ci_proof_wait_minutes: 25      # ubuntu job ~9 min + queue; past this the Mac runs the tests
+  ci_proof_wait_minutes: 45      # ubuntu job ~25-33 min (two Node passes) + queue, = the job timeout; past this the Mac runs the tests
 
 ci:
   required_checks: ["test (ubuntu)", "test (windows)"]
   guard_checks: false          # no pipeline-guards.yml here: every path is a hard-stop; the owner's chat "merge" is the approval
   e2e_label: null
-  draft_while_iterating: false
+  draft_while_iterating: true  # ci.yml skips drafts (both required checks read skipped) and lists ready_for_review + converted_to_draft
 
 merge:
   command: gh pr merge {pr} --squash --auto --delete-branch --match-head-commit {sha}
@@ -47,7 +47,26 @@ risk:
   # Plan 2026-11-12-cp-risk-rating R3-6: the files that decide what is safe (guards, hard stops, the final gate, the installer,
   # the risk rating and config itself, the review/merge commands, triage, owner grants, review proof, model floor) plus
   # anything that runs code on install or commit (package.json scripts, git hooks, the install wrappers), plus the glob/git/diff/
-  # doc-path helpers the rating and the final gate read (every file risk.mjs imports, a test checks the closure). A PR touching one stays high and gets Fable.
+  # doc-path helpers the rating and the final gate read (every file risk.mjs imports, a test checks the closure), plus the gate and
+  # review-proof inputs: a named set, listed BY HAND (nothing here is covered automatically): transcript, CI proof, integrity, guard
+  # provenance, state, review publish/context, locks, round status, the final-gate, triage and model-proof commands, the CLI entry, the
+  # libs finalgate.mjs imports directly, the GitHub, Codex, fix-verify, hold, CLI and lease-wiring helpers the review commands run on,
+  # the commands that read or write a gate input or proof (state, model-floor, verify, ci-wait, plus the risk, hardstops, integrity and
+  # preflight wrappers, and the owner-only, command-guard and ci-wait libs they use), the claude-ancestry and branch-protection libs, the
+  # comment command, the update command and its schedule lib (the set also covers the owner-only guards: update and the model-floor
+  # reset), and the render (markers, forgery defence), upstream, private-tmp and auto-update libs, plus the resumed-run guard (the run
+  # record and its cost shape check, the summary comment with its viewer-only filter, run-progress, and the checkpoint command, which
+  # stamps the mark; run-progress and run-record also write and carry it, and run-events holds the append-only run-resumed evidence the merge
+  # gate reads), the installer's scan, stacks and schedule libs with the jobs lib behind the install admission, the schedule
+  # builder, and the files that write the gate file (cmd-io) or word a merge result (merge-cleanup), plus the classification itself: the
+  # test that holds the exemption maps (DEPTH1_EXEMPT, COMMANDS_EXEMPT) and the import scanner it runs (test/fixtures/static-imports.mjs) are
+  # listed, so an edit to either rates high (they are depth-1 roots of their own check like every other literal .mjs entry).
+  # The model is roots and exemptions (issue #356, owner chose it 2026-11-13; round 7 dropped the leaf set). Every LITERAL .mjs path here is a
+  # depth-1 ROOT: a test checks that each file it imports directly is listed here or sits in the test's DEPTH1_EXEMPT map with a true one-line
+  # reason, so the list is closed under "a direct import of a listed file is listed or exempt". Globs are never roots. Only the import closure
+  # of risk.mjs is checked in full. Commands are checked by their own test: every .mjs file in pipeline/commands/ is listed here or sits in
+  # the test's COMMANDS_EXEMPT map with a true one-line reason (a new command fails until it is classified). A NEW import deeper than depth 1
+  # is NOT covered automatically: list the file by hand when it decides a gate or a proof.
   high_risk_paths: [
     "pipeline/hooks/**", "pipeline/lib/hardstops.mjs", "pipeline/lib/finalgate.mjs", "install.mjs", "pipeline/lib/installer.mjs",
     "pipeline/lib/risk.mjs", "pipeline/lib/config.mjs", "pipeline/commands/codex-review.mjs", "pipeline/commands/review-complete.mjs",
@@ -57,6 +76,36 @@ risk:
     "pipeline/lib/glob.mjs", "pipeline/lib/git.mjs", "pipeline/lib/diff.mjs", "pipeline/lib/doc-paths.mjs", "pipeline/lib/docs-exempt.mjs",
     "pipeline/lib/yaml.mjs", "pipeline/vendor/**", "pipeline/lib/proc.mjs", "pipeline/lib/paths.mjs", "pipeline/lib/resolution.mjs",
     "pipeline/lib/seams.mjs", "pipeline/lib/shell-words.mjs",
+    "pipeline/lib/transcript.mjs", "pipeline/lib/ci-proof.mjs", "pipeline/lib/integrity.mjs", "pipeline/lib/guard-provenance.mjs",
+    "pipeline/lib/state.mjs", "pipeline/lib/review-publish.mjs", "pipeline/lib/review-context.mjs", "pipeline/lib/locks.mjs",
+    "pipeline/lib/round-status.mjs", "pipeline/commands/final-gate.mjs", "pipeline/commands/triage.mjs", "pipeline/commands/model-proof.mjs",
+    "pipeline/bin/pipeline.mjs",
+    "pipeline/lib/closing-keywords.mjs", "pipeline/lib/preflight.mjs", "pipeline/lib/verify-steps.mjs", "pipeline/lib/merge-queue.mjs",
+    "pipeline/lib/github.mjs", "pipeline/lib/codex.mjs", "pipeline/lib/codex-exec.mjs", "pipeline/lib/fix-verify.mjs",
+    "pipeline/lib/hold.mjs", "pipeline/lib/merge-hold.mjs", "pipeline/lib/cli.mjs", "pipeline/lib/cmd-common.mjs",
+    "pipeline/lib/review-lease-wiring.mjs",
+    "pipeline/commands/state.mjs", "pipeline/commands/model-floor.mjs", "pipeline/lib/owner-only.mjs", "pipeline/commands/verify.mjs",
+    "pipeline/lib/command-guard.mjs", "pipeline/commands/ci-wait.mjs", "pipeline/lib/ci-wait.mjs",
+    "pipeline/commands/risk.mjs", "pipeline/commands/hardstops.mjs", "pipeline/commands/integrity.mjs", "pipeline/commands/preflight.mjs",
+    "pipeline/lib/claude-ancestry.mjs", "pipeline/lib/protection.mjs", "pipeline/commands/comment.mjs", "pipeline/commands/update.mjs",
+    "pipeline/lib/update-schedule.mjs",
+    "pipeline/lib/render.mjs", "pipeline/lib/upstream.mjs", "pipeline/lib/private-tmp.mjs", "pipeline/lib/auto-update.mjs",
+    "pipeline/lib/remote-url.mjs", "pipeline/lib/repo.mjs", "pipeline/lib/identity.mjs", "pipeline/lib/review-lease.mjs",
+    "pipeline/lib/queue-sweep.mjs", "pipeline/lib/run-events.mjs",
+    "pipeline/lib/run-record.mjs", "pipeline/lib/claude-code-version.mjs", "pipeline/lib/queue-route.mjs", "pipeline/lib/updatebranch.mjs",
+    "pipeline/lib/live-work-scan.mjs", "pipeline/lib/stacks/paths.mjs", "pipeline/lib/stacks/uninstall.mjs", "pipeline/lib/queue-sweep-schedule.mjs",
+    "pipeline/lib/summary-comment.mjs", "pipeline/lib/run-progress.mjs", "pipeline/commands/checkpoint.mjs",
+    "pipeline/lib/jobs.mjs", "pipeline/lib/run-cost.mjs",
+    "pipeline/lib/schedule.mjs", "pipeline/lib/cmd-io.mjs", "pipeline/lib/merge-cleanup.mjs",
+    "pipeline/lib/stacks/config.mjs", "pipeline/lib/stacks/result.mjs", "pipeline/lib/worktree-prune/live-sessions.mjs",
+    "pipeline/commands/summary.mjs", "pipeline/commands/queue-sweep.mjs", "pipeline/commands/merge-hold.mjs", "pipeline/commands/job.mjs", "pipeline/commands/update-branch.mjs", "pipeline/commands/redraft.mjs", "pipeline/commands/protect.mjs", "pipeline/commands/repo-move.mjs", "pipeline/commands/smoke.mjs", "pipeline/commands/followups.mjs", "pipeline/commands/artifacts.mjs", "pipeline/commands/vendor.mjs", "pipeline/commands/agent-log.mjs",
+    "pipeline/commands/cost.mjs",
+    "pipeline/lib/agentlog.mjs", "pipeline/lib/agentlog-close.mjs",
+    "pipeline/lib/click-ask.mjs", "pipeline/lib/local-branches.mjs", "pipeline/commands/owner-go.mjs",
+    "test/repo-risk-config.test.mjs", "test/fixtures/static-imports.mjs",
+    "pipeline/commands/substitute.mjs", "pipeline/commands/codex-status.mjs", "pipeline/lib/codex-session.mjs", "pipeline/lib/codex-usage.mjs",
+    "pipeline/lib/review-round.mjs", "pipeline/lib/review-route.mjs", "pipeline/lib/round-stats.mjs", "pipeline/lib/route-record.mjs",
+    "pipeline/lib/second-review-substitute.mjs", "pipeline/lib/substitute-proof.mjs",
     "install.sh", "install.ps1"]
   # Every path here is a hard stop (hard_stops.paths ["**"]), so every PR would rate high. These two rules no longer raise the
   # LEVEL (round-1 Codex effort, judge vs Fable); their hits still make the merge an owner item. Editing this file or other

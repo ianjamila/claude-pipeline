@@ -13,8 +13,11 @@ import { createGitHub, guardGh } from '../lib/github.mjs';
 import { matchAny } from '../lib/glob.mjs';
 import { docsExemptFrom } from '../lib/docs-exempt.mjs';
 import { readReviewGate } from '../lib/model-floor.mjs';
+import { wholePrOwed } from '../lib/review-route.mjs';
+import { roundStats } from '../lib/round-stats.mjs';
+import { hashBranch, prBaseBranch } from '../lib/risk.mjs';
 import { addRound, loadState, saveState, updateItems } from '../lib/state.mjs';
-import { arbiterFailures, countsTowardCap, finalIsReopenable, isOwnerRuled, isProtectedFinal, reviewedRoundCount, roundOutcome, staleFableRounds } from '../lib/triage.mjs';
+import { arbiterFailures, countsTowardCap, finalIsReopenable, isOwnerRuled, isProtectedFinal, reviewedRoundCount, roundOutcome, staleFableRounds, staleSubstituteFableRounds } from '../lib/triage.mjs';
 import { pastRoundHistoryProblem, publishTriage, readBaseline, readPublished, reviewContentHash, writeBaseline } from '../lib/review-publish.mjs';
 import {
   allItems, canonicalJson, currentContentHash, decidedItemsKey, findItem, findRound, followupsPending, newStaleDir, quarantineReviewDir, refreshBaseRef, requireState, reviewBaseRef,
@@ -37,8 +40,11 @@ export const meta = {
     'pipeline state discard-round --round R [--pr N] [--repo DIR]',
     '  -> drop an unpublished, trailing round R from the local state and move .review/round-R/ into .review/stale-<UTC time>/;',
     '     refused (exit 2) when the PR triage comment already holds round R, or (error round-has-verdict) when the round holds a second-review verdict',
-    'pipeline state outcome [--repo DIR]   -> roundOutcome + {clean, arbiterFailures, followupsPending, rounds, reviewedRounds, maxRounds}; exit 0 whether or not clean',
-    '  first fetches origin/<default_branch> (best effort: offline keeps the cached ref), so a PR updated from its base branch is not read as changed',
+    'pipeline state outcome [--repo DIR]   -> roundOutcome + {clean, arbiterFailures, followupsPending, rounds, reviewedRounds, maxRounds, roundStats: {rounds: [{n, items, byBucket}], reRaised, ruledReRaised}, wholePrOwed, nextRound:{round, base, wholePrOwed}[, base]}; exit 0 whether or not clean',
+    '  wholePrOwed: true (with base: the PR\'s merge base) when an Opus substitute round came before the PR\'s risk rose to high and no whole-PR round since: the next round must start at that base and reviews the whole PR',
+    '    (codex-review rejects any other base). nextRound.base is the base to pass (the merge base when wholePrOwed, else the last round\'s toHead); the effort and route of that round: pipeline codex-review --plan',
+    '  roundOutcome carries substituteRounds:[n] (rounds a Claude substitute reviewed first, while Codex was out of quota) and maxRisk (the highest risk the PR ever had: low|medium|high)',
+    '  first fetches the trusted default branch (GitHub\'s default; best effort: offline keeps the cached ref), so a PR updated from its base branch is not read as changed',
     '  grantedRound {k, grantId, head, quote}: the owner\'s open extra-round grant for the next counted round and the checked-out HEAD (chat mode, an owner',
     '  record younger than 24 h, not yet used) - it lifts reachedMax and effectiveMaxRounds by one; null otherwise. autoExtraOrdinal: the counted round the',
     '  automatic extra round took, or null',
@@ -48,13 +54,14 @@ export const meta = {
     '  -> a forced or Claude-ruled ACCEPT whose named file is empty or was not changed is still marked, with implementedVia \'other-files\': the next codex-review',
     '     round asks Codex to confirm it (round.confirmFixed) and review-complete waits for that round. Ordinary ACCEPTs get no such field',
     '  -> every mark records item.implementedAfterRound, the newest round number at that time (triage defer-fixes uses it to tell a fix made before the last reviewed round from a later one)',
-    '  -> exit 3 {ok:false, unavailable:true, reason:base-refresh} and nothing is marked when origin/<default_branch> cannot be fetched (offline, remote down) while the',
-    '     hash would be measured from it - also with no origin remote but a leftover origin/<default_branch> ref: a stale base would count the default branch\'s commits as the fix',
+    '  -> exit 3 {ok:false, unavailable:true, reason:base-refresh} and nothing is marked when the trusted default branch (GitHub\'s default) cannot be fetched (offline, remote down) while the',
+    '     hash would be measured from it - also with no origin remote but a leftover origin/<branch> ref: a stale base would count the default branch\'s commits as the fix',
     'pipeline state fable-refresh --pr N [--repo DIR]',
     '  -> {ok, round, staleRounds, scope: "whole-pr"}: opens an uncounted Fable-only round (no Codex, not counted against review.max_rounds, allowed past it and with no new commit) on the pushed head, so a Fable pass proven with',
-    '     a Fable older than MIN_FABLE (or the lower hold of model-floor reset --hold) is re-reviewed. Refused (exit 2) unless a proven Fable round is below that and no later whole-PR pass at or above it replaced it (error nothing-stale), every earlier round is finished',
+    '     a Fable older than MIN_FABLE (or the lower hold of model-floor reset --hold) is re-reviewed. Refused (exit 2) unless a proven Fable round - or a substitute-fable review that stood in for Codex - is below that and no later whole-PR pass at or above it replaced it (error nothing-stale), every earlier round is finished',
     '     (error unfinished-round: a Fable pass owed, an undecided, human-owed, unimplemented or newly accepted item), HEAD is the head of PR N on GitHub (error head-not-pushed; exit 3 when GitHub is unreachable)',
     '     and the content is what the last round reviewed, or only ledger rows were added since (review.docs_exempt_paths; the round then stays pinned at the last reviewed head) (error content-moved: run a normal codex-review round instead, its Fable pass already reads the whole PR). Then: arbiter needed --round R, the arbiter, arbiter apply',
+    '     the whole-PR range starts at the PR\'s merge base with its base branch at the time of the call (a base branch merged in since the last round moves it); when GitHub names no base branch and the default branch cannot be anchored on the remote (the working tree\'s default_branch is the PR\'s to edit) the fork point the last round recorded is kept instead',
     'pipeline state record-followup --id ID --url URL [--repo DIR]',
     'pipeline state set-outcome --outcome TEXT [--repo DIR]',
     'pipeline state past-round-grant --pr N --round n [--repo DIR]',
@@ -402,7 +409,7 @@ async function outcome(rest, ctx) {
   const root = resolveRepo(values, ctx);
   const { config } = await requireConfig(root);
   const state = requireState(root);
-  // Best effort: a stale origin/<default_branch> (after update-branch + a plain pull) only makes coverage look invalid; offline keeps the cached ref.
+  // Best effort: a stale origin/<trusted default branch> (after update-branch + a plain pull) only makes coverage look invalid; offline keeps the cached ref.
   refreshBaseRef(root, config);
   const hash = currentContentHash(root, config);
   // The owner's open extra-round grant for the next counted round, for the checked-out HEAD (chat mode only; codex-review is the authority).
@@ -411,9 +418,20 @@ async function outcome(rest, ctx) {
     ? (k) => ownerGrantedRounds({ repo: state.repo, pr: state.pr, k, anyHead: true }).map((r) => ({ grantId: grantIdOf(r), head: r.head, quote: r.prompt }))
     : undefined;
   const result = roundOutcome({ ...state, currentContentHash: hash }, { grants, head });
+  // A whole-PR round is owed: it starts at the PR's merge base (the default branch; codex-review judges a PR into another branch itself).
+  const owed = wholePrOwed(state);
+  let forkPoint = null;
+  if (owed) {
+    try {
+      forkPoint = mergeBase(reviewBaseRef(root, config), head, { cwd: root });
+    } catch (err) {
+      if (!(err instanceof GitError)) throw err;
+    }
+  }
+  const nextBase = owed && forkPoint !== null ? forkPoint : state.rounds.at(-1)?.toHead ?? null;
   return {
     exitCode: EXIT.OK,
-    output: { ok: true, ...result, arbiterFailures: arbiterFailures(state), followupsPending: followupsPending(state), currentContentHash: hash, rounds: state.rounds.length, reviewedRounds: reviewedRoundCount(state), maxRounds: state.maxRounds },
+    output: { ok: true, ...result, roundStats: roundStats(state), wholePrOwed: owed, ...(owed && forkPoint !== null ? { base: forkPoint } : {}), nextRound: { round: state.rounds.length + 1, base: nextBase, wholePrOwed: owed }, arbiterFailures: arbiterFailures(state), followupsPending: followupsPending(state), currentContentHash: hash, rounds: state.rounds.length, reviewedRounds: reviewedRoundCount(state), maxRounds: state.maxRounds },
   };
 }
 
@@ -502,7 +520,7 @@ async function markImplemented(rest, ctx) {
         throw new Fail(EXIT.USAGE, { ok: false, error: 'not-accepted', message: `${item.id} is not an accepted item, so it cannot be marked implemented` });
       }
     }
-    // The hash must be measured from a FRESH origin/<default_branch>: a stale one makes the hash differ merely because main's new commits
+    // The hash must be measured from a FRESH origin/<trusted default branch>: a stale one makes the hash differ merely because main's new commits
     // (merged into the PR by update-branch, pulled without a fetch of main) count as the PR's diff, and they would pass for the fix.
     // So this fails CLOSED (exit 3, nothing marked) whenever the base ref used is origin/<branch> and it was not refreshed in this call:
     // the fetch failed or timed out, or there is no origin remote but a leftover refs/remotes/origin/<branch>. Only a repo whose base
@@ -511,7 +529,7 @@ async function markImplemented(rest, ctx) {
     if (refresh.usesRemoteRef && !refresh.refreshed) {
       throw new Fail(EXIT.UNAVAILABLE, {
         ok: false, unavailable: true, reason: 'base-refresh',
-        message: `origin/${config.default_branch} could not be refreshed${refresh.reason ? ` (${refresh.reason})` : ''}, and a stale base would count the default branch's new commits as the fix: nothing was marked; retry when the remote is reachable`,
+        message: `origin/${hashBranch(root, config)} could not be refreshed${refresh.reason ? ` (${refresh.reason})` : ''}, and a stale base would count the default branch's new commits as the fix: nothing was marked; retry when the remote is reachable`,
       });
     }
     // An accepted item is only "implemented" by a change to the code: the branch content must differ from what the
@@ -630,14 +648,17 @@ async function fableRefresh(rest, ctx) {
       throw new Fail(EXIT.USAGE, { ok: false, error: 'state-pr-mismatch', message: `the review state belongs to PR #${state.pr}, not #${pr}` });
     }
     const gate = readReviewGate({ env: ctx.env ?? process.env });
-    const stale = staleFableRounds(state, gate);
+    // The arbiter's Fable passes below the floor, plus the substitute-fable reviews below it (a substitute stood in for Codex): one whole-PR Fable pass replaces both.
+    const staleByRound = new Map();
+    for (const e of [...staleFableRounds(state, gate), ...staleSubstituteFableRounds(state, gate)]) staleByRound.set(e.round, [...new Set([...(staleByRound.get(e.round) ?? []), ...e.models])].sort());
+    const stale = [...staleByRound].sort((a, b) => a[0] - b[0]).map(([round, models]) => ({ round, models }));
     if (stale.length === 0) {
       throw new Fail(EXIT.USAGE, { ok: false, error: 'nothing-stale', message: `no proven Fable round is below ${gate.threshold} (or a later whole-PR pass already replaced it): there is nothing to refresh` });
     }
     const last = state.rounds.at(-1);
     const o = { cwd: root };
     const head = headSha(o);
-    // As in state outcome: a stale origin/<default_branch> only makes the content look moved, and the refusal below says what to do then.
+    // As in state outcome: a stale origin/<trusted default branch> only makes the content look moved, and the refusal below says what to do then.
     refreshBaseRef(root, config);
     const hash = currentContentHash(root, config);
     const outcome = roundOutcome({ ...state, currentContentHash: hash });
@@ -670,8 +691,9 @@ async function fableRefresh(rest, ctx) {
     // The whole-PR range starts at the PR's merge base now (a base branch merged in since the last round moves it).
     let forkPoint = last.forkPoint ?? state.rounds[0]?.reviewBase;
     try {
-      const prBase = typeof view.baseRefName === 'string' && view.baseRefName !== '' ? view.baseRefName : config.default_branch;
-      forkPoint = mergeBase(reviewBaseRef(root, config, prBase), head, o);
+      // An untrusted anchor (GitHub named no base branch and the remote did not name the default one) is the PR's to choose: keep the fork point the last round recorded rather than let it move the range (S1).
+      const { branch: prBase, untrusted } = prBaseBranch(view, root, config);
+      if (untrusted === null) forkPoint = mergeBase(reviewBaseRef(root, config, prBase), head, o);
     } catch (err) {
       if (!(err instanceof GitError)) throw err;
     }
