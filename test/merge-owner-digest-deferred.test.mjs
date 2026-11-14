@@ -37,7 +37,9 @@ function world() {
   return s;
 }
 
-test('#417: a deferred step\'s fetch does not change the items digest: the dry run shows the digest the real final gate computes', async () => {
+// `queue`: the merge queue is on, where the behind-base check never reads the diff (the queue itself rebases), so the gate's first diff read
+// must not be left to a later check that runs after the deferred step's fetch (#422 R1-F1).
+for (const queue of [false, true]) test(`#417: a deferred step's fetch does not change the items digest: the dry run shows the digest the real final gate computes (merge queue ${queue ? 'on' : 'off'})`, async () => {
   const s = world();
   const { config } = await loadConfig(s.repo.dir);
   const git = (a) => s.repo.git(a).trim();
@@ -51,7 +53,7 @@ test('#417: a deferred step\'s fetch does not change the items digest: the dry r
     ...ciEntries(s, [{ id: 101, number: 5 }]),
     { match: `repos/acme/widgets/contents/\\.claude/pipeline\\.yml\\?ref=${s.baseTip}`, stdoutJson: ['file', 'base64', b64(chatYml())] },
     { match: '^pr view 12 --json state,headRefOid.*baseRefOid', stdoutJson: prReply },
-    ...ghEntries({ prHead: s.head, prFiles: s.prFiles, mergeStateStatus: 'CLEAN', baseOid: s.baseTip }),
+    ...ghEntries({ prHead: s.head, prFiles: s.prFiles, mergeStateStatus: 'CLEAN', baseOid: s.baseTip, queue }),
   ]);
 
   // The dry run first (no final-gate.json yet: it reports that blocker, but the live evaluation and its digest are there to read).

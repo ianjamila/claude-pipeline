@@ -805,6 +805,9 @@ export async function evaluateGate({ root, config, pr, gh, env, sleep = defaultS
   } catch (err) {
     hashError = String(err?.message ?? err);
   }
+  // The diff is taken once, here, against the same base as the content hash: a later check that reads it first would see the base AFTER a deferred
+  // verify step's `git fetch` (and the queue / BEHIND routes skip the read in behindBase), so the dry run and the real gate would scan different ranges (#417).
+  diff();
   let tree = '';
   try {
     tree = treeFingerprint(o);
