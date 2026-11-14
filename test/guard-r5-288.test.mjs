@@ -267,7 +267,7 @@ describe('R5-F2: rsync operands with a deletion flag', () => {
   ]);
   allows('F2', [
     ['--delete into a project directory, option after', 'rsync -a --delete /tmp/x/ ~/proj/out/ --timeout 30'],
-    ['no deletion flag', 'rsync -a /tmp/x/ ~/ --timeout 30'],
+    ['no deletion flag (the folder itself, not its contents: a contents merge is #300)', 'rsync -a /tmp/x ~/ --timeout 30'],
     ['--delete from a project directory to /tmp', 'rsync -a --delete ~/proj/out/ /tmp/y/ --timeout 30'],
     ['--delete between two project directories', 'rsync -a --delete -e ssh ~/proj/a/ ~/proj/b/'],
   ]);

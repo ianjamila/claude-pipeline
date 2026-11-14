@@ -625,7 +625,7 @@ describe('#288 R3 home and its parents', () => {
     ['cp /tmp/x ~/Desktop/', 'cp /tmp/x ~/Desktop/'],
     ['cp /tmp/x ~ (writes ~/x)', 'cp /tmp/x ~'],
     ['cp -r /tmp/x ~ (writes ~/x)', 'cp -r /tmp/x ~'],
-    ['rsync without --delete into home', 'rsync -a /tmp/x/ ~/'],
+    ['rsync without --delete into home (the folder itself, not its contents: a contents merge is #300)', 'rsync -a /tmp/x ~/'],
     ['cd ~', 'cd ~'],
     ['git -C ~ status', 'git -C ~ status'],
     ['mkdir ~/newdir', 'mkdir ~/newdir'],

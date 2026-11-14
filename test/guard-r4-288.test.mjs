@@ -49,8 +49,8 @@ describe('R4-B1 / item 6: rsync options read as expanded', () => {
     ['a name holding two words', 'D="-v --delete"; rsync -a $D /tmp/x/ ~/'],
   ]);
   allows('B1', [
-    ['a same-line name holding a harmless option', 'D=-v; rsync -a $D /tmp/x/ ~/'],
-    ['rsync -a into home (no delete)', 'rsync -a /tmp/x/ ~/'],
+    ['a same-line name holding a harmless option', 'D=-v; rsync -a $D /tmp/x ~/'],
+    ['rsync -a into home (no delete; the folder itself, not its contents: a contents merge is #300)', 'rsync -a /tmp/x ~/'],
     ['--delete into a project directory', 'D=--delete; rsync -a "$D" /tmp/x/ ~/proj/out/'],
     ['a run-time option into a project directory', 'rsync -a $OPT /tmp/x/ ~/proj/out/'],
   ]);
