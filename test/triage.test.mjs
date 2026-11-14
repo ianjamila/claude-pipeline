@@ -1641,9 +1641,14 @@ test('roundCapProblem owner grant: an open grant allows exactly the next counted
 // ---- #374 PR B: past the limit, a low-severity ACCEPT becomes a FOLLOW-UP (applyPostMaxDefault) -------------------------------------------------------
 
 const lowAccept = (over = {}) => item({ bucket: 'SUGGESTION', category: 'maintainability', final: settled('ACCEPT', 'arbiter'), ...over });
-const pm = (items, over = {}) => applyPostMaxDefault(items, { policy: 'follow-up', ordinal: 5, max: 3, ...over });
+// The severity context a caller builds (fix-verify.mjs#postMaxSettings): the review state, the round's number, the working-tree config, the reviewed diff's files and the trusted config.
+const PM_FILES = ['src/a.js', 'src/b.js', 'src/payroll/pay.js'].map((p) => ({ oldPath: p, newPath: p, path: p }));
+const PM_CONFIG = { risk: { high_risk_paths: ['src/payroll/**'] }, review: { arbiter_always_paths: [] } };
+const pmSeverity = (items, over = {}) => ({ state: { rounds: [round(5, items)], maxRounds: 3 }, round: 5, config: PM_CONFIG, files: PM_FILES, baseConfig: PM_CONFIG, ...over });
+// `severity: null` = a caller that gave none; an object overrides parts of the default context.
+const pm = (items, { severity, ...over } = {}) => applyPostMaxDefault(items, { policy: 'follow-up', ordinal: 5, max: 3, ...(severity === null ? {} : { severity: pmSeverity(items, severity) }), ...over });
 
-test('applyPostMaxDefault: within the limit, and the owner-granted round max + 1, nothing changes', () => {
+test('applyPostMaxDefault: within the limit, and the first round past it (max + 1: the automatic extra round), nothing changes', () => {
   const a = lowAccept();
   for (const ordinal of [1, 3, 4]) assert.deepEqual(pm([a], { ordinal }), [a], `ordinal ${ordinal}`);
   assert.deepEqual(pm([a], { ordinal: 5, policy: 'review' }), [a], 'policy review is off');
@@ -1684,6 +1689,42 @@ test('applyPostMaxDefault: pure (inputs untouched), and only a settled postMax F
   assert.equal(isPostMaxFinal(a), false);
   assert.equal(isPostMaxFinal({ ...out, final: { ...out.final, needsHuman: true } }), false);
   assert.equal(isPostMaxFinal({ ...out, final: { ...out.final, by: 'claude' } }), false);
+});
+
+test('applyPostMaxDefault: an owner grant after the automatic extra round (ordinal max + 2) IS coerced; the extra round itself (max + 1) is not', () => {
+  const rounds = [1, 2, 3].map((n) => round(n, [])).concat([round(4, [], 'h', { admission: 'auto-extra' }), round(5, [], 'h', { admission: 'owner' })]);
+  assert.equal(autoExtraOrdinal({ rounds, maxRounds: 3 }), 4);
+  assert.equal(pm([lowAccept()], { ordinal: 4 })[0].final.decision, 'ACCEPT', 'max + 1');
+  assert.equal(pm([lowAccept()], { ordinal: 5 })[0].final.decision, 'FOLLOW-UP', 'max + 2');
+});
+
+test('applyPostMaxDefault: the repo severity predicate decides: a file with an accepted BLOCKING or security item, a sensitive path (either config) and an out-of-diff location each stay ACCEPT', () => {
+  const stays = (items, over) => items.every((i, k) => pm(items, over)[k].final.decision === 'ACCEPT');
+  // src/a.js also holds an accepted BLOCKING (and a security SUGGESTION): the low SUGGESTION beside them is not coerced, one on another file is.
+  const low = lowAccept({ file: 'src/a.js' });
+  const blocking = item({ bucket: 'BLOCKING', category: 'logic', final: settled('ACCEPT', 'arbiter'), file: 'src/a.js' });
+  const sec = lowAccept({ category: 'security', file: 'src/b.js' });
+  const other = lowAccept({ file: 'src/b.js', category: 'docs' });
+  const [a1, , b1, b2] = pm([low, blocking, sec, other]);
+  assert.equal(a1.final.decision, 'ACCEPT', 'file of an accepted BLOCKING item');
+  assert.equal(b2.final.decision, 'ACCEPT', 'file of an accepted security item');
+  assert.equal(b1.final.decision, 'ACCEPT');
+  assert.equal(pm([lowAccept({ file: 'src/b.js' })])[0].final.decision, 'FOLLOW-UP', 'the same file with nothing accepted beside it is coerced');
+  // sensitive: the working-tree list, and the trusted one when the PR emptied its own
+  const pay = lowAccept({ file: 'src/payroll/pay.js' });
+  assert.equal(stays([pay], {}), true, 'working-tree sensitive path');
+  assert.equal(stays([pay], { severity: { config: { risk: { high_risk_paths: [] } } } }), true, 'trusted-only sensitive path');
+  // location: outside the diff, unresolved, ambiguous
+  for (const file of ['src/elsewhere.js', '', '../x.js', undefined]) assert.equal(stays([lowAccept({ file })], {}), true, String(file));
+  assert.equal(stays([lowAccept({ file: 'src/a.js' })], { severity: { files: [...PM_FILES, ...PM_FILES] } }), true, 'ambiguous');
+});
+
+test('applyPostMaxDefault: no severity context, an unreadable diff, or an unreadable config keeps the ACCEPT (fail closed)', () => {
+  const a = lowAccept();
+  assert.equal(pm([a], { severity: null })[0].final.decision, 'ACCEPT', 'no context given');
+  assert.equal(pm([a], { severity: { files: null } })[0].final.decision, 'ACCEPT', 'diff unreadable');
+  assert.equal(pm([a], { severity: { config: null } })[0].final.decision, 'ACCEPT', 'working-tree config unreadable');
+  assert.equal(pm([lowAccept()])[0].final.decision, 'FOLLOW-UP', 'the plain case still coerces');
 });
 
 test('postMaxPolicy: follow-up only when EVERY config says follow-up; review in either (or an unreadable config) turns it off', () => {

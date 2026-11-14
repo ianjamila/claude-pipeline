@@ -7,6 +7,7 @@
 // exploration it is asked for. Anything that is not clearly a fix round is `full`.
 import { applyPostMaxDefault, countsTowardCap, postMaxPolicy } from './triage.mjs';
 import { DEFAULTS, baseConfigAt, loadConfig } from './config.mjs';
+import { diffFiles } from './git.mjs';
 import { matchAny } from './glob.mjs';
 import { isDocPath } from './doc-paths.mjs';
 
@@ -61,22 +62,33 @@ export function fixRoundCandidate(state, round, { scope }) {
 // The 1-based ordinal of counted round n: how many counted rounds (triage.mjs#countsTowardCap) have a number up to and including n.
 export const countedOrdinal = (state, n) => (state?.rounds ?? []).filter((r) => countsTowardCap(r) && r.n <= n).length;
 
-// review.post_max_suggestions for the items of round `round` (#374 PR B): lib/triage.mjs#applyPostMaxDefault with the policy of the working-tree AND the fork-point config ('review' in either, or a
-// config that cannot be read, is off) and the round's counted ordinal. Reads no config at all unless the round is past max + 1. Callers: `arbiter apply` and `triage validate` (the judge); nobody else.
+// review.post_max_suggestions for the items of round `round` (#374 PR B): lib/triage.mjs#applyPostMaxDefault with the policy of the working-tree, the fork-point AND the trusted default-branch config
+// (round.trustedConfigSha, pinned on every round; 'review' in any, or a config that cannot be read, a missing or null pin included, is off: for a stacked PR the fork point is the unmerged parent's, which
+// the author controls) and the round's counted ordinal. `severity` carries what itemSeverity needs (the reviewed diff's files, the working-tree and the trusted config); a diff that cannot be read is null,
+// which keeps every ACCEPT. Reads no config at all unless the round is past max + 1. Callers: `arbiter apply` and `triage validate` (the judge); nobody else.
 export async function postMaxSettings({ state, round, root }) {
   const max = state?.maxRounds;
   if (!Number.isInteger(max)) return { policy: 'review' };
   const ordinal = countedOrdinal(state, round.n);
   if (ordinal <= max + 1) return { policy: 'review' };
   let configs;
+  let severity = null;
   try {
     const loaded = await loadConfig(root);
     const fork = baseConfigAt(round.forkPoint, root);
-    configs = [loaded.ok ? loaded.config : null, fork.ok ? fork.config : null];
+    const trusted = typeof round.trustedConfigSha === 'string' && round.trustedConfigSha !== '' ? baseConfigAt(round.trustedConfigSha, root) : { ok: false };
+    configs = [loaded.ok ? loaded.config : null, fork.ok ? fork.config : null, trusted.ok ? trusted.config : null];
+    if (postMaxPolicy(configs) === 'follow-up') {
+      let files = null;
+      try {
+        files = diffFiles(round.forkPoint, round.toHead, { cwd: root });
+      } catch { /* an unreadable diff: itemSeverity rates every item high, so nothing is converted */ }
+      severity = { state, round: round.n, config: configs[0], files, baseConfig: configs[2] };
+    }
   } catch {
     configs = [null];
   }
-  return { policy: postMaxPolicy(configs), ordinal, max };
+  return { policy: postMaxPolicy(configs), ordinal, max, severity };
 }
 export async function postMaxApply(items, ctx) {
   return applyPostMaxDefault(items, await postMaxSettings(ctx));

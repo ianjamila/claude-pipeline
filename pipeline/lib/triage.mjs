@@ -1299,23 +1299,40 @@ export function deferEligibility(state, config, files, { grants, grantGap, baseC
 }
 
 // ---- past the limit, a low-severity ACCEPT becomes a FOLLOW-UP (#374 PR B, review.post_max_suggestions) ------------------------------------------------
-// 'follow-up' only when EVERY config given (working tree, fork point) says so: 'review' in either, a config that cannot be read (null) or one without the key, is off.
+// 'follow-up' only when EVERY config given (working tree, fork point, trusted default branch) says so: 'review' in any, a config that cannot be read (null) or one without the key, is off.
 export const postMaxPolicy = (configs) => (Array.isArray(configs) && configs.length > 0 && configs.every((c) => c?.review?.post_max_suggestions === 'follow-up') ? 'follow-up' : 'review');
 
 // A settled FOLLOW-UP that applyPostMaxDefault made (final.postMax), still the judge's / arbiter's word (or a cached copy of it): not the owner's, not Claude's, not waiting for a human.
 export const isPostMaxFinal = (item) => isObject(item?.final?.postMax) && item.final.decision === 'FOLLOW-UP' && item.final.needsHuman !== true && !isProtectedFinal(item) && !isOwnerRuled(item);
 
 // `ordinal`: the counted ordinal of the round these items belong to (fix-verify.mjs#countedOrdinal; an uncounted round gets the counted rounds before it); `max`: review.max_rounds.
-// Only a round past max + 1 is touched: the round the owner granted (max + 1) keeps its ACCEPTs. Only an ACCEPT the judge or arbiter made on a SUGGESTION / WORTH_CONSIDERING item of a
-// low-severity category, not yet implemented; never a bug, security item or BLOCKING one, a test result, a cached copy, Claude's, the owner's or a forced final.
-export function applyPostMaxDefault(items, { policy, ordinal, max } = {}) {
+// Only a round past max + 1 is touched: the first round past the limit (the automatic extra round, or the owner's first grant when there was none) keeps its ACCEPTs; later owner-granted rounds are
+// affected. Only an ACCEPT the judge or arbiter made on a SUGGESTION / WORTH_CONSIDERING item that itemSeverity rates LOW (a low-severity category, a location that resolves to one file of the reviewed
+// diff, no accepted BLOCKING / security item in that file, no sensitive path under the working-tree or the trusted config), not yet implemented; never a bug, security item or BLOCKING one, a test
+// result, a cached copy, Claude's, the owner's or a forced final. `severity` = { state, round, config, files, baseConfig } as itemSeverity takes them (`round`: the number of the round `items` belong
+// to, whose items in `state` are replaced by `items` so this round's own accepts count); none given, an unreadable diff or config (null) or a config error (itemSeverity throws) keeps the ACCEPT.
+export function applyPostMaxDefault(items, { policy, ordinal, max, severity } = {}) {
   if (policy !== 'follow-up' || !Number.isInteger(ordinal) || !Number.isInteger(max) || ordinal <= max + 1) return items;
+  let view = null;
+  if (isObject(severity) && isObject(severity.state)) {
+    const ids = new Set(items.map((i) => i?.id));
+    view = { ...severity.state, rounds: (severity.state.rounds ?? []).map((r) => (r?.n === severity.round ? { ...r, items: [...(r.items ?? []).filter((i) => !ids.has(i?.id)), ...items] } : r)) };
+  }
+  const lowSeverity = (item) => {
+    if (view === null || !isObject(severity.config) || !isObject(severity.baseConfig)) return false;
+    try {
+      return itemSeverity(item, { state: view, config: severity.config, files: severity.files, baseConfig: severity.baseConfig }).level === 'low';
+    } catch {
+      return false;
+    }
+  };
   return items.map((item) => {
     const final = item?.final;
     if (!isObject(final) || final.decision !== 'ACCEPT' || final.needsHuman === true || !DEFERRABLE_BY.includes(final.by)) return item;
     if (item.implemented === true || isProtectedFinal(item) || isOwnerRuled(item)) return item;
     if (item.bucket !== 'SUGGESTION' && item.bucket !== 'WORTH_CONSIDERING') return item;
     if (!LOW_SEVERITY_CATEGORIES.includes(item.category)) return item;
+    if (!lowSeverity(item)) return item;
     return { ...structuredClone(item), final: { ...structuredClone(final), decision: 'FOLLOW-UP', postMax: { from: 'ACCEPT', by: final.by, ordinal, max }, reason: `past review.max_rounds (round ${ordinal}, limit ${max}): ${final.reason}` } };
   });
 }
