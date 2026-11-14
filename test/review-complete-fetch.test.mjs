@@ -13,8 +13,8 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
 import { createFakeGh, pipelineYml, REPO_VIEW } from './helpers/fakegh-env.mjs';
-import { assertExit } from './helpers/assert-exit.mjs';
 import { floorEnv } from './helpers/floor-env.mjs';
+import { assertExit } from './helpers/assert-exit.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const bin = join(here, '..', 'pipeline', 'bin', 'pipeline.mjs');
@@ -75,7 +75,7 @@ function world(t, { withOrigin = true, accept = false } = {}) {
     cli(args, env = {}) {
       const r = spawnSync(process.execPath, [bin, ...args], {
         cwd: repo.dir, encoding: 'utf8',
-        env: { ...process.env, ...fake.env, PIPELINE_CODEX: `node "${fakeCodex}"`, PIPELINE_LOCK_DIR: lockDir, ...floorEnv(), ...env },
+        env: { ...process.env, ...fake.env, PIPELINE_CODEX: `node "${fakeCodex}"`, PIPELINE_LOCK_DIR: lockDir, ...floorEnv(), ...env }, // floorEnv: an empty Codex home, so the weekly-quota governor never reads the real one (#429)
       });
       let json = null;
       try { json = r.stdout ? JSON.parse(r.stdout) : null; } catch { /* the assertion on json will say so */ }
