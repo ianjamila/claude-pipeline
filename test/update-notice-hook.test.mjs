@@ -24,7 +24,7 @@ function hook(content, { env = {}, raw = false, file, input = '{"hook_event_name
   const target = file ?? join(dir, 'update-status.json');
   if (content !== undefined) writeFileSync(target, raw ? content : `${JSON.stringify(content)}\n`);
   const started = Date.now();
-  const r = spawnSync(process.execPath, [HOOK], { encoding: 'utf8', input, env: { ...process.env, HOME: dir, USERPROFILE: dir, PIPELINE_UPDATE_STATUS_FILE: target, ...env }, timeout: 15_000 });
+  const r = spawnSync(process.execPath, [HOOK], { encoding: 'utf8', input, env: { ...process.env, HOME: dir, USERPROFILE: dir, PIPELINE_UPDATE_STATUS_FILE: target, PIPELINE_CODEX_STATUS_DIR: join(dir, 'no-codex-record'), ...env }, timeout: 15_000 });
   return { status: r.status, stdout: r.stdout, stderr: r.stderr, ms: Date.now() - started };
 }
 const base = { version: 1, checkedAt: '2026-11-11T10:00:00Z', installedSha: 'a'.repeat(40), mainSha: 'b'.repeat(40) };

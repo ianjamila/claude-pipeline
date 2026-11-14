@@ -143,7 +143,7 @@ test('every offending line is reported, and the problem names the exact rewrite'
 const findingsOf = () => ({ summary: 'Reviewed.', blocking: [], suggestions: [], worth_considering: [] });
 
 function world(t, body, { review = true } = {}) {
-  const repo = createTmpRepo();
+  const repo = createTmpRepo({ highEffort: true });
   t.after(() => repo.cleanup());
   const scratch = realpathSync.native(mkdtempSync(join(tmpdir(), 'cp-closing-')));
   t.after(() => rmSync(scratch, { recursive: true, force: true }));

@@ -8,7 +8,7 @@
 import { statSync } from 'node:fs';
 import { EXIT } from './cli.mjs';
 import { DEFAULTS, fill } from './config.mjs';
-import { GATE_FILE, GATE_MAX_AGE_MS, PR_FIELDS, evaluateGate, evaluateOwnerGo, gateRefusals, localContentHash, preMergeProblems, readReviewJson, waitBlockers } from './finalgate.mjs';
+import { GATE_FILE, GATE_MAX_AGE_MS, PR_FIELDS, evaluateGate, evaluateOwnerGo, gateRefusals, localContentHash, preMergeProblems, readReviewJson, substituteRouteProblem, waitBlockers } from './finalgate.mjs';
 import { classifyMergeCommand, commandTail } from './merge-cleanup.mjs';
 import { QueueRecordUnreadable, beginAttempt, confirmAttempt, endRecord, failingChecksOn, mayRequeue, noteRemoval, openRecord, queueRulesOf, queueWaitMs, readQueueRecord, reconcile, restoreHoldLabel, watchQueue } from './merge-queue.mjs';
 import { RESTORE_NOTE } from './hold.mjs';
@@ -62,6 +62,8 @@ export function gateFreshSince(gate, since) {
 // Before a re-queue on the --owner-go route: the live scan again, the owner's approval for what it found, and the blockers. Shared by `P merge` (its own watch)
 // and the queue sweep (an unattended re-queue), so both judge a re-queue exactly as the first enqueue was judged. `hold` = the lifted hold binding the record owns.
 export async function recheckOwnerGo({ root, config, pr, gh, env, head, repo, hold }) {
+  const substitute = substituteRouteProblem({ root, config, pr, route: 'owner-go' });
+  if (substitute !== null) return { ok: false, error: substitute.error, reasons: [substitute.reason] };
   const again = await evaluateOwnerGo({ root, config, pr, gh, env, queueMode: true });
   if (again.head !== head) return { ok: false, error: 'live-check', reasons: ['the worktree moved while the PR was queued'] };
   if (!again.ok) return { ok: false, error: 'live-check', reasons: again.checks.filter((c) => !c.ok).map((c) => `${c.name}: ${c.detail}`) };
@@ -75,6 +77,8 @@ export async function recheckOwnerGo({ root, config, pr, gh, env, head, repo, ho
 // for the owner, and the blockers. `P merge` (its own watch) calls it with the gate it holds; the queue sweep through recheckGatedRecorded below.
 // `evaluate` / `problemsOf` are test seams.
 export async function recheckGated({ root, config, pr, gh, env, gate, ownerApproved, ownerMergeReason, evaluate = evaluateGate, problemsOf = preMergeProblems }) {
+  const substitute = substituteRouteProblem({ root, config, pr, route: 'gated' });
+  if (substitute !== null) return { ok: false, error: substitute.error, reasons: [substitute.reason] };
   const fresh = await evaluate({ root, config, pr, gh, env, queueMode: true });
   const failed = fresh.checks.filter((c) => !c.ok);
   if (failed.length > 0) return { ok: false, error: 'live-check', reasons: failed.map((c) => `${c.name}: ${c.detail}`) };

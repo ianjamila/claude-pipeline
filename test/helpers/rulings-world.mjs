@@ -3,7 +3,7 @@
 import { addRound, emptyState } from '../../pipeline/lib/state.mjs';
 import { triageComment } from '../../pipeline/lib/render.mjs';
 import { REVIEW_COMPLETE_MARKER } from '../../pipeline/lib/review-marker.mjs';
-import { rulingsDigest } from '../../pipeline/lib/triage.mjs';
+import { rulingsDigest, substituteDigest, substituteSummary } from '../../pipeline/lib/triage.mjs';
 import { reviewContentHash } from '../../pipeline/lib/review-publish.mjs';
 
 const base = (over) => ({
@@ -28,13 +28,13 @@ export function rulingState({ hash, items = [], pr = 12, repo = 'acme/widgets', 
 }
 
 export const comment = (id, body, { login = 'me', at = '2026-11-05T10:00:00Z', updated = at } = {}) => ({ id, body, user: { login }, created_at: at, updated_at: updated });
-export const markerBody = ({ contentHash, head, base: b = '9'.repeat(40), digest = 'none', rounds = 1, stateHash = 'none' }) => {
+export const markerBody = ({ contentHash, head, base: b = '9'.repeat(40), digest = 'none', rounds = 1, stateHash = 'none', substituteDigest: subDigest = 'none', substitute = null, codexModel = 'gpt-x' }) => {
   // stateHash: the review state the marker was issued for (review-complete writes it); 'none' = a marker from before the field (omitted).
-  const rec = { contentHash, base: b, head, rounds, codexModel: 'gpt-x', modelProofDigest: null, ...(digest !== 'none' ? { rulingsDigest: digest } : {}), ...(stateHash !== 'none' ? { stateHash } : {}) };
+  const rec = { contentHash, base: b, head, rounds, codexModel, modelProofDigest: null, ...(digest !== 'none' ? { rulingsDigest: digest } : {}), ...(stateHash !== 'none' ? { stateHash } : {}), ...(subDigest !== 'none' ? { substitute, substituteDigest: subDigest } : {}) };
   return `${REVIEW_COMPLETE_MARKER}\nReview complete.\n\`\`\`json\n${JSON.stringify(rec)}\n\`\`\`\n`;
 };
 // What a finished review leaves on the PR: the triage comment with `state` and the marker for `hash` carrying the state's rulings digest (override with `marker`).
 export const publishedComments = (state, { hash, head, base: b, marker = {} } = {}) => [
   comment(1, triageComment(state)),
-  comment(2, markerBody({ contentHash: hash, head, base: b, digest: rulingsDigest(state), rounds: state.rounds.length, stateHash: reviewContentHash(state), ...marker }), { at: '2026-11-05T10:05:00Z' }),
+  comment(2, markerBody({ contentHash: hash, head, base: b, digest: rulingsDigest(state), rounds: state.rounds.length, stateHash: reviewContentHash(state), substituteDigest: substituteDigest(state), substitute: substituteSummary(state), ...marker }), { at: '2026-11-05T10:05:00Z' }),
 ];

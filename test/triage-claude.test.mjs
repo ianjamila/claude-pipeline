@@ -330,20 +330,20 @@ test('withStateVersion raises the version and never lowers it', () => {
   assert.equal(base.version, 1, 'the argument is not changed');
 });
 
-test('SUPPORTED_STATE_VERSION 3: a newer state is refused by loadState and decodeFromComment; 1, 2 (Claude ruling) and 3 (deferral) load', () => {
-  assert.equal(SUPPORTED_STATE_VERSION, 3);
+test('SUPPORTED_STATE_VERSION 4: a newer state is refused by loadState and decodeFromComment; 1, 2 (Claude ruling), 3 (deferral) and 4 (substitute) load', () => {
+  assert.equal(SUPPORTED_STATE_VERSION, 4);
   const dir = mkdtempSync(join(tmpdir(), 'cp-state-version-'));
   try {
     const base = emptyState({ repo: 'a/b', pr: 7, branch: 'x' });
     assert.equal(base.version, 1, 'ordinary states stay at 1');
-    for (const version of [1, 2, 3]) {
+    for (const version of [1, 2, 3, 4]) {
       saveState(dir, { ...base, version });
       assert.equal(loadState(dir).version, version);
       assert.equal(decodeFromComment(encodeForComment({ ...base, version })).version, version);
     }
-    saveState(dir, { ...base, version: 4 });
-    assert.throws(() => loadState(dir), /version 4.*supports.*3/);
-    assert.equal(decodeFromComment(encodeForComment({ ...base, version: 4 })), null);
+    saveState(dir, { ...base, version: 5 });
+    assert.throws(() => loadState(dir), /version 5.*supports.*4/);
+    assert.equal(decodeFromComment(encodeForComment({ ...base, version: 5 })), null);
     mkdirSync(join(dir, '.review'), { recursive: true });
     writeFileSync(join(dir, '.review', 'state.json'), JSON.stringify({ ...base, version: 99 }));
     assert.throws(() => loadState(dir), /newer/);
