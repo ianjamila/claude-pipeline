@@ -24,7 +24,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { toPosix, expandHome, isInside, samePath, drivePosix, transcriptRes, configDirOf, HOME_CONFIG_DIR_RE } from '../../lib/paths.mjs';
 import { UNDECIDABLE_HEREDOC, exitFollows, shapeAt, simpleCommands, commandName, scriptFileOf, scriptFeedsOf, startupFilesOf, startupVarsOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, sqlShellEscapes, sourcePathSearch, splicesOptions, spliceText, implicitBindsOf, MATCH_NAMES, ZSH_NAME_BINDERS, indirectExpansionOnLine, arithAssignedNames, refusalAdvice } from './shell-parse.mjs';
-import { flattenProgram, newWriteFrame, exportRecords, writtenTo, writtenCandidates, joinedReadings, writtenNamesIn, writeSignature, unmodelledBefore, sedArgsUnsafe, sedWriteTargets, sedInPlaceArg, awkArgsPure, sortArgsPure, flowStart, inFlow } from './line-writes.mjs';
+import { flattenProgram, newWriteFrame, exportRecords, writtenTo, writtenCandidates, joinedReadings, writtenNamesIn, writeSignature, unmodelledBefore, sedArgsUnsafe, sedWriteTargets, sedInPlaceArg, awkArgsPure, sortArgsPure, flowStart, inFlow, mayNotRun } from './line-writes.mjs';
 import { ZSH_MODIFIED, zshModifiedNames, scriptCandidates, execLineOf, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, countScript, countReading, substitute, GuardLimit, execLinesOf, paramReadings, readingsOf, UNKNOWN_WORD, assigningDefaults, spliceLines } from './script-candidates.mjs';
 import { SETS_BY_NAME } from './git-policy.mjs';
 
@@ -3285,6 +3285,42 @@ function rsyncFlags(argv, ctx, raw) {
   return out;
 }
 
+// #478 R1-F1: is every name that the words of this rsync command hold given its value once, by a command that surely runs before it? (`N=-n; rsync -a --delete $N SRC ~/`: yes. `[ -n "$DRY" ] && N=-n`, an
+// if / loop / group / subshell / pipe stage / background job, a second assignment, a prefix of the rsync command itself (the shell expands the word first), a function or a sourced file that may set it: no.)
+// A word that holds a substitution, a backtick or an expansion form other than `$NAME` / `${NAME}` is not read. A name the line never gives is no value the line made.
+const SURE_BINDERS = new Set(['export', 'declare', 'typeset', 'readonly']);
+function rsyncNamesSure(cmds, idx, ctx) {
+  const words = cmds[idx].argv.slice(1);
+  const names = new Set();
+  for (const w of words) {
+    if (!/[$`]/.test(w)) continue;
+    if (/`|\$\(|\$\{?[^A-Za-z_{]|\$\{[A-Za-z_]\w*[^\w}]|\$$/.test(w)) return false;
+    for (const m of w.matchAll(/\$\{?([A-Za-z_]\w*)/g)) names.add(m[1]);
+  }
+  if (!names.size) return true;
+  if (cmds.truncated || cmds.ctlBroken || ctx.unknownAll === true) return false;
+  for (const k of names) {
+    if (SKIP_READING.has(k)) continue;
+    if (ctx.unknownVars?.has(k) || ctx.pickUnknown?.has(k) || ctx.srcChanged?.has(k) || ctx.srcTouched?.has(k) || ctx.arith?.names?.has(k)) return false;
+    const sites = [];
+    for (const [i, c] of cmds.entries()) {
+      const nm = baseOf(c.argv[0] ?? '');
+      if (Object.hasOwn(c.env ?? {}, k)) sites.push(i);
+      else if (SURE_BINDERS.has(nm) && declAttrs(c.argv).assigns.some(([n]) => n === k)) sites.push(i);
+      else if (c.argv.length && !SURE_BINDERS.has(nm) && c.argv.slice(1).some((a) => new RegExp(`(?:^|[\\s,])${k}(?:\\[|=|$)`).test(a)) && ['read', 'printf', 'mapfile', 'readarray', 'getopts', 'for', 'select', 'let', 'unset', 'eval', 'source', '.', 'set'].includes(nm)) sites.push(i);
+    }
+    if (!sites.length) continue;
+    if (sites.length > 1) return false;
+    const [site] = sites;
+    const c = cmds[site];
+    const sure = site < idx && (c.argv.length === 0 || SURE_BINDERS.has(baseOf(c.argv[0]))) && c.depth === 0
+      && c.sep !== '&&' && c.sep !== '||' && c.sep !== '|' && c.sep !== '&' && cmds[site + 1]?.sep !== '|' && cmds[site + 1]?.sep !== '&'
+      && !mayNotRun(cmds, flowStart(cmds), site);
+    if (!sure) return false;
+  }
+  return true;
+}
+
 // $NAME values assigned on the line: `D=x cmd`, a bare `D=x`, `export D=x`, `declare -x D=x`.
 // Also fills ctx.keptVars: the same values with every backslash kept as a file name character (toPosix reads it as a
 // separator), for the off-Windows reading of a script name (`D='x\a'; bash "$D.sh"` runs x\a.sh).
@@ -5497,7 +5533,8 @@ function evaluateBashForFilesFrame(command, opts) {
         const f = rsyncFlags(c.argv, ctx, c.raw);
         if (!f.del && !f.rm && !f.unknown) return false;
         // #460: a dry run (both readings of the words agree) deletes nothing at the destination and removes no source
-        if ([true, false].every((split) => rsyncOperands(wordsOf(c), ctx, c.quotedWords, split).dry)) return false;
+        // (#478 R1-B2 / R1-F2: not when rsyncFlags cannot tell the words (a custom IFS, a run-time word before the -n); R1-F1: nor when a name that makes the flag may not hold it at run time)
+        if (!f.unknown && [true, false].every((split) => rsyncOperands(wordsOf(c), ctx, c.quotedWords, split).dry) && rsyncNamesSure(cmds, cmds.indexOf(c), ctx)) return false;
         // R5-F2: --delete removes what the source lacks at the destination, --remove-source-files removes the sources; rsync permutes its options, so the last word can be the value of one
         // (`rsync -a --delete SRC ~/ --timeout 30`): with either flag, known or not, EVERY word (a positional or an option's value) is judged as a possible destination
         return operandsOf(c).some(hit);
