@@ -38,7 +38,7 @@ export const meta = {
     '  the Codex run is the job codex-rR tagged <pr>:<R>:<base>:<head>: the same tag running is adopted (no second start), another tag running is exit 1 job-conflict',
     '  the result is read from the job\'s whole stdout; when that is missing (an older runner) or was cut, and the state records round R, the report is built from the state, else {next:"job read"}',
     '  a round already recorded picks up a job codex-rR only when its tag\'s base:head are the recorded round\'s fromHead:toHead (a job left by a discarded round is never used: exit 1 identity-mismatch);',
-    '     a job that ended non-zero while the state already records round R (round recorded another way, e.g. substitute apply) reports from the state ({codex:{fromState:true}}), not the failure JSON',
+    '     a job that ended non-zero while the state already records round R at the job tag base:head (round recorded another way, e.g. substitute apply) reports from the state ({codex:{fromState:true}}), not the failure JSON; a round recorded at another base:head (another writer, during the wait) leaves the job failure JSON as it is: never ok:true, never `arbiter needed`',
     '  the command exits early when the process that started it is gone (the job keeps running; rerun it)',
     'pipeline round publish --pr N --round R [--repo DIR]',
     '  -> exit 0 {ok, accepted:{ids, path, count}, followups:[{id, issue}], held:[ids], warnings, outcome}; outcome is `state outcome` verbatim, needsHuman included (published first, then read)',
@@ -153,8 +153,9 @@ function reportFromOutput(json) {
 
 // PIPELINE_ROUND_HOLD_AFTER_PLAN=<file>: test seam (checkout only, lib/seams.mjs). After the plan step the command writes <file>.reached, then waits (60 s at most)
 // until <file> exists, so a test can end the parent process at a known point of the command.
-async function holdAfterPlan(ctx) {
-  const file = seamValue('PIPELINE_ROUND_HOLD_AFTER_PLAN', ctx?.env ?? process.env);
+// PIPELINE_ROUND_HOLD_BEFORE_WAIT=<file>: the same, at the start of the wait (the job is started or adopted).
+async function holdAt(varName, ctx) {
+  const file = seamValue(varName, ctx?.env ?? process.env);
   if (file === undefined) return;
   writeFileAtomic(`${file}.reached`, 'reached\n');
   const end = Date.now() + 60_000;
@@ -222,7 +223,7 @@ async function roundCodex(rest, ctx) {
       const common = ['--pr', String(pr), '--round', String(round), '--base', base, '--head', head];
       const plan = step(root, ['codex-review', ...common, '--plan'], ctx);
       if (plan.code !== EXIT.OK) return passThrough(plan);
-      await holdAfterPlan(ctx);
+      await holdAt('PIPELINE_ROUND_HOLD_AFTER_PLAN', ctx);
       // The process that started this command is already gone: start nothing (a job started now would have no waiter; the rerun starts it).
       if (gone()) return { exitCode: EXIT.FAILED, output: { ok: false, error: 'parent-gone', next: 'rerun round codex', message: 'the process that started this command is gone: no job was started' } };
       const effort = plan.json?.expectedEffort;
@@ -247,6 +248,7 @@ async function roundCodex(rest, ctx) {
     const n = Number(seamValue(varName, ctx?.env ?? process.env));
     return Number.isFinite(n) && n > 0 ? n : undefined;
   };
+  await holdAt('PIPELINE_ROUND_HOLD_BEFORE_WAIT', ctx);
   const snap = await waitJob(name, {
     cwd: root, timeoutMs: seamMs('PIPELINE_ROUND_WAIT_MS') ?? maxMinutes * 60_000, pollMs: seamMs('PIPELINE_ROUND_POLL_MS') ?? POLL_MS, expectRunId: runId, full: true, shouldStop: gone,
   });
@@ -281,7 +283,10 @@ async function finish({ root, ctx, pr, round, snap, jobInfo }) {
   if (snap.exitCode !== 0) {
     // A failed job does not record a round: a recorded round R was recorded another way (the substitute path), so the state answers, not the failure.
     const recordedState = readState(root);
-    if (recordedState && recordedState.pr === pr && recordedState.rounds.some((r) => r.n === round)) {
+    // Only when it is recorded at THIS job's range (the tag's base:head): a round another writer recorded at another head meanwhile is not this job's result.
+    const tagParts = String(snap.tag ?? '').split(':');
+    const recordedRound = recordedState?.pr === pr ? recordedState.rounds.find((r) => r.n === round) : undefined;
+    if (recordedRound !== undefined && tagParts.length === 4 && tagParts[2] === recordedRound.fromHead && tagParts[3] === recordedRound.toHead) {
       return finishFromState({ root, ctx, pr, round, state: recordedState, report: reportFromState(root, recordedState, round) });
     }
     if (json === null) {

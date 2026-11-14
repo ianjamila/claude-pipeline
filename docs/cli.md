@@ -762,7 +762,7 @@ pipeline round codex --pr N --round R [--base B] [--head H] [--max-minutes M] [-
   the Codex run is the job codex-rR tagged <pr>:<R>:<base>:<head>: the same tag running is adopted (no second start), another tag running is exit 1 job-conflict
   the result is read from the job's whole stdout; when that is missing (an older runner) or was cut, and the state records round R, the report is built from the state, else {next:"job read"}
   a round already recorded picks up a job codex-rR only when its tag's base:head are the recorded round's fromHead:toHead (a job left by a discarded round is never used: exit 1 identity-mismatch);
-     a job that ended non-zero while the state already records round R (round recorded another way, e.g. substitute apply) reports from the state ({codex:{fromState:true}}), not the failure JSON
+     a job that ended non-zero while the state already records round R at the job tag base:head (round recorded another way, e.g. substitute apply) reports from the state ({codex:{fromState:true}}), not the failure JSON; a round recorded at another base:head (another writer, during the wait) leaves the job failure JSON as it is: never ok:true, never `arbiter needed`
   the command exits early when the process that started it is gone (the job keeps running; rerun it)
 pipeline round publish --pr N --round R [--repo DIR]
   -> exit 0 {ok, accepted:{ids, path, count}, followups:[{id, issue}], held:[ids], warnings, outcome}; outcome is `state outcome` verbatim, needsHuman included (published first, then read)

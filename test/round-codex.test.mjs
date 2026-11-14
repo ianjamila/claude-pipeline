@@ -283,6 +283,26 @@ test('a failed job (exit 3) while the state already records round R (the substit
   assert.deepEqual(r.json.codex.counts, { blocking: 0, suggestions: 1, worth_considering: 0 });
 });
 
+test('a failed job (head-moved for head A) while another writer recorded round R at head B during the wait: the job failure JSON, and arbiter needed is NOT called', { skip: process.platform === 'win32' }, async (t) => {
+  const w = roundWorld(t, { max: 3, yml: 'risk:\n  high_risk_paths: ["src/a.js"]\n' });
+  const emit = emitter(w);
+  startJob(w, tagOf(w, w.base, w.head), emit(2, '{"ok":false,"error":"head-moved","message":"the head moved"}', 3000));
+  const hold = join(w.scratch, 'hold');
+  const run = startRound(w, ['--base', w.base, '--head', w.head], { PIPELINE_ROUND_HOLD_BEFORE_WAIT: hold });
+  await untilExists(`${hold}.reached`);
+  w.repo.write('src/fix.js', 'export const fix = 1;\n');
+  const h2 = w.repo.commit('fix');
+  w.prHead(h2);
+  assertExit(w.codex(1, findingsOf([], [low()]), { from: w.base, to: h2 }), 0); // round 1 recorded at head B by another writer
+  writeFileSync(hold, 'go\n');
+  const r = await run.done;
+  assert.equal(r.code, 2, r.out);
+  assert.equal(r.json.error, 'head-moved');
+  assert.equal('codex' in r.json, false);
+  assert.equal('arbiter' in r.json, false);
+  assert.equal(w.state().rounds[0].arbiter, undefined, 'arbiter needed did not run: the round has no arbiter input');
+});
+
 test('a failed arbiter needed is ok:false, step arbiter-needed, the child\'s error and JSON as result, the child\'s exit code', (t) => {
   const w = roundWorld(t, { max: 3, yml: 'risk:\n  high_risk_paths: ["src/a.js"]\n' });
   const cc = join(w.scratch, 'claude-code-2.1.322');
