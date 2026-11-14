@@ -3,9 +3,14 @@
 // recorder that turns a verified click into the SAME record the typed path writes (owner-go.mjs: approval / ruling / extra-round, plus `via: 'ask'`), and the one verifier every consumer
 // uses (clickProvenance, called by ownedBy where promptProvenance is for typed prompts).
 //
-// The trust argument, in one paragraph. A human click leaves a user entry in the session transcript whose permissionDecision says `source: user_temporary` and whose toolUseResult carries
-// `annotations: {}`; an answer given by a hook (updatedInput / PermissionRequest), by the model's own `answers` input, or by a non-interactive run lacks that stamp (spikes s07, s08, s10 of
-// 2026-11-11, test/fixtures/click). The transcript is the evidence, never the PostToolUse hook input (which the recorder only polls the transcript for: the entry lands 100-200 ms after the
+// The trust argument, in one paragraph. A human click leaves a user entry in the session transcript whose permissionDecision is EXACTLY HUMAN_DECISION (decision accept, source user_temporary,
+// grantScope once, reasonCode unknown: the whole object, no other key) and whose toolUseResult carries `annotations: {}`; an answer given by a hook (updatedInput / PermissionRequest), by the
+// model's own `answers` input, or by a non-interactive run lacks that stamp (spikes s07, s08, s10 of 2026-11-11, test/fixtures/click). The stamp is the whole object, not decision + source,
+// because the 2.1.323 recording of a PreToolUse hook answering "ask" with a prefilled `answers` shows a result stamped source user_temporary and annotations {} like a click, about 1.5 s after
+// the tool_use; only its reasonCode (hook:PreToolUse, a person's is unknown) tells them apart. The 2.1.323 recordings were made by a script that could also press keys into the dialog, so
+// they cannot tell Claude Code submitting a prefilled answer by itself from a stray key press of that script; the owner's re-record from their own terminal decides it, and the whole-object
+// check is the stricter rule either way. (The 2.1.323 recording of the model's own prefilled `answers` carries the exact human stamp: only the tool-use shape check below refuses it, and
+// the 2 s floor is no defence: both recordings were answered in about 2 s.) The transcript is the evidence, never the PostToolUse hook input (which the recorder only polls the transcript for: the entry lands 100-200 ms after the
 // hook starts). Hooks that could still answer the dialog are the dialog-hook check's business (B5, hookCheck below, T2): this file takes it as an injected function.
 // What binds is the question TEXT: it is the typed path's closing block, so the answer goes through the SAME parsers the typed prompt does (approvalBinding, roundBinding, rulingBinding in
 // owner-go.mjs), and the ask file supplies only what a typed prompt cannot: one-time use, supersession, expiry, the dialog hash and the issue-time hook fingerprint.
@@ -18,8 +23,10 @@ import {
   MAX_AGE_MS, SESSION_RE, accountHome, appendRecord, approvalBinding, ownerGoDir, readRecords, realDirChain, repoKey, roundBinding, rulingBinding, rulingsIn, scanBackwards,
 } from './owner-go.mjs';
 
-// The Claude Code builds whose click transcripts were recorded and checked (test/fixtures/click). Installed (protected) code, never pipeline.yml: a repo may switch clicks OFF, never widen this.
-export const CLICK_BUILDS = Object.freeze(['2.1.322']);
+// The Claude Code builds whose click transcripts were recorded and checked. Each build needs its fixture set under test/fixtures/click/<build>/, recorded by scripts/click-spike.mjs (the tests
+// run the whole matrix for every build listed here). Installed (protected) code, never pipeline.yml: a repo may switch clicks OFF, never widen this.
+export const CLICK_BUILDS = Object.freeze(['2.1.322', '2.1.323']);
+export const HUMAN_DECISION = Object.freeze({ decision: 'accept', source: 'user_temporary', grantScope: 'once', reasonCode: 'unknown' });
 // owner-go.mjs <-> this file import each other (ownedBy calls clickProvenance), so nothing here may read an owner-go.mjs binding while the module loads: the literal is pinned to
 // OWNER_GO_REL + '/asks' by a test.
 export const ASKS_REL = '.claude/pipeline-state/owner-go/asks';
@@ -320,6 +327,8 @@ const clickIdOf = (session, toolUseId, askId) => sha256(`${session}|${toolUseId}
 
 // ---- the transcript evidence (B3 entry checks) --------------------------------------------------------------------------------------------
 
+// The whole permissionDecision, key for key and value for value (an extra or missing key, another grantScope or reasonCode is not a person's click).
+const isHumanDecision = (pd) => isObj(pd) && Object.keys(pd).length === Object.keys(HUMAN_DECISION).length && Object.entries(HUMAN_DECISION).every(([k, v]) => Object.hasOwn(pd, k) && pd[k] === v);
 const blocksOf = (e) => (Array.isArray(e?.message?.content) ? e.message.content : []);
 const isoMs = (s) => (typeof s === 'string' && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/.test(s) ? Date.parse(s) : NaN);
 
@@ -352,7 +361,7 @@ export function clickEvidence(transcriptPath, toolUseId, { home = accountHome() 
     if (content.length !== 1 || content[0]?.type !== 'tool_result' || content[0].tool_use_id !== toolUseId || content[0].is_error === true || result.message?.content?.length !== 1) return { ok: false, reason: 'tool-result-shape' };
     if (typeof use.uuid !== 'string' || use.uuid === '' || result.sourceToolAssistantUUID !== use.uuid || result.parentUuid !== use.uuid) return { ok: false, reason: 'chain' };
     if (use.isSidechain !== false || result.isSidechain !== false) return { ok: false, reason: 'sidechain' };
-    if (!isObj(pd) || pd.decision !== 'accept' || pd.source !== 'user_temporary') return { ok: false, reason: 'not-a-human-answer' };
+    if (!isHumanDecision(pd)) return { ok: false, reason: 'not-a-human-answer' };
     if (!isObj(res) || !Array.isArray(res.questions) || res.questions.length !== 1 || sortedJson(canonicalDialog(res.questions[0])) !== sortedJson(dialog)) return { ok: false, reason: 'result-dialog-differs' };
     if (!isObj(res.answers) || Object.keys(res.answers).length !== 1 || !Object.hasOwn(res.answers, dialog.question) || typeof res.answers[dialog.question] !== 'string') return { ok: false, reason: 'answers-shape' };
     if (!isObj(res.annotations) || Object.keys(res.annotations).length !== 0) return { ok: false, reason: 'annotations' };
