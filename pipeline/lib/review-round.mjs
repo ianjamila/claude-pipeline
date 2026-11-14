@@ -284,8 +284,10 @@ export async function admitRound({ root, config, ctx, pr, round, base, head }) {
   const confirmItems = baseOnly ? [] : priorItems.filter((i) => i.implementedVia === 'other-files' && !confirmed.has(i.id));
   // The trusted default-branch config this round is rated under (F7): pinned on the round (trustedConfigSha; null = unavailable) and the source of the threat models in the prompt.
   const trustedConfigSha = rated.baseConfig?.ok === true && typeof rated.trustedFork === 'string' ? rated.trustedFork : null;
+  // Shown to Codex (and the substitute) only on a Fable round: a threat-model finding they downgrade to a SUGGESTION is routed to a filed issue or a human only by
+  // the Fable review path, so a judge-lane or light-lane round would let it be dismissed with neither.
   let threatModels = [];
-  if (trustedConfigSha !== null && !baseOnly) {
+  if (trustedConfigSha !== null && !baseOnly && fable) {
     const trustedRead = baseConfigAt(trustedConfigSha, root);
     try {
       if (trustedRead.ok) threatModels = threatModelsFor(diffFiles(review.base, head, o), trustedRead.config);
