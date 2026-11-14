@@ -754,6 +754,7 @@ pipeline round codex --pr N --round R [--base B] [--head H] [--max-minutes M] [-
      (with an arbiter record: arbiterState:{recorded, proofOk}; `arbiter needed` is not a read, so it is not called again)
   -> a failed `arbiter needed` (non-zero exit or no JSON): {ok:false, step:"arbiter-needed", error, result:<its JSON>, codex, reviewer} with the step's exit code (error copied from the child; same shape as round publish), e.g. stale-terminal with restartRequired
   -> exit 0 {ok, state:"running", next:"rerun round codex"}: still running after M minutes; the same command adopts the same job
+  -> exit 1 {ok:false, error:"parent-gone", next:"rerun round codex"}: the process that started the command (read when it began) was gone before the job was started: nothing was started; gone later: the same with state:"running", the job keeps running
   -> a refusal or failure of a step is that step's JSON, unchanged, with its exit code (codex-review --plan, job start, codex-review: empty-range, base-mismatch, head-moved, round-cap, exit 3 unavailable / substitute …);
      update-in-progress adds next:"rerun in a minute"; a job that was replaced by a newer run: {state:"replaced", next:"reconcile"} (never discard-round on its own); lost / missing: the job JSON
   identity (before anything runs, and again before the result and the arbiter call): no .review/state.json is fine for round 1; else its pr must be N and R the next round, else exit 1 identity-mismatch

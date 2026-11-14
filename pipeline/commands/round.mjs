@@ -10,6 +10,7 @@
 // is handed back unchanged. Nothing here decides anything a step does not: no cost booking, no ruling, no discard-round.
 // Exit codes follow the step that stopped the bundle (0 ok, 1 refused / failed, 2 usage / environment, 3 dependency unavailable).
 import { spawnSync } from 'node:child_process';
+import { existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { EXIT, UsageError, intOption, parseCommandArgs } from '../lib/cli.mjs';
@@ -29,6 +30,7 @@ export const meta = {
     '     (with an arbiter record: arbiterState:{recorded, proofOk}; `arbiter needed` is not a read, so it is not called again)',
     '  -> a failed `arbiter needed` (non-zero exit or no JSON): {ok:false, step:"arbiter-needed", error, result:<its JSON>, codex, reviewer} with the step\'s exit code (error copied from the child; same shape as round publish), e.g. stale-terminal with restartRequired',
     '  -> exit 0 {ok, state:"running", next:"rerun round codex"}: still running after M minutes; the same command adopts the same job',
+    '  -> exit 1 {ok:false, error:"parent-gone", next:"rerun round codex"}: the process that started the command (read when it began) was gone before the job was started: nothing was started; gone later: the same with state:"running", the job keeps running',
     '  -> a refusal or failure of a step is that step\'s JSON, unchanged, with its exit code (codex-review --plan, job start, codex-review: empty-range, base-mismatch, head-moved, round-cap, exit 3 unavailable / substitute …);',
     '     update-in-progress adds next:"rerun in a minute"; a job that was replaced by a newer run: {state:"replaced", next:"reconcile"} (never discard-round on its own); lost / missing: the job JSON',
     '  identity (before anything runs, and again before the result and the arbiter call): no .review/state.json is fine for round 1; else its pr must be N and R the next round, else exit 1 identity-mismatch',
@@ -149,6 +151,16 @@ function reportFromOutput(json) {
   };
 }
 
+// PIPELINE_ROUND_HOLD_AFTER_PLAN=<file>: test seam (checkout only, lib/seams.mjs). After the plan step the command writes <file>.reached, then waits (60 s at most)
+// until <file> exists, so a test can end the parent process at a known point of the command.
+async function holdAfterPlan(ctx) {
+  const file = seamValue('PIPELINE_ROUND_HOLD_AFTER_PLAN', ctx?.env ?? process.env);
+  if (file === undefined) return;
+  writeFileAtomic(`${file}.reached`, 'reached\n');
+  const end = Date.now() + 60_000;
+  while (!existsSync(file) && Date.now() < end) await new Promise((resolve) => setTimeout(resolve, 50));
+}
+
 const fullSha = (ref, root) => revParse(`${ref}^{commit}`, { cwd: root });
 
 async function roundCodex(rest, ctx) {
@@ -159,6 +171,8 @@ async function roundCodex(rest, ctx) {
   const pr = intOption(values, 'pr', { required: true, min: 1 });
   const round = intOption(values, 'round', { required: true, min: 1 });
   const maxMinutes = intOption(values, 'max-minutes', { min: 1, max: MAX_MAX_MINUTES }) ?? DEFAULT_MAX_MINUTES;
+  // The parent is captured HERE, before any step runs: under load the steps below can outlast it, and a parent read later is the adoptive one.
+  const gone = parentWatcher();
   const root = resolveRepo(values, ctx);
   const { config } = await requireConfig(root);
   const name = `codex-r${round}`;
@@ -208,6 +222,9 @@ async function roundCodex(rest, ctx) {
       const common = ['--pr', String(pr), '--round', String(round), '--base', base, '--head', head];
       const plan = step(root, ['codex-review', ...common, '--plan'], ctx);
       if (plan.code !== EXIT.OK) return passThrough(plan);
+      await holdAfterPlan(ctx);
+      // The process that started this command is already gone: start nothing (a job started now would have no waiter; the rerun starts it).
+      if (gone()) return { exitCode: EXIT.FAILED, output: { ok: false, error: 'parent-gone', next: 'rerun round codex', message: 'the process that started this command is gone: no job was started' } };
       const effort = plan.json?.expectedEffort;
       if (typeof effort !== 'string') {
         return { exitCode: EXIT.FAILED, output: { ok: false, error: 'plan-unreadable', message: 'codex-review --plan printed no expectedEffort', stdout: plan.stdout.slice(0, 2000) } };
@@ -225,7 +242,6 @@ async function roundCodex(rest, ctx) {
   }
 
   // Phase 2: wait. Only this call's own parent ending (or the limit) ends it early; the job keeps running either way.
-  const gone = parentWatcher();
   // PIPELINE_ROUND_WAIT_MS / PIPELINE_ROUND_POLL_MS: test seams (checkout only, lib/seams.mjs): a wait limit and a poll interval in milliseconds.
   const seamMs = (varName) => {
     const n = Number(seamValue(varName, ctx?.env ?? process.env));

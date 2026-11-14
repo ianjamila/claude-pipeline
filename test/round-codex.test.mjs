@@ -334,33 +334,58 @@ test('reviewer fable WITH an arbiter record: arbiter needed is not called (the r
   assert.equal(w.stateText(), before, 'needed would have rewritten the round');
 });
 
-test('the command ends when its parent process is gone; the job keeps running', { skip: process.platform === 'win32' }, async (t) => {
-  const w = roundWorld(t, { max: 3 });
+// Starts `round codex` from a launcher that exits once the round command has REACHED a known point (`readyFile` exists), never after a fixed time:
+// under load the command's first steps can take longer than any fixed delay. -> { out } (the file the orphan prints its JSON to).
+function orphanedRound(w, readyFile, env) {
   const out = join(w.scratch, 'orphan.out');
   const launcher = w.file('launch.mjs', [
     "import { spawn } from 'node:child_process';",
-    "import { openSync } from 'node:fs';",
+    "import { existsSync, openSync } from 'node:fs';",
     'const fd = openSync(process.env.ORPHAN_OUT, "w");',
     `const c = spawn(process.execPath, [${JSON.stringify(bin)}, "round", "codex", "--pr", "7", "--round", "1"], { cwd: process.cwd(), env: process.env, detached: true, stdio: ["ignore", fd, fd] });`,
     'c.unref();',
-    'setTimeout(() => process.exit(0), 1500);',
+    'const end = Date.now() + 90000;',
+    'const poll = () => { if (existsSync(process.env.ORPHAN_READY) || Date.now() > end) process.exit(0); else setTimeout(poll, 50); };',
+    'poll();',
   ].join('\n'));
-  const env = { ...process.env, ...w.fake.env, PIPELINE_CODEX: `node "${join(here, 'fixtures', 'fake-codex.mjs')}"`, PIPELINE_LOCK_DIR: join(w.scratch, 'locks'), ...FAST, ...slowCodex(w, 5), ORPHAN_OUT: out };
-  const started = spawnSync(process.execPath, [launcher], { cwd: w.repo.dir, env, encoding: 'utf8' });
+  const full = { ...process.env, ...w.fake.env, PIPELINE_CODEX: `node "${join(here, 'fixtures', 'fake-codex.mjs')}"`, PIPELINE_LOCK_DIR: join(w.scratch, 'locks'), ...FAST, ...env, ORPHAN_OUT: out, ORPHAN_READY: readyFile };
+  const started = spawnSync(process.execPath, [launcher], { cwd: w.repo.dir, env: full, encoding: 'utf8' });
   assert.equal(started.status, 0, started.stderr);
-  const end = Date.now() + 15_000;
-  let json = null;
-  while (json === null && Date.now() < end) {
+  assert.equal(existsSync(readyFile), true, 'the round command reached the point the launcher waits for');
+  return { out };
+}
+async function orphanJson(out) {
+  const end = Date.now() + 60_000;
+  while (Date.now() < end) {
     await sleep(100);
-    try { json = JSON.parse(readFileSync(out, 'utf8')); } catch { /* not yet */ }
+    try { return JSON.parse(readFileSync(out, 'utf8')); } catch { /* not yet */ }
   }
-  assert.ok(json, 'the orphaned command printed its result and exited');
-  assert.deepEqual([json.error, json.next], ['parent-gone', 'rerun round codex']);
+  assert.fail('the orphaned command printed no result');
+}
+
+test('the command ends when its parent process is gone; the job keeps running', { skip: process.platform === 'win32' }, async (t) => {
+  const w = roundWorld(t, { max: 3 });
+  // the parent ends once the job's runner has started the command (child.json), however long the steps before took
+  const { out } = orphanedRound(w, join(jobsDir(w), 'codex-r1', 'child.json'), slowCodex(w, 8));
+  const json = await orphanJson(out);
+  assert.deepEqual([json.error, json.next, json.state], ['parent-gone', 'rerun round codex', 'running']);
   const job = w.cli(['job', 'read', 'codex-r1']);
   assert.equal(job.json.state === 'running' || job.json.state === 'done', true);
   const finished = w.cli(['job', 'wait', 'codex-r1', '--timeout', '60']);
   assert.equal(finished.json.state, 'done');
   assert.equal(finished.json.exitCode, 0);
+});
+
+test('the parent gone BEFORE the job starts: parent-gone, no job is started', { skip: process.platform === 'win32' }, async (t) => {
+  const w = roundWorld(t, { max: 3 });
+  const hold = join(w.scratch, 'hold');
+  // PIPELINE_ROUND_HOLD_AFTER_PLAN: the command writes hold.reached after the plan step, then waits for hold; the parent ends in between
+  const { out } = orphanedRound(w, `${hold}.reached`, { ...ok(w), PIPELINE_ROUND_HOLD_AFTER_PLAN: hold });
+  writeFileSync(hold, 'go\n');
+  const json = await orphanJson(out);
+  assert.deepEqual([json.ok, json.error, json.next], [false, 'parent-gone', 'rerun round codex']);
+  assert.equal('state' in json, false);
+  assert.equal(existsSync(jobsDir(w)), false, 'no job was started');
 });
 
 test('usage: --max-minutes is bounded 1..120', (t) => {
