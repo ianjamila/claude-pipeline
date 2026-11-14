@@ -360,13 +360,15 @@ async function chooseBrief(state, round, diff, root, { forceFull = false, truste
     if (!loaded.ok) return full(`config unreadable: ${loaded.errors?.[0] ?? 'unknown'}`);
     const base = baseConfigAt(round.forkPoint, root);
     if (!base.ok) return full(base.reason);
+    // No readable trusted default-branch config (a parent branch can cause that with the same pipeline.yml edit that relaxes a path, by moving default_branch): fail closed.
+    if (trusted === null) return full('the trusted default-branch config is unavailable');
     // The late lane (review.fix_verify_after_round): every config sets it (the trusted one must be readable) and the counted ordinal is above the largest.
-    const afters = [loaded.config, base.config, ...(trusted === null ? [] : [trusted])].map((c) => c.review?.fix_verify_after_round);
+    const afters = [loaded.config, base.config, trusted].map((c) => c.review?.fix_verify_after_round);
     const ordinal = countedOrdinal(state, round.n);
-    const late = trusted !== null && afters.every((a) => Number.isInteger(a)) && ordinal > Math.max(...afters);
-    // The same config twice is checked once (the usual case: nobody touched pipeline.yml). The trusted default-branch config joins on EVERY round when it is readable (it can only make a round full: for a PR to the default branch it is the fork-point config; for a stacked PR it stops a parent branch's relaxed config from admitting fix-verify).
+    const late = afters.every((a) => Number.isInteger(a)) && ordinal > Math.max(...afters);
+    // The same config twice is checked once (the usual case: nobody touched pipeline.yml). The trusted default-branch config joins on EVERY round, and an unreadable one makes the round full (it can only make a round full: for a PR to the default branch it is the fork-point config; for a stacked PR it stops a parent branch's relaxed config from admitting fix-verify).
     const configs = [];
-    for (const [label, config] of [['working-tree', loaded.config], ['base', base.config], ...(trusted === null ? [] : [['trusted', trusted]])]) {
+    for (const [label, config] of [['working-tree', loaded.config], ['base', base.config], ['trusted', trusted]]) {
       const seen = configs.find((c) => JSON.stringify(c[1]) === JSON.stringify(config));
       if (seen) { if (label !== 'trusted') seen[0] += ` and ${label}`; }
       else configs.push([label, config]);

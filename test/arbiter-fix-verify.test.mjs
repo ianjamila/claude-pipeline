@@ -51,6 +51,7 @@ function world(t, { yml = YML(), initFiles = {}, parentYml } = {}) {
   let base = initial;
   let prBase = 'main';
   if (parentYml !== undefined) {
+    repo.git(['branch', 'develop', initial]); // a parent config may name it as the default branch
     repo.branch('parent');
     repo.write('.claude/pipeline.yml', parentYml);
     base = repo.commit('parent');
@@ -307,6 +308,12 @@ test('R2-B1 stacked PR: a parent branch that drops a sensitive path from its own
   assertExit(r, 0, r.stdout + r.stderr);
   assert.deepEqual([r.json.scope, r.json.brief, r.json.agent], ['round', 'full', 'arbiter']);
   assert.match(r.json.briefReason, /sensitive path .*trusted config/);
+  // R3-F1: the parent that also moves default_branch (the same pipeline.yml edit) leaves no readable trusted config: fail closed, not the narrow brief
+  const nulled = fixWorld(t, { yml: trusted, parentYml: `${YML()}default_branch: develop\n` });
+  const n = nulled.needed(2);
+  assertExit(n, 0, n.stdout + n.stderr);
+  assert.deepEqual([n.json.scope, n.json.brief, n.json.agent], ['round', 'full', 'arbiter']);
+  assert.match(n.json.briefReason, /trusted .*config .*unavailable/);
   // the same stack with a parent that agrees with the trusted config stays on the narrow brief
   const same = fixWorld(t, { yml: YML(), parentYml: `${YML()}# parent branch, same settings\n` });
   assert.equal(same.needed(2).json.brief, 'fix-verify');
