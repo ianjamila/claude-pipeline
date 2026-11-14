@@ -289,6 +289,15 @@ async function finish({ root, ctx, pr, round, snap, jobInfo }) {
 // round publish
 // ---------------------------------------------------------------------------------------------------------------------------------------------
 
+// The publish steps, in the skill's order (publish first, outcome after). `state show` takes NO --pr: with it the command reaches GitHub and can quarantine .review/.
+export const publishSteps = (pr, round) => [
+  ['comment', ['comment', '--pr', String(pr), '--kind', 'triage']],
+  ['followups', ['followups', 'create', '--round', String(round)]],
+  ['comment-links', ['comment', '--pr', String(pr), '--kind', 'triage']],
+  ['accepted', ['state', 'show', '--round', String(round), '--accepted']],
+  ['outcome', ['state', 'outcome']],
+];
+
 async function roundPublish(rest, ctx) {
   const { values } = parseCommandArgs(rest, { pr: { type: 'string' }, round: { type: 'string' }, repo: { type: 'string' } }, { allowPositionals: false });
   const pr = intOption(values, 'pr', { required: true, min: 1 });
@@ -300,13 +309,7 @@ async function roundPublish(rest, ctx) {
   checkIdentity(root, pr, round, { mayBeRecorded: true });
   if (!state.rounds.some((r) => r.n === round)) throw identityMismatch(`round ${round} is not recorded in the review state: nothing was run`);
 
-  const steps = [
-    ['comment', ['comment', '--pr', String(pr), '--kind', 'triage']],
-    ['followups', ['followups', 'create', '--round', String(round)]],
-    ['comment-links', ['comment', '--pr', String(pr), '--kind', 'triage']],
-    ['accepted', ['state', 'show', '--round', String(round), '--accepted']],
-    ['outcome', ['state', 'outcome']],
-  ];
+  const steps = publishSteps(pr, round);
   const ran = [];
   const results = {};
   for (const [id, args] of steps) {
