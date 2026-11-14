@@ -2497,6 +2497,7 @@ class Parser {
       // (`if C (sub) { B } else { E }`, `until C [[ x ]] B`): the body runs when the condition FAILED (until) or held, which the && / || list before it says nothing about. The parser does not follow these: the
       // whole line's directory and branch become unknown (ctlBroken), as for any shape it cannot follow. Not words here: a reserved word that continues the construct (then / do / else ...), a `{fd}` redirect, the
       // `{` of a zsh anonymous function `() { }` (the `()` exactly adjacent) and the redirect targets above)
+      const dblWas = this.dblOpen; // (read before the `]]` below clears it: it survives a && / || / ( ) that splits the segment inside the [[ ]], R19-B1)
       if (seg.condWatch) {
         if (q < 0 && (text === 'then' || text === 'do' || text === ']]' || AFTER_PAREN_RESERVED.has(text))) { if (text !== ']]') seg.condWatch = false; }
         else if (q < 0 && /^\{[A-Za-z_]\w*\}$/.test(text) && /[<>]/.test(s[this.i] ?? '')) seg.condAnon = false;
@@ -2531,11 +2532,17 @@ class Parser {
       // (#352 R18: independent of how the R16 watch was armed: a plain word after the unquoted `]]` that closes a [[ ]] command (a `[[` in command position of this segment, or the `]]` itself in command position
       // because a ( ) / && inside the [[ ]] split the segment) is zsh's short-form body, in the argv of `]]`, no command of its own. The whole line is refused. Not words here: then / do / else / elif / fi / done /
       // esac / { / }, a `{fd}` redirect; `echo ]] x` (no [[ ]] command) is no condition end)
-      if (seg.afterDbl === true) {
+      // (#352 R19-F1: a reserved word right after `]]` (`if [[ x ]] then B`, `while [[ x ]] do B`) is no segment end: the body is in the argv of `[[`, so any further word of the segment refuses the line (afterDbl 'kw').
+      // R19-B1: `dblWas` (the parser's open [[ ]], kept across a && / || / ( ) split) arms the watch like a [[ in command position of this segment)
+      if (seg.afterDbl === 'kw') ctx.truncated = true;
+      else if (seg.afterDbl === true) {
         seg.afterDbl = false;
-        if (!(q < 0 && (text === '{' || text === 'do' || text === 'elif' || AFTER_PAREN_RESERVED.has(text) || (/^\{[A-Za-z_]\w*\}$/.test(text) && /[<>]/.test(s[this.i] ?? ''))))) ctx.truncated = true;
+        if (q < 0 && text === '{') { /* (a brace body: the { splits the segment) */ }
+        else if (q < 0 && /^\{[A-Za-z_]\w*\}$/.test(text) && /[<>]/.test(s[this.i] ?? '')) seg.afterDbl = true; // (R19-F2: a `{fd}` redirect prefix is no word: the watch stays armed for the real word, or the end of the segment)
+        else if (q < 0 && (text === 'do' || text === 'elif' || AFTER_PAREN_RESERVED.has(text))) seg.afterDbl = 'kw';
+        else ctx.truncated = true;
       }
-      if (q < 0 && text === ']]' && (cmdPos || seg.dblSeen === true)) seg.afterDbl = true;
+      if (q < 0 && text === ']]' && (cmdPos || seg.dblSeen === true || dblWas)) seg.afterDbl = true;
       if (q < 0 && text === '[[' && cmdPos) seg.dblSeen = true;
       if (cmdPos && q < 0 && text === '!') seg.negLead = true; // (R9-F3: a `!` in front: the command, group, pipeline or construct that follows is negated)
       // (`time` and its options before a compound command: `time if ...; fi` -- review of #50)
@@ -2583,7 +2590,7 @@ class Parser {
       }
       if (text === '{' || text === '(') seg.fnActive = false;
       fnPending = fnName && seg.fnActive === true; // (a name of `function NAME` ending the line: its body may open on the next)
-      seg.words.push({ text, qa: q, bm: marks, dyn, subs, win, pat, one });
+      seg.words.push({ text, qa: q, bm: marks, dyn, subs, win, pat, one, fdRedir: q < 0 && /^\{[A-Za-z_]\w*\}$/.test(text) && /[<>]/.test(s[this.i] ?? '') }); // (fdRedir: a `{fd}>file` redirect prefix, no command word: see finalizeGroup, R19-F2)
     };
     const endSeg = (idx) => {
       flushWord();
@@ -3096,7 +3103,7 @@ class Parser {
     for (;;) {
       const w = words[i];
       if (!w || w.qa >= 0) break;
-      if (KEYWORDS.has(w.text)) i++;
+      if (KEYWORDS.has(w.text) || w.fdRedir === true) i++; // (#352 R19-F2: `{fd}>/dev/null git push` runs git, not a command named `{fd}`)
       else if (w.text === 'function' && i + 1 < words.length) i += 2;
       else break;
     }

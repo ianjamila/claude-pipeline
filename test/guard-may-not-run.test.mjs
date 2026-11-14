@@ -549,6 +549,8 @@ test('#352 R19-B1, R19-F1, R19-F2: the ]] watch survives a && inside [[ ]], a sa
   refuses('R19-F1: if [[ a && b ]] then push; fi', `if [[ -n a && -n b ]] then ${SHIP}; fi`);
   refuses('R19-F2: if { true } && [[ ]] {fd}>/dev/null push', `if { true } && [[ -n x ]] {fd}>/dev/null ${SHIP}`);
   refuses('R19-F2: if [[ ( ) ]] {fd}>/dev/null push', `if [[ ( -n x ) ]] {fd}>/dev/null ${SHIP}`);
+  denies('R19-F2: a {fd}>file redirect prefix is no command word: {fd}>/dev/null push (main)', `{fd}>/dev/null ${SHIP}`, {}, MAIN_DIR);
+  denies('R19-F2: true && {fd}>/dev/null push (main)', `true && {fd}>/dev/null ${SHIP}`, {}, MAIN_DIR);
   // lines that use [[ ]] as an ordinary command keep their verdict
   allows('twin: if [[ ]]; then push; fi', `if [[ -n x ]]; then ${SHIP}; fi`, {}, '/work/other2');
   allows('twin: [[ a && b ]] && push', `[[ -n a && -n b ]] && ${SHIP}`, {}, '/work/other2');
