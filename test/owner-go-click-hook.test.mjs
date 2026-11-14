@@ -16,7 +16,7 @@ const REPO = 'acme/app';
 const HEAD = '0123456789abcdef0123456789abcdef01234567';
 const ITEMS = 'abcdef012345';
 const GHEAD = 'abcdef0123456789abcdef0123456789abcdef01';
-const FIX = new URL('./fixtures/click/genuine-click.jsonl', import.meta.url);
+const FIX = new URL('./fixtures/click/2.1.322/genuine-click.jsonl', import.meta.url);
 const OK = () => ({ ok: true, hookLayersSha256: null });
 const noSleep = async () => {};
 

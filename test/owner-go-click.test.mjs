@@ -1,17 +1,20 @@
-// #261 (click-to-approve, PR A, T1): the owner's click on a choice dialog as a recorded "merge" / "extra round" / ruling. The transcripts under test/fixtures/click are trimmed copies (prompt,
-// AskUserQuestion tool_use, its tool_result; cwd and repo names neutral, every metadata field as Claude Code 2.1.322 wrote it) of the 2026-11-11 spikes: genuine-click (s12, a keystroke click),
-// pretooluse-hook-answer (s07), permissionrequest-hook-answer (s08), model-prefilled-answers (s10), preview-annotations (s14), multiselect-click (s16). A test rewrites the dialog text and answer
-// inside a copy to bind a real closing block; it never touches a metadata field unless the case IS that field.
+// #261 (click-to-approve, PR A, T1): the owner's click on a choice dialog as a recorded "merge" / "extra round" / ruling. The transcripts under test/fixtures/click/<build>/ are trimmed copies
+// (prompt, AskUserQuestion tool_use, its tool_result; cwd and repo names neutral, every metadata field as that Claude Code build wrote it), one folder per build in CLICK_BUILDS, recorded by
+// scripts/click-spike.mjs (2.1.322: the 2026-11-11 spikes by hand): genuine-click (a keystroke click), pretooluse-hook-answer, permissionrequest-hook-answer, model-prefilled-answers,
+// preview-annotations, multiselect-click, and from 2.1.323 on pretooluse-ask-prefill (a hook that answers "ask" with prefilled answers: Claude Code submits them itself, stamped user_temporary
+// but with reasonCode hook:PreToolUse). The fixture-driven cases run for EVERY build in CLICK_BUILDS, so a new build gets the whole matrix by adding its folder. A test rewrites the dialog text
+// and answer inside a copy to bind a real closing block (and moves the result's time 30 s after the tool_use when the recording was answered sooner than MIN_ANSWER_MS, so the 2 s floor is
+// never what a case proves); it never touches a metadata field unless the case IS that field.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import {
   OWNER_GO_REL, approvalGap, approvedPr, claimGrantMarkers, grantIdOf, ownerGoDir, ownerGrantedRounds, ownerRuled, readApprovals, verifyOwnerGrant,
 } from '../pipeline/hooks/lib/owner-go.mjs';
 import {
-  ASKS_REL, CLICK_BUILDS, asksDir, canonicalDialog, clickEvidence, clickProvenance, dialogSha256, issueAsk, mergeAsk, mergeManyAsk, readAsk, recordClick, roundAsk, rulingAsk,
+  ASKS_REL, CLICK_BUILDS, HUMAN_DECISION, MIN_ANSWER_MS, asksDir, canonicalDialog, clickEvidence, clickProvenance, dialogSha256, issueAsk, mergeAsk, mergeManyAsk, readAsk, recordClick, roundAsk, rulingAsk,
 } from '../pipeline/hooks/lib/owner-go-click.mjs';
 import { mergeRequest, roundRequest, rulingRequest } from './helpers/owner-go.mjs';
 
@@ -21,7 +24,14 @@ const HEAD2 = 'fedcba9876543210fedcba9876543210fedcba98';
 const ITEMS = 'abcdef012345';
 const GHEAD = 'abcdef0123456789abcdef0123456789abcdef01';
 const FIX = new URL('./fixtures/click/', import.meta.url);
-const loadFixture = (name) => readFileSync(new URL(`${name}.jsonl`, FIX), 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+const OLDEST = '2.1.322'; // the build the rest of this file's builds-agnostic tests (and its few 2.1.322-specific assertions) run on
+const BUILD_DIR = (build) => new URL(`${build}/`, FIX);
+const loadFixture = (name, build = OLDEST) => readFileSync(new URL(`${name}.jsonl`, BUILD_DIR(build)), 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+const buildNo = (b) => b.split('.').map(Number);
+const buildAtLeast = (b, min) => { const [x, y] = [buildNo(b), buildNo(min)]; for (let i = 0; i < 3; i++) if (x[i] !== y[i]) return x[i] > y[i]; return true; };
+// The fixture set every build in CLICK_BUILDS must have; pretooluse-ask-prefill exists from 2.1.323 on (2.1.322 has no such Claude Code behaviour to record).
+const REQUIRED = ['genuine-click', 'pretooluse-hook-answer', 'permissionrequest-hook-answer', 'model-prefilled-answers', 'preview-annotations', 'multiselect-click'];
+const requiredFor = (build) => (buildAtLeast(build, '2.1.323') ? [...REQUIRED, 'pretooluse-ask-prefill'] : REQUIRED);
 const OK = () => ({ ok: true, hookLayersSha256: null });
 const noSleep = async () => {};
 
@@ -46,10 +56,12 @@ function forgeAsk({ kind, repo, prs, header, title, block, options, actions, hoo
 // A world: a temp home, an issued ask and a transcript holding the fixture's entries rewritten to the ask's dialog and `answer` (default: the approving label). `tamper(dialog)` returns the dialog the
 // transcript shows instead of the issued one; `mutate({ prompt, use, result })` edits the entries (a metadata case); `fixture` picks the spike transcript; `write: false` leaves the transcript with
 // the prompt and the tool_use only (poll tests append the result themselves).
-function world(t, { parts = mergeParts(), answer = null, fixture = 'genuine-click', tamper = null, mutate = null, hookLayersSha256 = null, issueBeforeUseMs = 10000, write = true, forge = false } = {}) {
+function world(t, { parts = mergeParts(), answer = null, fixture = 'genuine-click', build = OLDEST, tamper = null, mutate = null, hookLayersSha256 = null, issueBeforeUseMs = 10000, write = true, forge = false } = {}) {
   const home = mkdtempSync(join(tmpdir(), 'owner-go-click-'));
-  const entries = loadFixture(fixture);
+  const entries = loadFixture(fixture, build);
   const [prompt, use, result] = entries;
+  // a recording the script made by keys or a hook was answered in under 2 s: move the answer to 30 s so that the 2 s floor is never what a case proves (mutate may still set its own time)
+  if (Date.parse(result.timestamp) - Date.parse(use.timestamp) < MIN_ANSWER_MS) result.timestamp = new Date(Date.parse(use.timestamp) + 30000).toISOString();
   const issuedAt = Date.parse(use.timestamp) - issueBeforeUseMs;
   const issued = forge ? forgeAsk({ ...parts, hookLayersSha256, home, issuedAt }) : issueAsk({ ...parts, hookLayersSha256, home, now: () => issuedAt });
   assert.ok(issued.askId, `issue failed: ${JSON.stringify(issued)}`);
@@ -152,6 +164,32 @@ test('merge-many: ticked labels become one approval per PR; a partial or foreign
   assert.equal(odd.records().length, 0);
 });
 
+test('every build in CLICK_BUILDS: a genuine click and a multiselect click are recorded (the build allowlist admits the recorded builds)', async (t) => {
+  for (const build of CLICK_BUILDS) {
+    const w = world(t, { build });
+    const r = await w.click();
+    assert.equal(r.recorded?.via, 'ask', `${build}: ${JSON.stringify(r)}`);
+    assert.equal(r.recorded.prompt, 'merge');
+    assert.equal(clickProvenance(r.recorded, { home: w.home }), 'owner', build);
+    assert.equal(w.gap(), 'ok', build);
+    assert.equal(JSON.parse(readFileSync(join(asksDir(w.home), `${w.askId}.spent`), 'utf8')).producerVersion, build);
+    // (the multiselect recording's own answer varies by build; the test binds the labels it needs in the copy)
+    const many = world(t, { build, parts: manyParts(), answer: 'Merge #58, Merge #59', fixture: 'multiselect-click' });
+    const m = await many.click();
+    assert.equal(m.kind, 'merge-many', `${build}: ${JSON.stringify(m)}`);
+    assert.equal(m.recorded.prompt, 'merge #58 #59');
+    assert.equal(many.gap({ pr: 59 }), 'ok', build);
+  }
+});
+
+test('a genuine 2.1.323 click (the recording, answered after 30 s) is recorded and proven', async (t) => {
+  const w = world(t, { build: '2.1.323' });
+  const r = await w.click();
+  assert.equal(r.recorded?.via, 'ask', JSON.stringify(r));
+  assert.equal(clickProvenance(r.recorded, { home: w.home }), 'owner');
+  assert.equal(w.gap(), 'ok');
+});
+
 test('"Other" free text goes through the same strict parser: "merge" records, "merge after CI" records nothing and consumes nothing', async (t) => {
   const yes = world(t, { answer: 'merge' });
   assert.equal((await yes.click()).recorded?.prompt, 'merge');
@@ -213,28 +251,88 @@ test('a second click on an ask already answered is refused (one ask, one use)', 
 
 // ---- the refusals ---------------------------------------------------------------------------------------------------------------------
 
-test('an answer a hook gave (PreToolUse updatedInput, PermissionRequest) is refused: no user_temporary stamp', async (t) => {
-  for (const fixture of ['pretooluse-hook-answer', 'permissionrequest-hook-answer']) {
-    const w = world(t, { fixture });
-    assert.deepEqual(await w.click(), { refused: 'not-a-human-answer' }, fixture);
+test('an answer a hook gave (PreToolUse updatedInput, PermissionRequest) is refused: no user_temporary stamp (every build)', async (t) => {
+  for (const build of CLICK_BUILDS) {
+    for (const fixture of ['pretooluse-hook-answer', 'permissionrequest-hook-answer']) {
+      const w = world(t, { fixture, build });
+      assert.deepEqual(await w.click(), { refused: 'not-a-human-answer' }, `${build} ${fixture}`);
+      assert.equal(w.records().length, 0);
+    }
+  }
+});
+
+// 2.1.323: a PreToolUse hook that answers "ask" with `updatedInput.answers` makes Claude Code show the dialog and then SUBMIT the prefilled answer itself after ~1.5-2 s, stamped
+// decision accept / source user_temporary / grantScope once, but reasonCode "hook:PreToolUse" (a person's click: "unknown"), annotations {} and no `answers` in the tool_use input.
+test('a hook-prefilled "ask" answer that Claude Code submitted itself is refused not-a-human-answer, whatever the answer time (every build that has the case)', async (t) => {
+  const builds = [...new Set(['2.1.323', ...CLICK_BUILDS.filter((b) => buildAtLeast(b, '2.1.323'))])]; // 2.1.323 always: it is the build that recorded the case
+  for (const build of builds) {
+    const w = world(t, { fixture: 'pretooluse-ask-prefill', build, mutate: ({ use, result }) => { result.timestamp = new Date(Date.parse(use.timestamp) + 40000).toISOString(); } });
+    assert.equal(w.result.permissionDecision.reasonCode, 'hook:PreToolUse', 'the fixture is the recorded hook auto-submit');
+    assert.deepEqual(Object.keys(w.use.message.content[0].input), ['questions']);
+    const ev = clickEvidence(w.file, w.toolUseId, { home: w.home });
+    assert.deepEqual([ev.ok, ev.reason], [false, 'not-a-human-answer'], `${build} clickEvidence`);
+    assert.deepEqual(await w.click(), { refused: 'not-a-human-answer' }, build);
+    assert.equal(w.records().length, 0);
+    // the recording's own, shorter time refuses the same way (the stamp is checked before the floor)
+    const fast = world(t, { fixture: 'pretooluse-ask-prefill', build, mutate: ({ use, result }) => { result.timestamp = new Date(Date.parse(use.timestamp) + 1487).toISOString(); } });
+    assert.equal(clickEvidence(fast.file, fast.toolUseId, { home: fast.home }).reason, 'not-a-human-answer');
+  }
+});
+
+test('the human stamp is the WHOLE permissionDecision: an extra key, a missing grantScope or reasonCode, another grantScope or reasonCode is refused not-a-human-answer', async (t) => {
+  assert.deepEqual(HUMAN_DECISION, { decision: 'accept', source: 'user_temporary', grantScope: 'once', reasonCode: 'unknown' });
+  assert.ok(Object.isFrozen(HUMAN_DECISION));
+  const { grantScope: _g, ...noGrantScope } = HUMAN_DECISION;
+  const { reasonCode: _r, ...noReasonCode } = HUMAN_DECISION;
+  const cases = {
+    'extra key': { ...HUMAN_DECISION, reasonType: 'hook' },
+    'no grantScope': noGrantScope,
+    'no reasonCode': noReasonCode,
+    'only decision and source': { decision: 'accept', source: 'user_temporary' },
+    'another grantScope': { ...HUMAN_DECISION, grantScope: 'session' },
+    'hook reasonCode': { ...HUMAN_DECISION, reasonCode: 'hook:PreToolUse' },
+    'another reasonCode': { ...HUMAN_DECISION, reasonCode: 'rule' },
+    'another source': { ...HUMAN_DECISION, source: 'user_permanent' },
+    'not an object': 'accept',
+    absent: undefined,
+  };
+  for (const build of CLICK_BUILDS) {
+    for (const [name, pd] of Object.entries(cases)) {
+      const w = world(t, { build, mutate: ({ result }) => { if (pd === undefined) delete result.permissionDecision; else result.permissionDecision = pd; } });
+      assert.deepEqual(await w.click(), { refused: 'not-a-human-answer' }, `${build} ${name}`);
+      assert.equal(w.records().length, 0, name);
+    }
+    const genuine = world(t, { build });
+    assert.deepEqual(genuine.result.permissionDecision, HUMAN_DECISION, `${build}: the genuine fixture carries exactly the human stamp`);
+  }
+});
+
+test('the model pre-filling `answers` in the tool input is refused (an input key, and the dialog was rejected on 2.1.322; auto-submitted with the human stamp on 2.1.323) (every build)', async (t) => {
+  for (const build of CLICK_BUILDS) {
+    const w = world(t, { fixture: 'model-prefilled-answers', build, mutate: ({ use, result }) => { use.message.content[0].input.answers = { x: 'Merge' }; result.message.content[0].is_error = undefined; result.timestamp = new Date(Date.parse(use.timestamp) + 2500).toISOString(); } });
+    assert.deepEqual(await w.click(), { refused: 'tool-use-shape' }, build);
     assert.equal(w.records().length, 0);
   }
 });
 
-test('the model pre-filling `answers` in the tool input is refused (an input key, and the dialog was rejected)', async (t) => {
-  const w = world(t, { fixture: 'model-prefilled-answers', mutate: ({ use, result }) => { use.message.content[0].input.answers = { x: 'Merge' }; result.message.content[0].is_error = undefined; } });
-  assert.deepEqual(await w.click(), { refused: 'tool-use-shape' });
+test('2.1.323 model-prefilled-answers: the recording itself carries the exact human stamp, so only the tool-use shape check refuses it (answer >= 2 s)', async (t) => {
+  const w = world(t, { fixture: 'model-prefilled-answers', build: '2.1.323', mutate: ({ use, result }) => { use.message.content[0].input.answers = { x: 'Merge' }; result.timestamp = new Date(Date.parse(use.timestamp) + 2058).toISOString(); } });
+  assert.deepEqual(w.result.permissionDecision, HUMAN_DECISION);
+  assert.ok(Date.parse(w.result.timestamp) - Date.parse(w.use.timestamp) >= MIN_ANSWER_MS);
+  assert.deepEqual(clickEvidence(w.file, w.toolUseId, { home: w.home }), { ok: false, reason: 'tool-use-shape' });
 });
 
-test('annotations (the owner pressed n for notes, or an option preview was copied in) are refused; the preview spike transcript too', async (t) => {
-  const notes = world(t, { mutate: ({ result, dialog }) => { result.toolUseResult.annotations = { [dialog.question]: { notes: 'but only after lunch' } }; } });
-  assert.deepEqual(await notes.click(), { refused: 'annotations' });
-  const preview = world(t, { fixture: 'preview-annotations' });
-  assert.deepEqual(await preview.click(), { refused: 'annotations' }, 'the dialog itself is canonical here; the annotations are what refuses');
-  const withPreview = world(t, { tamper: (d) => { d.options[1].preview = 'Rulings ...'; return d; } });
-  assert.equal((await withPreview.click()).refused, 'dialog-not-canonical');
-  const loaded = loadFixture('preview-annotations')[2].toolUseResult.annotations;
-  assert.ok(Object.values(loaded).some((a) => 'preview' in a), 'the spike copied the chosen option preview into annotations');
+test('annotations (the owner pressed n for notes, or an option preview was copied in) are refused; the preview spike transcript too (every build)', async (t) => {
+  for (const build of CLICK_BUILDS) {
+    const notes = world(t, { build, mutate: ({ result, dialog }) => { result.toolUseResult.annotations = { [dialog.question]: { notes: 'but only after lunch' } }; } });
+    assert.deepEqual(await notes.click(), { refused: 'annotations' }, build);
+    const preview = world(t, { fixture: 'preview-annotations', build });
+    assert.deepEqual(await preview.click(), { refused: 'annotations' }, `${build}: the dialog itself is canonical here; the annotations are what refuses`);
+    const withPreview = world(t, { build, tamper: (d) => { d.options[1].preview = 'Rulings ...'; return d; } });
+    assert.equal((await withPreview.click()).refused, 'dialog-not-canonical', build);
+    const loaded = loadFixture('preview-annotations', build)[2].toolUseResult.annotations;
+    assert.ok(Object.values(loaded).some((a) => 'preview' in a), `${build}: the spike copied the chosen option preview into annotations`);
+  }
 });
 
 test('a dialog edited after issue is refused: one character, an added option, another header, multiSelect flipped, a description changed', async (t) => {
@@ -280,6 +378,7 @@ test('entry checks: sidechain, is_error, a parent chain elsewhere, headless entr
     'sdk-cli result': [({ result }) => { result.entrypoint = 'sdk-cli'; }, 'entrypoint'],
     'sdk-cli use': [({ use }) => { use.entrypoint = 'sdk-cli'; }, 'entrypoint'],
     'versions differ': [({ result }) => { result.version = '2.1.323'; }, 'version'],
+    'permissionDecision with a hook reason': [({ result }) => { result.permissionDecision = { ...HUMAN_DECISION, reasonCode: 'hook:PreToolUse' }; }, 'not-a-human-answer'],
     'other session': [({ result }) => { result.sessionId = '22222222-2222-4222-8222-222222222222'; }, 'session'],
     'two blocks': [({ result }) => { result.message.content.push({ type: 'text', text: 'x' }); }, 'tool-result-shape'],
     'answers for two questions': [({ result }) => { result.toolUseResult.answers.extra = 'x'; }, 'answers-shape'],
@@ -291,10 +390,29 @@ test('entry checks: sidechain, is_error, a parent chain elsewhere, headless entr
     assert.deepEqual(await w.click(), { refused: reason }, name);
     assert.equal(w.records().length, 0, name);
   }
-  const old = world(t, { mutate: ({ use, result }) => { use.version = '2.1.321'; result.version = '2.1.321'; } });
-  assert.deepEqual(await old.click(), { refused: 'build-not-allowlisted' });
-  assert.deepEqual([...CLICK_BUILDS], ['2.1.322']);
+  for (const other of ['2.1.321', '2.1.324']) {
+    const unlisted = world(t, { mutate: ({ use, result }) => { use.version = other; result.version = other; } });
+    assert.deepEqual(await unlisted.click(), { refused: 'build-not-allowlisted' }, other);
+    assert.equal(unlisted.records().length, 0, other);
+  }
+});
+
+test('CLICK_BUILDS is frozen; every build has its fixture folder with the required files, and every fixture was written by that build', () => {
   assert.ok(Object.isFrozen(CLICK_BUILDS));
+  assert.ok(CLICK_BUILDS.length > 0 && CLICK_BUILDS.every((b) => /^\d+\.\d+\.\d+$/.test(b)));
+  assert.equal(new Set(CLICK_BUILDS).size, CLICK_BUILDS.length);
+  for (const build of CLICK_BUILDS) {
+    const files = readdirSync(BUILD_DIR(build)).filter((f) => f.endsWith('.jsonl')).map((f) => f.slice(0, -6)).sort();
+    for (const name of requiredFor(build)) assert.ok(files.includes(name), `${build} is missing test/fixtures/click/${build}/${name}.jsonl (record it with scripts/click-spike.mjs)`);
+    for (const name of files) {
+      const entries = loadFixture(name, build);
+      assert.equal(entries.length, 3, `${build}/${name}`);
+      assert.deepEqual([entries[1].version, entries[2].version], [build, build], `${build}/${name}: the fixture's version field is its folder name`);
+    }
+  }
+  // no fixture folder for a build that is not allowlisted is a stale recording
+  const folders = readdirSync(FIX, { withFileTypes: true }).filter((d) => d.isDirectory()).map((d) => d.name).sort();
+  assert.deepEqual(folders, [...CLICK_BUILDS].sort(), 'every fixture folder is an allowlisted build and vice versa');
 });
 
 test('an answer sooner than 2 s after the dialog opened is a typed-ahead key, refused; 2 s exactly passes', async (t) => {
