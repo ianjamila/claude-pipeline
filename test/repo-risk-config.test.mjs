@@ -317,6 +317,7 @@ const DEPTH1_EXEMPT = new Map([
 // importing anything else from the file (a namespace, a default, a new name, a side-effect import) fails until someone re-reads it. '*' = a namespace
 // or an unreadable clause; '(side effect)' = a bare `import './x.mjs'`. Checked against every root's import clause, static and dynamic.
 const DEPTH1_NAMES = new Map([
+  ['pipeline/lib/codex-usage-kinds.mjs', ['summariseUsage']],
   ['pipeline/lib/round-ask.mjs', ['askSummary', 'costFrom', 'notCleanReasons', 'openItems', 'roundsFrom', 'statusLines']],
   ['pipeline/lib/worktree-prune/inspect.mjs', ['unFirm']],
   ['pipeline/lib/worktree-prune/run.mjs', ['pruneLogDir']],
