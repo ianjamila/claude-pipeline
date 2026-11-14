@@ -184,3 +184,4 @@ full record.
 - 2026-11-14 · #428 · Review threat models in the arbiter and Codex input, and a late fix-verify lane (opt-in; #374 PR A) · risk high · rounds 7 · arbiter 5 · awaiting-owner-merge · Codex 7d: 8926 runs (8699 high)
 - 2026-11-14 · #420 · fix(review): one default-branch anchor, resolved fully qualified; follow-ups #367 #368 #387 #388 #392 #396 #407 · risk high · rounds 7 · arbiter 6 · awaiting-owner-merge · Codex 7d: 9617 runs (9381 high)
 - 2026-11-14 · #420 · fix(review): one default-branch anchor, resolved fully qualified; follow-ups #367 #368 #387 #388 #392 #396 #407 · risk high · rounds 8 · arbiter 6 · awaiting-owner-merge · Codex 7d: 10258 runs (10011 high)
+- 2026-11-14 · #476 · Codex model config: shape check, retired-model stand-in, say where effort/model come from (#443 #431 #445) · risk high · rounds 4 · arbiter 3 · awaiting-owner-merge · Codex 7d: 10377 runs (10124 high)
