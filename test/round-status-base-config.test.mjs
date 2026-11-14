@@ -96,3 +96,24 @@ test('the park comment: an unreadable trusted base config with no open item says
   const a = ask(w);
   assert.ok(a.warnings.some((x) => x.startsWith('severity could not be judged: the trusted base config is unreadable')), JSON.stringify(a.warnings));
 });
+
+// #368: an unreadable reviewed diff only matters while an item is open (round-ask.mjs warns the same way): with nothing open there is no severity to guess.
+test('the park comment: an unreadable reviewed diff with no open item keeps "no item is open" (no severity warning)', (t) => {
+  const w = roundWorld(t);
+  w.atCap();
+  w.edit((s) => {
+    for (const r of s.rounds) r.items = [];
+    s.rounds.at(-1).toHead = 'f'.repeat(40); // no such commit: the reviewed diff cannot be read
+  });
+  const body = park(w);
+  assert.match(body, /^- Open: no item is open\.$/m);
+  assert.doesNotMatch(body, /severity could not be judged/);
+});
+
+test('the park comment: an unreadable reviewed diff with an item open still drops the Open line (the warning stays)', (t) => {
+  const w = roundWorld(t);
+  w.atCap();
+  w.edit((s) => { s.rounds.at(-1).toHead = 'f'.repeat(40); });
+  const body = park(w);
+  assert.match(body, /^- Open: not available \(severity could not be judged\)\.$/m);
+});

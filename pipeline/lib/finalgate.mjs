@@ -30,7 +30,7 @@ import { verifyOwnerGrants } from './owner-grants.mjs';
 import { docsExemptFrom } from './docs-exempt.mjs';
 import { readReviewGate } from './model-floor.mjs';
 import { skipOf } from './verify-steps.mjs';
-import { NETWORK_TIMEOUT_MS, commitTime, diffFiles, git, headSha, mergeBase, revParse, reviewBaseRef, reviewContentHash, showFile, treeFingerprint } from './git.mjs';
+import { NETWORK_TIMEOUT_MS, commitTime, diffFiles, displayRef, git, headSha, mergeBase, revParse, reviewBaseRef, reviewContentHash, showFile, treeFingerprint } from './git.mjs';
 import { ownerItemsDigest, rulingsBlockDigest } from '../hooks/lib/owner-go.mjs';
 import { QueueUnreadable, queueModeFor } from './merge-queue.mjs';
 
@@ -239,7 +239,7 @@ function behindBase({ info, diff, root, config, baseSha = null, queueMode = fals
   try {
     const ref = baseSha ?? baseRefFor(root, config, branch);
     const tip = baseSha ?? revParse(`${ref}^{commit}`, { cwd: root });
-    if (tip !== d.mb) return `the base (${baseSha ? 'GitHub\'s base commit' : ref} at ${short(tip)}) is not an ancestor of HEAD; the branch forked from ${short(d.mb)}`;
+    if (tip !== d.mb) return `the base (${baseSha ? 'GitHub\'s base commit' : displayRef(ref)} at ${short(tip)}) is not an ancestor of HEAD; the branch forked from ${short(d.mb)}`;
   } catch { /* an unreadable ref was already reported by the diff */ }
   return null;
 }

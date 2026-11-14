@@ -78,6 +78,7 @@ function summaryKind(gh, pr, sections, outcome) {
     outcome, host: hostname(), now: Date.now(),
   });
   const r = writeRunRecord(gh, pr, { record, sections, firstRead: existing });
+  for (const w of r.warnings) if (!warnings.includes(w)) warnings.push(w);
   return { exitCode: EXIT.OK, output: { ok: true, kind: 'summary', pr, action: r.action, url: r.url, id: r.id, step: r.record.step, warnings } };
 }
 

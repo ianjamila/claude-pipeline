@@ -49,6 +49,9 @@ export function writeSummaryComment(gh, pr, { record, sections, existing } = {})
   if (String(useSections).trim()) parts.push(String(useSections).trim(), '');
   if (useRecord) parts.push(encodeRecord(useRecord));
   const body = parts.join('\n').trimEnd();
-  const posted = gh.upsertComment(pr, MARKERS.summary, body);
+  // `current` is a fresh read of the newest own marker comment: edit that id instead of listing every comment again (#396); no comment yet (or a gh without updateComment): the upsert creates it.
+  const posted = current.id != null && typeof gh.updateComment === 'function'
+    ? gh.updateComment(current.id, MARKERS.summary, body)
+    : gh.upsertComment(pr, MARKERS.summary, body);
   return { ...posted, record: useRecord };
 }

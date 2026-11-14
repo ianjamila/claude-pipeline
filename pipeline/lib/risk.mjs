@@ -252,7 +252,7 @@ export function trustedBase({ root, head, config, trustedFork: given }) {
 // records the Fable round review-complete will ask for.
 // `base` (optional) is the ref the diff starts from; it defaults to the trusted fork point (codex-review passes its own, stack-aware, fork point).
 // Throws what the scan throws (the callers decide how to fail closed). -> {
-//   level, reasons, changedLines, fileCount, drivers, sizeOnly, reviewer, laneReasons, sensitivePaths, sizeOnlyJudge, note, hits, files, lightLane,
+//   level, reasons, changedLines, fileCount, drivers, sizeOnly, reviewer, laneReasons, laneNotes, sensitivePaths, sizeOnlyJudge, note, hits, files, lightLane,
 //   trustedFork, baseConfig: { ok, reason? }, stacked, defaultBranch, anchor, untrusted }
 // `defaultBranch` is the trusted one and `anchor` where it came from ('origin-head' | 'ls-remote' | 'config', trustedDefaultBranch), for a caller that decides "is the PR's base the default branch" (admitRound's base rule, #398); `untrusted` (a sentence, or null) says the anchor came from the working tree although an origin remote exists:
 // such a default branch is the PR's to choose and must not narrow a reviewed range (S1).
@@ -298,9 +298,11 @@ export async function rateBranch({ root, head, config, prBase, base }) {
   if (stacked && sizeCandidate) reasons.push(`stacked PR: base is ${prBase} (no size-only judge)`);
   if (!trusted.ok) laneReasons.push(`trusted base config unreadable: ${trusted.reason}`);
   else if (mismatch !== null) laneReasons.push(`trusted base config unreadable: ${mismatch}`);
+  // Informational, never a reason for Fable (codex-review stores laneReasons as the Fable reasons): its own field (#367).
+  const laneNotes = [];
   if (remoteDefault !== null) {
     const source = anchor === 'ls-remote' ? 'the remote (git ls-remote --symref origin HEAD; origin/HEAD is not set)' : 'origin/HEAD';
-    laneReasons.push(`${source} names default branch ${JSON.stringify(remoteDefault)}, pipeline.yml names ${JSON.stringify(config.default_branch)}: the rating follows ${anchor === 'ls-remote' ? 'the remote' : 'origin/HEAD'}. The pipeline supports only GitHub's default branch as its main: set default_branch: ${remoteDefault} in pipeline.yml, or make ${JSON.stringify(config.default_branch)} the default branch on GitHub (fix a stale origin/HEAD with \`git remote set-head origin -a\`)`);
+    laneNotes.push(`${source} names default branch ${JSON.stringify(remoteDefault)}, pipeline.yml names ${JSON.stringify(config.default_branch)}: the rating follows ${anchor === 'ls-remote' ? 'the remote' : 'origin/HEAD'}. The pipeline supports only GitHub's default branch as its main: set default_branch: ${remoteDefault} in pipeline.yml, or make ${JSON.stringify(config.default_branch)} the default branch on GitHub (fix a stale origin/HEAD with \`git remote set-head origin -a\`)`);
   }
   // The collector's own identity (hardstops.mjs makeSink: rule, file, line; the detail when there is no line), and the stricter status
   // (blocking > ownerMerge > report-only) when both configs report the same hit.
@@ -330,7 +332,7 @@ export async function rateBranch({ root, head, config, prBase, base }) {
       hardStop: rated.some((r) => r.risk.drivers.hardStop), advisory: rated.some((r) => r.risk.drivers.advisory),
       path: rated.some((r) => r.risk.drivers.path), size: rated.some((r) => r.risk.drivers.size),
     },
-    sizeOnly, reviewer, laneReasons, sensitivePaths, ...(sizeOnlyJudge ? { sizeOnlyJudge: true, note: SIZE_ONLY_NOTE } : {}),
+    sizeOnly, reviewer, laneReasons, laneNotes, sensitivePaths, ...(sizeOnlyJudge ? { sizeOnlyJudge: true, note: SIZE_ONLY_NOTE } : {}),
     hits, files, lightLane: rated.every((r) => r.lightLane), trustedFork, baseConfig: trustedOk ? { ok: true, same: sameConfig } : { ok: false, reason: trusted.ok ? mismatch : trusted.reason }, stacked, defaultBranch, anchor, untrusted,
   };
 }
