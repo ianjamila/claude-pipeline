@@ -605,7 +605,8 @@ test('#352 R23-B1, R23-F1: a nested or quoted subscript in a named descriptor is
   }
   // (#352 R24-F2: the subscript is arithmetic (quotes removed), so it may assign any name: only a plain number or name is followed)
   for (const w of ['{a["x=5"]}', '{a[x=5]}', '{a[x+=1]}', "{a['0']}", '{a[$i]}', '{a[i++]}']) refuses(`exec ${w}>f; push`, `exec ${w}>/dev/null; ${SHIP}`, {}, GIT_ROOT);
-  allows('twin: exec {a[i]}>/dev/null; push', `exec {a[i]}>/dev/null; ${SHIP}`, {}, GIT_ROOT);
+  // (#352 R25-B1: a plain name's value is evaluated as arithmetic too: only a plain number is followed)
+  refuses('R25-B1: exec {a[i]}>/dev/null; push', `exec {a[i]}>/dev/null; ${SHIP}`, {}, GIT_ROOT);
   allows('twin: exec {a[12]}>/dev/null; push', `exec {a[12]}>/dev/null; ${SHIP}`, {}, GIT_ROOT);
   // (#352 R24-B1: a newline inside a quoted subscript; R24-F1: a line continuation around a quoted one, which the shell removes before it reads the word)
   for (const w of ["{a['x\ny']}", '{a["x\ny"]}', "{a\\\n['0']}", "{\\\na['0']}", "{a['0']\\\n}", "{a['0']}\\\n", '{a[$(\necho 0)]}']) {

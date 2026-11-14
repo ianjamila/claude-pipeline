@@ -2455,8 +2455,9 @@ class Parser {
       const one = wspans.length > 0 && wspans[0][0] === 0 && wspans[0][1] === text.length; // (the first span covers the whole text: no other can follow it)
       const from = wstart;
       const fdw = /[<>]/.test(s[this.i] ?? '') && (q < 0 ? FD_NAME_WORD.test(text) : FD_SUB_RAW.test(s.slice(from, this.i).replace(/\\\r?\n/g, ''))); // (a `{fd}>file` redirect prefix: R19-F2, R23-F1, R24)
-      // (#352 R24-F2: the subscript of an indexed array is arithmetic, quotes removed, so `exec {a["x=5"]}>f` assigns x: a named descriptor whose subscript is anything but a plain number or name refuses the line)
-      if (fdw && (q >= 0 || (text.includes('[') && !/^\{[A-Za-z_]\w*\[(?:\d+|[A-Za-z_]\w*)\]\}$/.test(text)))) ctx.truncated = true;
+      // (#352 R24-F2: the subscript of an indexed array is arithmetic, quotes removed, so `exec {a["x=5"]}>f` assigns x: a named descriptor whose subscript is anything but a plain number refuses the line.
+      // R25-B1: a plain name is no exception: its VALUE is evaluated as arithmetic too (`i='F=22'; exec {a[i]}>f` assigns F))
+      if (fdw && (q >= 0 || (text.includes('[') && !/^\{[A-Za-z_]\w*\[\d+\]\}$/.test(text)))) ctx.truncated = true;
       cur = '';
       inWord = false;
       qa = -1;
