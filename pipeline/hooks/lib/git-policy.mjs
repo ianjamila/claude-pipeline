@@ -2953,7 +2953,7 @@ function evalString(str, startDir, ctx, level, child = false) {
       const orExits = next?.sep === '||' && plainExit(next) && after?.sep !== '|' && after?.sep !== '&'
         && !(after !== undefined && after.argv.length === 0 && (after.redirects ?? []).length > 0)
         || (changesState && exitsAsGroup(i));
-      if (changesState && !failGroup && exitsAsGroup(i)) failGroup = { to: exitOfGroup(i), snap: null, doubt: false };
+      if (changesState && !failGroup && exitsAsGroup(i)) failGroup = { to: exitOfGroup(i), snap: null, doubt: false, from: i, byDir: DIR_CHANGERS.includes(nm) };
       if (changesState && (inFlow(from, i) || c.depth > 0 || c.sep === '&&' || c.sep === '||' || ranInSubshell(cmds, i) || (next?.sep === '||' && !orExits))) uncertain = true;
       if (failGroup && failGroup.snap === null) failGroup.doubt = uncertain; // (the doubt about this cd / checkout, carried or new: it is consumed inside the group)
     }
@@ -3072,7 +3072,8 @@ function evalString(str, startDir, ctx, level, child = false) {
     }
   }
   // #482: a group whose exit ends the text is restored here too (ctx.branches is shared with the caller of a nested text: it must not keep every branch name forgotten)
-  if (failGroup?.snap) restoreAfterGroup();
+  // (#491 R1: only a group opened by a directory change, with no git state change inside it: after a checkout that may have failed, or a switch made where the directory is unknown, the caller's branch is not known)
+  if (failGroup?.snap && failGroup.byDir && !cmds.slice(failGroup.from + 1, failGroup.to + 1).some((g) => baseName(g.argv[0] ?? '') === 'git' && g.argv.some((w) => STATE_GIT.has(w)) && !g.argv.some((w) => w === '--show-current' || w === '--list' || w === '-l'))) restoreAfterGroup();
   return allowed();
   } finally {
     // what the list wrote is still true for the commands after the one that ran it

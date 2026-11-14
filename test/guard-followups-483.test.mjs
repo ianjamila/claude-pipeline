@@ -95,4 +95,17 @@ describe('#482: a failure group that ends the text is restored when the text end
     const v = gitRun('git checkout agent/y && bash build.sh; git push', { [BUILD]: 'cd dist || { echo no; exit 1; }\nmake\n' });
     assert.equal(v.decision, 'allow', v.reason);
   });
+  // #491 R1: the end-of-text restore only when the group was opened by a directory change and nothing in it changes git state (the caller shares ctx.branches: origin/main left the names forgotten)
+  test('R1-B1: a checkout that may fail, then a group that exits: the caller\'s push is not judged on the optimistic branch (denied, as on main)', () => {
+    const v = gitRun('bash build.sh; git push', { [BUILD]: 'git checkout agent/missing || { echo no; exit 1; }\n' });
+    assert.equal(v.decision, 'deny', v.reason);
+  });
+  test('R1-F1: a git checkout inside the group (its directory unknown there) is not hidden by the restore (denied, as on main)', () => {
+    const v = gitRun('git checkout agent/y && bash build.sh; git push', { [BUILD]: 'cd dist || { git checkout main; exit 1; }\n' });
+    assert.equal(v.decision, 'deny', v.reason);
+  });
+  test('the #482 case with a command in the group that does not change git state is still restored (allowed)', () => {
+    const v = gitRun('git checkout agent/y && bash build.sh; git push', { [BUILD]: 'make\ncd dist || { echo no; git status; exit 1; }\n' });
+    assert.equal(v.decision, 'allow', v.reason);
+  });
 });
