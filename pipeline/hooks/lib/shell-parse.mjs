@@ -2118,6 +2118,7 @@ class Parser {
     this.ctlUp = []; // the levels (ctx.up) before each construct opened
     this.ctlStack = []; // loops / function bodies / { groups open (see ctlOpen), for every nesting level of this text
     this.ctlBase = 0; // where the current level's entries start
+    this.ctlCond = []; // for each open construct: an if / loop whose condition is still open (no `then` / `do` yet), see the R16 rule in flushWord
     this.ctlNeg = []; // for each open construct: it was opened under a `!` (its commands are negated, see ctx.neg)
     this.ctlPS = []; // and the start of the pipeline it was opened in (an index of ctx.out), for a `&` after its closer
     this.pipeStart = ctx.out.length; // the first command of the pipeline being read (ctx.out index): a `&` after it makes all of them a background job (cmd.bg)
@@ -2128,8 +2129,6 @@ class Parser {
     this.pipeLead = ';';
     this.ctlPH = []; // and the pipeHead / pipeLead each open construct was opened under
     this.ctlPL = [];
-    this.ctlAlt = []; // (R15-F1: the `{` is the body of a zsh alternate-form loop / if: its `}` ends that construct too)
-    this.lastCloseAlt = false;
     this.lastClosePH = 0;
     this.lastClosePL = ';';
     ctx.work += src.length;
@@ -2422,7 +2421,9 @@ class Parser {
           pipedFrom: lastSep === '|' ? this.lastStage : null, pipeSkip: lastSep === '|' && this.lastStageParen ? this.lastStage : null, sep: tail ? tail.sep : lastSep, lead: tail ? tail.lead : lastSep === '|' ? this.pipeLead : null, afterClose: tail ? tail.afterClose : lastSep === '&&' && lastAfterClose,
           up: ctx.up, negIn: ctx.neg > 0, negPipe: lastSep === '|' && lastNeg, negLead: false, // (negation: R9-F3; up: R9-F1)
         };
-        tailUndo = tail ? { empty: tail.empty, seg, pipeStart: this.pipeStart, pipeHead: this.pipeHead, pipeLead: this.pipeLead, at: ctx.out.length } : null;
+        // (#352 R16: a ( ) / (( )) that ends the condition of an open if / while / until: the next WORD is zsh's short-form body, which this parser does not follow, see flushWord)
+        if (tail && this.condOpenTop()) { seg.condWatch = true; seg.condAnon = tail.empty === true; }
+        tailUndo = tail ? { seg, pipeStart: this.pipeStart, pipeHead: this.pipeHead, pipeLead: this.pipeLead, at: ctx.out.length } : null;
         if (!tail && lastSep !== '|' && lastSep !== '&&' && lastSep !== '||') this.pipeStart = ctx.out.length; // (a & ends the whole and-or list: `a && b &`)
         if (!tail && lastSep !== '|') { this.pipeHead = ctx.out.length; this.pipeLead = lastSep; }
         lastAfterClose = false;
@@ -2488,18 +2489,26 @@ class Parser {
         this.hd.push({ delim: text, strip, quoted: q >= 0, seg });
         return;
       }
+      // (#352 R16: zsh "condition then body" forms. While an if / while / until condition is open, a WORD after the `)` / `))` / `]]` that ends a condition part is the body of the short or alternate form
+      // (`if C (sub) { B } else { E }`, `until C [[ x ]] B`): the body runs when the condition FAILED (until) or held, which the && / || list before it says nothing about. The parser does not follow these: the
+      // whole line's directory and branch become unknown (ctlBroken), as for any shape it cannot follow. Not words here: a reserved word that continues the construct (then / do / else ...), a `{fd}` redirect, the
+      // `{` of a zsh anonymous function `() { }` (the `()` exactly adjacent) and the redirect targets above)
+      if (seg.condWatch) {
+        if (q < 0 && (text === 'then' || text === 'do' || text === ']]' || AFTER_PAREN_RESERVED.has(text))) { if (text !== ']]') seg.condWatch = false; }
+        else if (q < 0 && /^\{[A-Za-z_]\w*\}$/.test(text) && /[<>]/.test(s[this.i] ?? '')) seg.condAnon = false;
+        else if (q < 0 && text === '{' && seg.condAnon) seg.condWatch = false;
+        else { ctx.ctlBroken = true; seg.condWatch = false; }
+        seg.condAnon = false;
+      } else if (q < 0 && text === ']]' && seg.dblBracket === true && this.condOpenTop()) { seg.condWatch = true; seg.condAnon = false; }
+      if (q < 0 && text === '[[' && seg.kwOnly !== false) seg.dblBracket = true;
+      // (the zsh brace bodies of `repeat N { }` and `for x in a b { }`: the `{` is no command here, so it is never opened)
+      if (q < 0 && text === '{' && seg.words.length > 0 && seg.words[0].qa < 0 && ['for', 'select', 'repeat', 'foreach'].includes(seg.words[0].text) && this.condOpenTop()) ctx.ctlBroken = true;
       // (#352 R13-F1: a reserved word that closes or continues a construct after `)` (`else`, `then`, `fi`, ...) is no redirect of the subshell: the segment is an ordinary one that follows a `;`.
       // R14-F1: any other word (`{fd}` of a named-descriptor redirect, the `{` of a zsh `() { }`, a short-form body) still continues the list that began before the `(`, so the tail stays)
       if (tailUndo && tailUndo.seg === seg) {
         if (q < 0 && AFTER_PAREN_RESERVED.has(text)) {
           seg.sep = ';'; seg.lead = null; seg.afterClose = false;
           this.pipeStart = tailUndo.at; this.pipeHead = tailUndo.at; this.pipeLead = ';';
-        } else if (!(seg.redirects.length > 0 || (q < 0 && /^\{[A-Za-z_]\w*\}$/.test(text) && /[<>]/.test(s[this.i] ?? '')) || (q < 0 && text === '{' && tailUndo.empty))) {
-          // (R15-F1: any other word is no part of the subshell's command: after a `( )` that ends an if / while / until condition it is the BODY, which runs when the condition FAILED, so it must not
-          // keep the `&&` before the `(`. The list bookkeeping (pipeStart / pipeHead / pipeLead) stays for `&`; a change before the construct is carried by the construct's own level)
-          seg.sep = ';'; seg.lead = null; seg.afterClose = false;
-          // (a `{` straight after the `)` that ends the condition of a loop / if is its zsh alternate-form body: it may not run, as the body of `do` / `then` may not)
-          if (q < 0 && text === '{' && ['loop', 'if'].includes(this.ctlStack[this.ctlStack.length - 1])) seg.condBody = true;
         }
         tailUndo = null;
       }
@@ -2531,21 +2540,24 @@ class Parser {
       if (q < 0 && cmdPos && text === 'function') seg.fnActive = true;
       else if (seg.fnActive && text !== '{') { fnName = true; ctx.fns.add(text); seg.fnHasName = true; }
       const fnKw = text === '{' && seg.fnActive === true && seg.fnHasName === true;
+      if (q < 0 && cmdPos && (text === 'then' || text === 'do' || text === 'elif')) this.ctlSetCond(text === 'do' ? 'loop' : 'if', text === 'elif');
       if (q < 0 && cmdPos && LOOP_WORDS.has(text)) { this.ctlOpen('loop', segNeg(seg), seg); seg.ctl = { ...seg.ctl, loop: true }; seg.loops = this.ctx.loops; }
       else if (q < 0 && cmdPos && text === 'if') { this.ctlOpen('if', segNeg(seg), seg); seg.ctl = { ...seg.ctl, cond: true }; }
       else if (q < 0 && cmdPos && text === 'fi') seg.closesFrom = this.ctlClose(['if']);
       else if (q < 0 && cmdPos && text === 'done') seg.closesFrom = this.ctlClose(['loop']);
       else if (q < 0 && cmdPos && text === '}') {
+        // (#352 R16: a `}` that has to close an if / loop / case still open above its brace (`f() { repeat 1 { :; }; ...`, `{ if C { } else { }; ...`, the brace bodies of zsh short forms the parser does not open) would end the OUTER group
+        // early: the marks are not to be trusted)
+        let k = this.ctlStack.length - 1;
+        while (k >= this.ctlBase && !['fn', 'brace', 'cbrace'].includes(this.ctlStack[k])) k--;
+        if (k >= this.ctlBase && this.ctlStack.slice(k + 1).some((x) => ['if', 'loop', 'case'].includes(x))) ctx.ctlBroken = true;
         seg.closesFrom = this.ctlClose(['fn', 'brace', 'cbrace']);
-        // (R15-F1: the `}` of a zsh alternate-form body ends the loop / if it belongs to, unless an else / elif follows)
-        if (seg.closesFrom !== undefined && this.lastCloseAlt && !/^[\s;]*(?:else|elif)(?![\w-])/.test(s.slice(this.i, this.i + 40))) {
-          const outer = this.ctlClose(['loop', 'if']);
-          if (outer !== undefined) seg.closesFrom = outer;
-        }
+        // (zsh `if C { } else { }`: an else / elif straight after a `}` of an if that has seen no `then` is the alternate form)
+        if (seg.closesFrom !== undefined && this.condOpenTop() && /^(?:[ \t]|\\\r?\n)*(?:else|elif)(?![\w-])/.test(s.slice(this.i, this.i + 4096))) ctx.ctlBroken = true;
       }
       else if (q < 0 && (cmdPos || fnKw) && text === '{') {
         // (a plain group after && / || runs only when that holds, and one that is a pipeline stage runs in a subshell: its commands may not run here -- review of #50)
-        const kind = fnPending || fnKw ? 'fn' : ['&&', '||', '|'].includes(seg.sep) || seg.condBody ? 'cbrace' : 'brace';
+        const kind = fnPending || fnKw ? 'fn' : ['&&', '||', '|'].includes(seg.sep) ? 'cbrace' : 'brace';
         this.ctlOpen(kind, kind !== 'fn' && segNeg(seg), seg);
         if (kind === 'fn') seg.ctl = { ...seg.ctl, fn: true }; // (the body's first command is in this segment: `{ echo x > f; }`)
         if (kind === 'cbrace') seg.ctl = { ...seg.ctl, cond: true };
@@ -2741,7 +2753,7 @@ class Parser {
           flushWord();
           // `f ()`, `f()`, zsh `f g ()`, `function f ()`: the words before an empty `()` are names of functions, and the next `{ }` or `( )` is their body
           const head = /^\(\s*\)/.test(s.slice(this.i, this.i + 64)) && seg ? seg.words.filter((w, k) => !(k === 0 && w.qa < 0 && w.text === 'function')).map((w) => w.text) : null;
-          const emptyParen = /^\(\s*\)/.test(s.slice(this.i, this.i + 64)); // (R15-F1: `()` with nothing inside: a `{` after it is a zsh anonymous function)
+          const adjacentEmpty = s[this.i + 1] === ')'; // (#352 R16: `()` with nothing inside: a `{` after it is a zsh anonymous function; `( )` is an empty subshell)
           const body = fnPending; // (this group is the body of the function named just before it)
           // (a subshell after && / || runs only when that holds, and one that is a pipeline stage runs apart: its commands may not run, as for a { } group (cbrace).
           // `{ cat a; true || (cat x); cat c; } | bash` runs a+c, which the join a+x+c hid)
@@ -2767,7 +2779,7 @@ class Parser {
           this.pipeStart = stageStart;
           this.pipeHead = stageHead;
           this.pipeLead = stageLead;
-          subTail = { sep: opened.sep, lead: opened.lead ?? null, afterClose: opened.afterClose, end: this.i, empty: emptyParen };
+          subTail = { sep: opened.sep, lead: opened.lead ?? null, afterClose: opened.afterClose, end: this.i, empty: adjacentEmpty }; // (empty: the group is exactly `()`)
           // (#352 R12-B1: a ( ) stage of a pipeline is no pipe mark for its OWN commands: they share the stage's directory with each other, and the level that ends gives back what a change in it did.
           // What came before the `|` is marked when the `|` is read (markPipe), and the group as a whole takes the operator of the pipeline (lead).)
           for (const c of ctx.out.slice(outFrom)) Object.defineProperty(c, 'paren', { value: true, enumerable: false, configurable: true });
@@ -2923,6 +2935,7 @@ class Parser {
   // A loop / function body / plain `{` group opens at this nesting level (closed by ctlClose, or when the level ends: see parseList).
   ctlOpen(kind, neg = false, seg = null) {
     this.ctlStack.push(kind);
+    this.ctlCond.push(kind === 'if' || kind === 'loop');
     // (#352 R10: every construct is a level of its own (up): its commands run under the operator of the construct, whatever `;` they are separated by inside it)
     this.ctlUp.push(this.ctx.up);
     this.ctx.up = [...this.ctx.up, { sep: seg ? seg.sep : this.lexOp().sep, lead: seg ? seg.lead : this.lexOp().lead, kind: kind === 'brace' ? 'brace' : 'blk' }];
@@ -2932,20 +2945,32 @@ class Parser {
     this.ctlPS.push(this.pipeStart);
     this.ctlPH.push(this.pipeHead);
     this.ctlPL.push(this.pipeLead);
-    this.ctlAlt.push(!!seg && (kind === 'brace' || kind === 'cbrace') && (seg.condBody === true || (seg.words.length === 1 && seg.words[0].qa < 0 && seg.words[0].text === 'else' && this.ctlStack[this.ctlStack.length - 2] === 'if')));
     if (neg) this.ctx.neg++;
     if (CTL_COUNTER[kind]) this.ctx.ctl[CTL_COUNTER[kind]]++;
     if (kind === 'loop') this.ctx.loops = [...this.ctx.loops, ++this.ctx.loopSeq];
   }
 
+  // (#352 R16: the innermost construct of this level is an if / while / until / for ... whose condition is still open: no `then` / `do` seen)
+  condOpenTop() {
+    const k = this.ctlStack.length - 1;
+    return k >= this.ctlBase && this.ctlCond[k] === true;
+  }
+
+  // `then` / `do` end the condition of the last if / loop of this level, an `elif` opens a new one
+  ctlSetCond(kind, open) {
+    for (let k = this.ctlStack.length - 1; k >= this.ctlBase; k--) {
+      if (this.ctlStack[k] === kind) { this.ctlCond[k] = open; return; }
+    }
+  }
+
   popCtl() {
     const kind = this.ctlStack.pop();
+    this.ctlCond.pop();
     this.ctx.up = this.ctlUp.pop();
     this.ctlFrom.pop();
     this.ctlPS.pop();
     this.ctlPH.pop();
     this.ctlPL.pop();
-    this.ctlAlt.pop();
     if (this.ctlNeg.pop()) this.ctx.neg--;
     ctlDec(this.ctx, kind);
   }
@@ -2959,7 +2984,6 @@ class Parser {
       this.lastClosePS = this.ctlPS[k];
       this.lastClosePH = this.ctlPH[k];
       this.lastClosePL = this.ctlPL[k];
-      this.lastCloseAlt = this.ctlAlt[k] === true;
       while (this.ctlStack.length > k) this.popCtl();
       return from;
     }

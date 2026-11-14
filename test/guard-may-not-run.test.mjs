@@ -399,7 +399,8 @@ test('#352 R14-F1: a zsh anonymous function or short-form body after ) still con
   allows('twin: cd d && () { true; } && push', `cd /work/other2 && () { true; } && ${SHIP}`);
   allows('twin: cd d && () { true; }; push', `cd /work/other2 && () { true; }; ${SHIP}`);
   allows('twin: switch; () { push; }', `${RESET}; () { ${SHIP}; }`);
-  allows('twin: cd d && if (true) echo hi && push', `cd /work/other2 && if (true) echo hi && ${SHIP}`);
+  // (R16: an `if (true) echo hi` has no `then`: a zsh short form the parser does not follow, so the line is refused wholesale: was an allow)
+  denies('twin: cd d && if (true) echo hi && push (short form, R16)', `cd /work/other2 && if (true) echo hi && ${SHIP}`);
 });
 
 // (#352 R15-F1: after a `( )` that ends the condition of if / while / until in zsh, the next word is the BODY, which runs when the condition FAILED: it must not keep the `&&` that stood before the `(`)
@@ -408,8 +409,9 @@ test('#352 R15-F1: the body after a ( ) that ends a zsh if / until condition is 
   denies('until switch && (true) { push; break; }', `until ${RESET} && (true) { ${SHIP}; break; }`);
   denies('if cd d && (true) { : } else { push }', `if cd /work/other2 && (true) { : } else { ${SHIP} }`);
   denies('until cd d && ((1)) push', `until cd /work/other2 && ((1)) ${SHIP}`);
-  allows('twin: cd d && until (false) { push; break; }', `cd /work/other2 && until (false) { ${SHIP}; break; }`);
-  allows('twin: cd d && if (true) { push }', `cd /work/other2 && if (true) { ${SHIP} }`);
+  // (R16: a condition-then-body form is not followed, so these two former allows are refusals)
+  denies('twin: cd d && until (false) { push; break; } (R16)', `cd /work/other2 && until (false) { ${SHIP}; break; }`);
+  denies('twin: cd d && if (true) { push } (R16)', `cd /work/other2 && if (true) { ${SHIP} }`);
 });
 
 test('#352 R15-F1: the } of a zsh alternate-form body ends its until / if, so a later || runs when the change failed', () => {
@@ -417,8 +419,9 @@ test('#352 R15-F1: the } of a zsh alternate-form body ends its until / if, so a 
   denies('switch && until C && (true) { true; break; } || push', `${RESET} && until true && (true) { true; break; } || ${SHIP}`);
   denies('switch && if (true) { true; } || push', `${RESET} && if (true) { true; } || ${SHIP}`);
   denies('switch && if (true) { true; } else { true; } || push', `${RESET} && if (true) { true; } else { true; } || ${SHIP}`);
-  allows('twin: switch; until (true) { push; break; }', `${RESET}; until (true) { ${SHIP}; break; }`);
-  allows('twin: switch && until (true) { true; } && push', `${RESET} && until (true) { true; } && ${SHIP}`);
+  // (R16: a condition-then-body form is not followed, so these two former allows are refusals)
+  denies('twin: switch; until (true) { push; break; } (R16)', `${RESET}; until (true) { ${SHIP}; break; }`);
+  denies('twin: switch && until (true) { true; } && push (R16)', `${RESET} && until (true) { true; } && ${SHIP}`);
 });
 
 // (#352 R16: the zsh "condition then body" forms (`if C (sub) { B }`, `until C [[ x ]] B`, `if C { } else { }`, `repeat N { }`, `for x in a b { }`) are not followed: while an if / while / until condition is open, a WORD after the ) / )) / ]] that ends it
@@ -459,13 +462,10 @@ test('#352 R16-#432: a [[ ]] ending a zsh condition followed by a brace body is 
   denies('if C && [[ ]] { : } else { push }', `if cd /work/other2 && [[ -n x ]] { : } else { ${SHIP} }`);
   denies('until C && [[ ]] { push; break; }', `until cd /work/other2 && [[ -n x ]] { ${SHIP}; break; }`);
   denies('while C && (( 1 )) short body', `while cd /work/other2 && ((1)) ${SHIP}`);
-  // a condition-then-body form is not followed (R16): these became refusals under the rule
-  denies('cd d && until (false) { push; break; } (condition-then-body)', `cd /work/other2 && until (false) { ${SHIP}; break; }`);
-  denies('cd d && if (true) { push } (condition-then-body)', `cd /work/other2 && if (true) { ${SHIP} }`);
-  denies('cd d && if (true) echo hi && push (condition-then-body)', `cd /work/other2 && if (true) echo hi && ${SHIP}`);
   // lines that use no condition-then-body form keep their verdict
   allows('twin: cd d && (npm test) && push', `cd /work/other2 && (npm test) && ${SHIP}`);
-  allows('twin: if [ -f x ]; then cd d; fi; push', `if [ -f x ]; then cd /work/other2; fi; ${SHIP}`);
+  allows('twin: if [ -f x ]; then cd d && push; fi', `if [ -f x ]; then cd /work/other2 && ${SHIP}; fi`);
+  allows('twin: if [ -f x ]; then :; fi; push', `if [ -f x ]; then :; fi; ${SHIP}`, {}, '/work/other2');
   allows('twin: cd d && if (true); then echo hi; fi && push', `cd /work/other2 && if (true); then echo hi; fi && ${SHIP}`);
   allows('twin: cd d && if [[ -n x ]]; then echo hi; fi && push', `cd /work/other2 && if [[ -n x ]]; then echo hi; fi && ${SHIP}`);
   allows('twin: cd d && () { push; } (anonymous function)', `cd /work/other2 && () { ${SHIP}; }`);
