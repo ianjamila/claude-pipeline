@@ -45,6 +45,7 @@ export function buildCodexArgs({ cwd, model, effort, schemaPath, outPath }) {
   }
   return [
     'exec', '--sandbox', 'read-only', '--color', 'never', '--skip-git-repo-check',
+    '--json', // stdout becomes JSONL events: the only thing classifyCodexFailure reads
     '-C', cwd, '-o', outPath, '--output-schema', schemaPath,
     '-c', `model="${model}"`, '-c', `model_reasoning_effort="${effort}"`,
     '-', // prompt arrives on stdin
@@ -360,15 +361,153 @@ const AUTH_RE = /not logged in|unauthori[sz]ed|codex login|authentication failed
 const NETWORK_RE = /could not resolve host|network error|network is unreachable|econnreset|etimedout|service unavailable|\b502 bad gateway\b|\b(?:status|http|code|error)\W{0,4}(?:502|503)\b/;
 const MISSING_COMMAND_RE = /command not found|is not recognized as an internal or external command/;
 
+// A Codex thread id / session id as it appears in a rollout file name; checked before it is used in a path.
+export const THREAD_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+// `codex exec --json` prints one JSON event per stdout line. Only a whole line that parses to an object with a string `type` is an
+// event: a half line (output cut off), plain text, or JSON text sitting inside some event's string (an item's command output) is not.
+export function parseCodexEvents(stdout) {
+  const events = [];
+  for (const line of String(stdout ?? '').split('\n')) {
+    const text = line.trim();
+    if (!text.startsWith('{')) continue;
+    try {
+      const e = JSON.parse(text);
+      if (e && typeof e === 'object' && !Array.isArray(e) && typeof e.type === 'string') events.push(e);
+    } catch { /* not a whole JSON line */ }
+  }
+  return events;
+}
+
+const messageOf = (v) => (typeof v === 'string' && v.trim() !== '' ? v : null);
+
+// What Codex itself said about a failed run, from its own events: the LAST `turn.failed` message (the verdict), every top-level `error`
+// event message (transient "Reconnecting... n/5" lines included), and the thread id. item.* events are what the model and its tools
+// printed, so they are never read here.
+export function readCodexVerdict(stdout) {
+  let turnFailed = null;
+  let threadId = null;
+  const errors = [];
+  for (const e of parseCodexEvents(stdout)) {
+    if (e.type === 'thread.started' && threadId === null && typeof e.thread_id === 'string' && THREAD_ID_RE.test(e.thread_id)) threadId = e.thread_id;
+    else if (e.type === 'turn.failed') turnFailed = messageOf(e.error?.message) ?? '';
+    else if (e.type === 'error') {
+      const m = messageOf(e.message);
+      if (m) errors.push(m);
+    }
+  }
+  return { turnFailed, errors, threadId };
+}
+
 // Every non-success outcome maps to one of four failure kinds; none of them can be mistaken for "no findings".
 // Order matters: a 429 body often also mentions auth or the network, and quota must win.
-export function classifyCodexFailure({ code, stderr = '', stdout = '', timedOut = false, spawnError } = {}) {
-  const text = `${stderr}\n${stdout}\n${spawnError?.message ?? ''}`.toLowerCase();
-  if (spawnError?.code === 'ENOENT' || code === 127 || MISSING_COMMAND_RE.test(text) || timedOut) return 'unavailable';
-  if (QUOTA_RE.test(text)) return 'quota';
-  if (AUTH_RE.test(text)) return 'auth';
-  if (NETWORK_RE.test(text)) return 'unavailable';
-  return 'error';
+// `quota` needs ALL of: a non-zero exit, no timeout, no kill by a signal, and a LAST `turn.failed` event whose message is Codex's usage-limit
+// wording. stderr (Codex's tracing, or a shell's complaint) is read only for a missing binary; the other kinds read the same structured
+// messages. -> {reason, message (the turn.failed message or null), threadId}.
+export function analyzeCodexFailure({ code, signal = null, stderr = '', stdout = '', timedOut = false, spawnError } = {}) {
+  const { turnFailed, errors, threadId } = readCodexVerdict(stdout);
+  const out = (reason) => ({ reason, message: turnFailed || null, threadId });
+  const shellText = `${stderr}\n${spawnError?.message ?? ''}`.toLowerCase();
+  if (spawnError?.code === 'ENOENT' || code === 127 || MISSING_COMMAND_RE.test(shellText) || timedOut) return out('unavailable');
+  if (typeof code === 'number' && code !== 0 && !signal && turnFailed && QUOTA_RE.test(turnFailed.toLowerCase())) return out('quota');
+  const text = [turnFailed ?? '', ...errors].join('\n').toLowerCase();
+  if (AUTH_RE.test(text)) return out('auth');
+  if (NETWORK_RE.test(text)) return out('unavailable');
+  return out('error');
+}
+
+// Codex says the model is overloaded: a non-zero exit, no timeout, no kill by a signal, and a LAST `turn.failed` event whose message is Codex's own
+// capacity wording ("Selected model is at capacity...", or its typed `server_overloaded`). Never stderr, never item.* or top-level error events (the model
+// and its tools can print that text). Such a failure is worth one retry; it keeps its ordinary classification (analyzeCodexFailure) if the retry fails too.
+const CAPACITY_RE = /selected model is at capacity|server[_ ]overloaded/i;
+export function isCapacityFailure({ code, signal = null, stdout = '', timedOut = false } = {}) {
+  if (typeof code !== 'number' || code === 0 || signal || timedOut) return false;
+  const { turnFailed } = readCodexVerdict(stdout);
+  return turnFailed !== null && CAPACITY_RE.test(turnFailed);
+}
+
+// -> 'quota' | 'auth' | 'unavailable' | 'error' (analyzeCodexFailure also returns the turn.failed message and the thread id).
+export function classifyCodexFailure(input = {}) {
+  return analyzeCodexFailure(input).reason;
+}
+
+// ---------- quota reset time ----------
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+const dtfCache = new Map();
+function wallParts(ms, timeZone) {
+  const key = timeZone ?? '';
+  let dtf = dtfCache.get(key);
+  if (!dtf) {
+    dtf = new Intl.DateTimeFormat('en-US', { timeZone, hourCycle: 'h23', year: 'numeric', month: 'numeric', day: 'numeric', hour: 'numeric', minute: 'numeric', second: 'numeric' });
+    dtfCache.set(key, dtf);
+  }
+  const p = {};
+  for (const { type, value } of dtf.formatToParts(new Date(ms))) if (type !== 'literal') p[type] = Number(value);
+  return p;
+}
+// The zone's UTC offset at an instant: its wall clock read as if it were UTC, minus the instant.
+const offsetAt = (ms, timeZone) => {
+  const whole = ms - (((ms % 1000) + 1000) % 1000);
+  const w = wallParts(whole, timeZone);
+  return Date.UTC(w.year, w.month - 1, w.day, w.hour, w.minute, w.second) - whole;
+};
+
+// The instants (0, 1 or 2) at which the wall clock in `timeZone` reads y-m-d h:min. None = a time a spring-forward skipped; two = a time a
+// fall-back repeats.
+function instantsOf(y, mo, d, h, min, timeZone) {
+  const asUtc = Date.UTC(y, mo - 1, d, h, min, 0);
+  const found = new Set();
+  for (const guessOffset of [offsetAt(asUtc - DAY_MS, timeZone), offsetAt(asUtc + DAY_MS, timeZone)]) {
+    const t = asUtc - guessOffset;
+    const w = wallParts(t, timeZone);
+    if (w.year === y && w.month === mo && w.day === d && w.hour === h && w.minute === min) found.add(t);
+  }
+  return [...found].sort((a, b) => a - b);
+}
+
+// Codex's usage-limit message says when to come back. Forms: "try again at 4:21 PM", "at 16:21", "in 37 minutes", "in 2 hours",
+// "after 2026-11-11T08:21:00Z". A clock time is the next time it comes round within 24 h in `timeZone` (default: this machine's); one that
+// a daylight-saving change skips or repeats is ambiguous, so it gives no resetAt. -> {resetAt: ISO | null, resetText: matched words | null}.
+export function parseQuotaReset(message, { now = Date.now(), timeZone } = {}) {
+  const text = String(message ?? '');
+  const nowMs = now instanceof Date ? now.getTime() : Number(now);
+  const none = { resetAt: null, resetText: null };
+  if (!Number.isFinite(nowMs)) return none;
+
+  const iso = /\bafter (\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2}))/i.exec(text);
+  if (iso) {
+    const ms = Date.parse(iso[1]);
+    return { resetAt: Number.isFinite(ms) ? new Date(ms).toISOString() : null, resetText: iso[0] };
+  }
+
+  const rel = /\bin (?=\d)(?:(\d{1,3}) hours?)?(?:\s*(?:and\s+)?(\d{1,4}) minutes?)?(?!\w)/i.exec(text);
+  if (rel && (rel[1] !== undefined || rel[2] !== undefined)) {
+    const ms = nowMs + (Number(rel[1] ?? 0) * 60 + Number(rel[2] ?? 0)) * 60 * 1000;
+    return { resetAt: new Date(ms).toISOString(), resetText: rel[0].trim() };
+  }
+
+  const clock = /\bat (\d{1,2}):(\d{2})(?:\s*([ap])(?:\.m\.|m))?(?![\w:])/i.exec(text);
+  if (!clock) return none;
+  const resetText = clock[0];
+  let hour = Number(clock[1]);
+  const minute = Number(clock[2]);
+  const meridiem = clock[3]?.toLowerCase();
+  if (minute > 59 || (meridiem ? hour < 1 || hour > 12 : hour > 23)) return { resetAt: null, resetText };
+  if (meridiem) hour = (hour % 12) + (meridiem === 'p' ? 12 : 0);
+
+  let tz;
+  let today;
+  try {
+    tz = timeZone ?? new Intl.DateTimeFormat().resolvedOptions().timeZone;
+    today = wallParts(nowMs, tz);
+  } catch { return { resetAt: null, resetText }; }
+  // Today's occurrence if that wall time is still ahead, otherwise tomorrow's.
+  const tomorrow = hour * 60 + minute <= today.hour * 60 + today.minute;
+  const day = new Date(Date.UTC(today.year, today.month - 1, today.day + (tomorrow ? 1 : 0)));
+  const at = instantsOf(day.getUTCFullYear(), day.getUTCMonth() + 1, day.getUTCDate(), hour, minute, tz);
+  if (at.length !== 1 || at[0] <= nowMs || at[0] - nowMs > DAY_MS) return { resetAt: null, resetText };
+  return { resetAt: new Date(at[0]).toISOString(), resetText };
 }
 
 // ---------- ids and fingerprints ----------

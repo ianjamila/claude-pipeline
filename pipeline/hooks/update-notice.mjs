@@ -9,9 +9,15 @@
 // number that pass a strict shape check (never `mainTitle`, `reason` or `command`, which can hold free text).
 // Stdout of a SessionStart hook is added to the session's context, so the line is plain text.
 //
+// Second notice (plan 2026-11-11-codex-substitute-reviewer B2): when PRs are parked for Codex (pipeline-state/codex/status.json, written by codex-review) and the
+// outage's reset has passed, it prints "Codex is back: <repo>#N (round R) … waiting" and each resume sentence. It reads one more small file, validates what it prints
+// the same strict way, and can never fail the hook (no cnotify call: cnotify has settings subcommands only, nothing that sends a notice).
+//
 // Test seams (a repo checkout only, like the other seams; an installed copy ignores them):
 //   PIPELINE_UPDATE_STATUS_FILE        read this file instead of the account's
 //   PIPELINE_UPDATE_NOTICE_DELAY_MS    make the read take this long first (proves the 1 s budget)
+//   PIPELINE_CODEX_STATUS_DIR          read the Codex waiting record from this folder (lib/codex-usage.mjs)
+//   PIPELINE_CODEX_NOTICE_NOW          the clock for "Codex is back" (epoch ms or ISO)
 const BUDGET_MS = 1000;
 setTimeout(() => process.exit(0), BUDGET_MS).unref();
 
@@ -36,7 +42,7 @@ const lineFor = (status) => {
   return 'pipeline update needs you: run pupdate';
 };
 
-async function main() {
+async function updateLine() {
   const { seamValue } = await import('../lib/seams.mjs');
   const { accountHome } = await import('../lib/paths.mjs');
   const fs = await import('node:fs/promises');
@@ -60,8 +66,18 @@ async function main() {
   return `${lineFor(status)}\n`;
 }
 
+async function codexLines() {
+  const { readStatus, backNoticeLines } = await import('../lib/codex-usage.mjs');
+  const { seamValue } = await import('../lib/seams.mjs');
+  const raw = seamValue('PIPELINE_CODEX_NOTICE_NOW');
+  const at = raw === undefined || raw === '' ? NaN : Number.isNaN(Number(raw)) ? Date.parse(raw) : Number(raw);
+  const lines = backNoticeLines(readStatus({}), Number.isFinite(at) ? at : Date.now());
+  return lines.length > 0 ? `${lines.join('\n')}\n` : '';
+}
+
 let output = '';
-try { output = await main(); } catch { output = ''; }
+try { output += await updateLine(); } catch { /* silent */ }
+try { output += await codexLines(); } catch { /* silent */ }
 // Exit explicitly: the unread stdin pipe and the unref'd timer must not keep the process (or the session start) waiting.
 if (output) process.stdout.write(output, () => process.exit(0));
 else process.exit(0);

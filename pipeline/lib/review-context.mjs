@@ -123,16 +123,25 @@ export function repoLockKey(root) {
 
 export const reviewLockName = (root, pr) => `review-${sha256(repoLockKey(root)).slice(0, 12)}-pr${pr}`;
 
-export async function withReviewLock(root, pr, ctx, fn) {
+async function withNamedReviewLock(name, defaultWaitMs, ctx, fn) {
   const env = ctx?.env ?? process.env;
   const wait = Number(env.PIPELINE_LOCK_WAIT_MS);
   try {
-    return await withLock(reviewLockName(root, pr), fn, { dir: env.PIPELINE_LOCK_DIR || undefined, waitMs: wait > 0 ? wait : LOCK_WAIT_MS });
+    return await withLock(name, fn, { dir: env.PIPELINE_LOCK_DIR || undefined, waitMs: wait > 0 ? wait : defaultWaitMs });
   } catch (err) {
     if (err instanceof LockTimeoutError) throw new Fail(EXIT.USAGE, { ok: false, error: 'lock-timeout', message: err.message });
     throw err;
   }
 }
+
+export const withReviewLock = (root, pr, ctx, fn) => withNamedReviewLock(reviewLockName(root, pr), LOCK_WAIT_MS, ctx, fn);
+
+// The route lock (per PR) guards route.json's compare-and-swap: a pending record is installed under it ALONE, so a held review lock (Codex's recording of another round,
+// a substitute's apply) never stops a codex-review attempt from starting, and every final write of route.json (compare + write) holds it so a pending record cannot land
+// between them (R1-B2). Lock order is always review -> route; the pending write takes no review lock, so the two cannot deadlock. Its sections are short: a short wait.
+export const ROUTE_LOCK_WAIT_MS = 15 * 1000;
+export const routeLockName = (root, pr) => `${reviewLockName(root, pr)}-route`;
+export const withRouteLock = (root, pr, ctx, fn) => withNamedReviewLock(routeLockName(root, pr), ROUTE_LOCK_WAIT_MS, ctx, fn);
 
 // For commands that do not know the PR up front: the state on disk names it. No readable state means the command
 // fails on its own (requireState) before it changes anything, so it runs unlocked rather than under a made-up name.

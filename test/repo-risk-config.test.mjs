@@ -305,6 +305,7 @@ test('repo config: every file the risk rating imports (transitively) is covered 
 // merge-cleanup out of this map for that reason).
 const STACKS_EXEMPT_WHY = 'owner decision 2026-11-13 (#392): unattended stack/worktree jobs are exempt';
 const DEPTH1_EXEMPT = new Map([
+  ['pipeline/lib/codex-usage-kinds.mjs', 'display only: codex-status.mjs imports only summariseUsage, which reads the Codex session logs and sums tokens per session kind for the printed report; it writes nothing and no gate, proof or route reads its result'],
   ['pipeline/lib/round-ask.mjs', 'display only: the text of the extra-round ask and the park comment (round-status.mjs hands costFrom, roundsFrom, openItems, notCleanReasons and statusLines to the owner-facing display, triage.mjs hands askSummary to the ask); admission and defer eligibility are decided in triage.mjs (listed) and defer-fixes re-checks'],
   ['pipeline/lib/worktree-prune/inspect.mjs', 'live-sessions.mjs imports only unFirm (strips the macOS /System/Volumes/Data firmlink prefix from a path), which only liveSessionsIn calls (the worktree-prune session match); review-lease.mjs uses claudeConfigDirs and psStarts, never liveSessionsIn, so no gate, proof, trust or install branches on it'],
   ['pipeline/lib/worktree-prune/run.mjs', 'update-schedule.mjs, queue-sweep-schedule.mjs and queue-sweep.mjs import only pruneLogDir (the folder the cron-*.log files are appended to); it picks no command, argument or code to run, and the worktree prune the file holds decides no gate, proof, trust or install'],

@@ -300,7 +300,9 @@ export async function runOrchestrator({ env = process.env, cwd = process.cwd(), 
     if (hash !== r.contentHash) {
       return { state: 'failure', description: `the content changed since the review (reviewed ${r.contentHash.slice(0, 8)}, head is ${hash.slice(0, 8)}): review it again` };
     }
-    return { state: 'success', description: `reviewed at ${r.head.slice(0, 8)}: ${r.rounds} round(s), Codex ${r.codexModel}${r.modelProofDigest ? ', Fable' : ''}` };
+    // (cosmetic) a Claude stand-in reviewed instead of Codex for some rounds: the marker says so (review-marker.mjs `substitute`); an older parser drops the field and prints the codexModel only
+    const sub = r.substitute?.rounds?.length > 0 ? `, substitute round${r.substitute.rounds.length > 1 ? 's' : ''} ${r.substitute.rounds.length > 1 ? `${Math.min(...r.substitute.rounds)}–${Math.max(...r.substitute.rounds)}` : r.substitute.rounds[0]}` : '';
+    return { state: 'success', description: `reviewed at ${r.head.slice(0, 8)}: ${r.rounds} round(s), Codex ${r.codexModel}${r.modelProofDigest ? ', Fable' : ''}${sub}` };
   }
 
   let pass = await evaluatePass();

@@ -14,7 +14,7 @@ import { createFakeGh, pipelineYml } from './helpers/fakegh-env.mjs';
 import { LOCK_DIR, PR, ME, REPO, cli, scenario } from './helpers/gate-env.mjs';
 import { addRound, emptyState, saveState } from '../pipeline/lib/state.mjs';
 import { repoLockKey, reviewLockName } from '../pipeline/lib/review-context.mjs';
-import { acquireAdmission, blocking, releaseAdmission, scanLeases } from '../pipeline/lib/review-lease.mjs';
+import { HOLDER_ENV, acquireAdmission, blocking, releaseAdmission, scanLeases } from '../pipeline/lib/review-lease.mjs';
 import { tryAcquire, release } from '../pipeline/lib/locks.mjs';
 import { LEASED_COMMANDS, leaseArgs, leasesOffForTests } from '../pipeline/lib/review-lease-wiring.mjs';
 import { assertExit } from './helpers/assert-exit.mjs';
@@ -46,6 +46,8 @@ function world({ session = true, extra = {} } = {}) {
   const env = {
     ...withFakePs(), HOME: home, USERPROFILE: home, CLAUDE_CONFIG_DIR: undefined, PIPELINE_MACHINE_ID: MACHINE,
     PIPELINE_REVIEW_LEASE_DIR: dir, [SESSION_VAR]: session ? '1' : undefined, ...extra,
+    // Hermetic: a suite run inside a `P job` carries the launching session's PIPELINE_LEASE_HOLDER; handed to the child CLI it would make the lease a job-scoped one of that session (live only while a job runs).
+    [HOLDER_ENV]: undefined,
   };
   return { root, home, dir, env };
 }
@@ -59,7 +61,7 @@ const leaseOn = (w, repo) => leasesOf(w).find((l) => l.worktree === realpathSync
 
 // A repo with a review state for PR 12 and a valid config; the state names its PR, so state-only commands get a PR lease.
 function reviewRepo({ state = true } = {}) {
-  const repo = createTmpRepo();
+  const repo = createTmpRepo({ highEffort: true });
   repo.write('.claude/pipeline.yml', pipelineYml());
   repo.write('.gitignore', '.review/\n.verify/\n');
   repo.write('src/app.js', 'export const a = 1;\n');
@@ -88,7 +90,7 @@ const summaryGh = () => createFakeGh([
 test('wiring: the leased commands are exactly the ones that read or write a worktree\'s review state (read-only commands take none)', () => {
   assert.deepEqual([...LEASED_COMMANDS].sort(), [
     'agent-log', 'arbiter', 'checkpoint', 'ci-wait', 'codex-review', 'comment', 'cost', 'final-gate', 'followups', 'job', 'merge', 'merge-hold',
-    'redraft', 'review-complete', 'smoke', 'state', 'summary', 'triage', 'update-branch', 'verify',
+    'redraft', 'review-complete', 'smoke', 'state', 'substitute', 'summary', 'triage', 'update-branch', 'verify',
   ]);
   for (const name of ['preflight', 'config', 'labels', 'update', 'version', 'model-floor', 'risk', 'hardstops', 'integrity', 'queue-sweep', 'protect', 'vendor']) {
     assert.equal(LEASED_COMMANDS.has(name), false, name);

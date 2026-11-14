@@ -103,7 +103,7 @@ const fenced = (obj) => `Done.\n\n\`\`\`json\n${JSON.stringify(obj)}\n\`\`\``;
 // baseFiles / featFiles: extra { path: content } committed in the base commit / the feature commit.
 // slug: the repository name the fake gh reports (`repo view`). Tests that record the owner's chat words use ownerWorld (below).
 function world(t, { gh = GH, light = false, yml = pipelineYml(), baseFiles = {}, featFiles = {}, slug = 'acme/widgets' } = {}) {
-  const repo = createTmpRepo();
+  const repo = createTmpRepo({ highEffort: true });
   t.after(() => repo.cleanup());
   repo.write('.claude/pipeline.yml', yml);
   // As pipeline-setup leaves a real repo: the review's own files are never part of a commit (a fix commit would
@@ -146,7 +146,7 @@ function world(t, { gh = GH, light = false, yml = pipelineYml(), baseFiles = {},
       for (const k of [
         'PIPELINE_TEST_FORCE_ARBITER', 'PIPELINE_ARBITER_MODEL_OVERRIDE', 'PIPELINE_TEST_MODE', 'PIPELINE_CODEX_TIMEOUT_MS',
         'PIPELINE_LOCK_WAIT_MS', 'FAKE_CODEX_EXIT', 'FAKE_CODEX_STDERR', 'FAKE_CODEX_NO_WRITE', 'FAKE_CODEX_OUTPUT',
-        'FAKE_CODEX_HANG', 'FAKE_CODEX_DURING', 'FAKE_CODEX_DURING_OUTPUT',
+        'FAKE_CODEX_HANG', 'FAKE_CODEX_DURING', 'FAKE_CODEX_DURING_OUTPUT', 'FAKE_CODEX_TURN_FAILED',
         // the suite runs inside Claude Code: a real terminal's versions must not decide whether a Fable round is stopped as stale (cli-stale-terminal pins that)
         'AI_AGENT', 'CLAUDE_CODE_EXECPATH',
       ]) {
@@ -278,7 +278,7 @@ test('codex-review: a valid findings file becomes round 1 with ids, state, codex
   const [call] = w.captured();
   const at = (flag) => call.argv[call.argv.indexOf(flag) + 1];
   assert.equal(call.argv[0], 'exec');
-  assert.equal(at('-o'), w.roundFile(1, 'codex-raw.json'));
+  assert.match(at('-o'), /[\\/]round-1[\\/]attempt-[0-9a-f]{16}[\\/]codex-raw\.json$/, 'Codex writes into the attempt\'s own folder; the winner\'s copy is round-1/codex-raw.json');
   assert.equal(at('-C'), w.repo.dir);
   assert.match(at('--output-schema'), /codex-findings\.schema\.json$/);
   assert.ok(call.argv.includes('model="gpt-6-astra"') && call.argv.includes('model_reasoning_effort="high"'));
@@ -337,14 +337,14 @@ test('codex-review: --model overrides the configured model; a bad effort or mode
 
 test('codex-review: quota, auth and a missing binary are exit 3 with unavailable:true and a reason; no state is written', (t) => {
   const w = world(t);
-  const quota = w.codex(1, findingsOf(), { env: { FAKE_CODEX_EXIT: '1', FAKE_CODEX_STDERR: 'ERROR: You hit your usage limit. Try again later.' } });
+  const quota = w.codex(1, findingsOf(), { env: { FAKE_CODEX_EXIT: '1', FAKE_CODEX_TURN_FAILED: 'You hit your usage limit. Try again later.' } });
   assertExit(quota, 3);
   assert.equal(quota.json.ok, false);
   assert.equal(quota.json.unavailable, true);
   assert.equal(quota.json.reason, 'quota');
   assert.match(quota.json.detail, /usage limit/);
 
-  const auth = w.codex(1, findingsOf(), { env: { FAKE_CODEX_EXIT: '1', FAKE_CODEX_STDERR: 'Not logged in. Run codex login.' } });
+  const auth = w.codex(1, findingsOf(), { env: { FAKE_CODEX_EXIT: '1', FAKE_CODEX_TURN_FAILED: 'Not logged in. Run codex login.' } });
   assertExit(auth, 3);
   assert.equal(auth.json.reason, 'auth');
 
@@ -393,7 +393,10 @@ test('codex-review: a leftover raw file from an earlier run is never read as thi
   assertExit(r, 3);
   assert.equal(r.json.reason, 'malformed');
   assert.ok(!existsSync(join(w.repo.dir, '.review', 'state.json')));
-  assert.ok(!existsSync(stale), 'the stale file was removed before Codex ran');
+  // Codex now writes into the attempt's own folder (cp #256), so a file left at round-1/codex-raw.json is never even the output path: it is not read, and an
+  // attempt that fails publishes nothing over it. The remove-before-run guard for the attempt's own output path is pinned in codex-exec.test.mjs.
+  const attempt = readdirSync(join(w.repo.dir, '.review', 'round-1')).find((n) => n.startsWith('attempt-'));
+  assert.ok(!existsSync(join(w.repo.dir, '.review', 'round-1', attempt, 'codex-raw.json')), 'nothing was read from, or written to, the attempt folder');
 });
 
 test('codex-review: an answer Codex writes during the run is read even when its source bytes are old (fake writes fresh, not a Windows copy)', (t) => {
@@ -1781,7 +1784,7 @@ test('review-complete: unresolved items or an unimplemented ACCEPT keep the labe
 
 test('review-complete: Codex outage then recovery (exit 3, then a clean review, then the label comes off)', (t) => {
   const w = world(t, { gh: [...GH, REMOVE_LABEL, ...REVIEW_COMMENT] });
-  const outage = w.codex(1, findingsOf(), { env: { FAKE_CODEX_EXIT: '1', FAKE_CODEX_STDERR: 'usage limit reached' } });
+  const outage = w.codex(1, findingsOf(), { env: { FAKE_CODEX_EXIT: '1', FAKE_CODEX_TURN_FAILED: 'usage limit reached' } });
   assertExit(outage, 3);
   assertExit(w.cli(['review-complete', '--pr', '7']), 1, 'nothing was reviewed yet');
 
@@ -4487,6 +4490,26 @@ test('review-complete and the final gate refuse a PR whose Fable round was prove
   const gateOk = await gateReview(w);
   assert.equal(gateOk.ok, true, gateOk.detail);
   assertExit(refreshOf(w), 2, 'nothing is stale any more');
+});
+
+test('R1-B3: a substitute-fable round under a raised floor is refused by review-complete with the working advice, and a proven fable-refresh round clears it', (t) => {
+  const w = oldProofWorld(t, { models: { 'claude-fable-5-2': 1 } });
+  editState(w, (s) => {
+    s.rounds[0].firstReviewer = 'substitute';
+    s.rounds[0].substitute = { agent: 'substitute-fable', models: { [OLD_FABLE]: 1 }, evidence: 'quota', resetAt: null, outageAt: '2026-11-11T07:23:00.000Z', attempts: 1, proof: { transcript: '/t/x.jsonl', models: { [OLD_FABLE]: 1 }, effort: 'high' } };
+    s.version = 4;
+  });
+  const refused = w.cli(['review-complete', '--pr', '7']);
+  assertExit(refused, 1, refused.stdout + refused.stderr);
+  assert.equal(refused.json.error, 'substitute-unproven');
+  assert.match(refused.json.reason, /run `pipeline state fable-refresh --pr 7`/);
+  const r = refreshOf(w);
+  assertExit(r, 0, r.stdout + r.stderr);
+  assert.deepEqual([r.json.round, r.json.scope, r.json.staleRounds], [2, 'whole-pr', [{ round: 1, models: [OLD_FABLE] }]]);
+  const { applied } = proveRound(w, 2);
+  assertExit(applied, 0, applied.stdout);
+  const ok = w.cli(['review-complete', '--pr', '7']);
+  assertExit(ok, 0, ok.stdout + ok.stderr);
 });
 
 test('state fable-refresh is refused with a named reason when nothing is stale, work is unfinished, the content moved or the head is not pushed', (t) => {

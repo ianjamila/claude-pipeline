@@ -171,12 +171,13 @@ export function reviewLane({ level, files, config, sizeOnly = false }) {
 // working-tree config is not fully trusted (the PR moved the anchor): its rules are still evaluated (a PR must not lose them by editing default_branch), but
 // the mismatch is returned apart as `mismatch` and the callers require Fable. `remoteDefault` is the remote's default branch when it was used and differs from
 // the working-tree config's default_branch (a repo where they disagree on purpose, or origin/HEAD is stale), else null.
+// `trustedFork` (optional): the fork point when the caller already has it (adm.rated.trustedFork, from rateBranch); the merge base is then not worked out again.
 // -> { defaultBranch, trustedFork, trusted: { ok: true, config } | { ok: false, reason }, mismatch: string | null, remoteDefault: string | null }. Throws what git throws (no fork point).
-export function trustedBase({ root, head, config }) {
+export function trustedBase({ root, head, config, trustedFork: given }) {
   const o = { cwd: root };
   const remote = remoteDefaultBranch(o);
   const defaultBranch = remote ?? config.default_branch;
-  const trustedFork = mergeBase(reviewBaseRef(defaultBranch, o), head, o);
+  const trustedFork = given ?? mergeBase(reviewBaseRef(defaultBranch, o), head, o);
   const trusted = baseConfigAt(trustedFork, root);
   const mismatch = trusted.ok && trusted.config.default_branch !== config.default_branch
     ? `the config at the fork point names default_branch ${JSON.stringify(trusted.config.default_branch)}, the working-tree config ${JSON.stringify(config.default_branch)}`

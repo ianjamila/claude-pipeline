@@ -382,6 +382,13 @@ test('J: an unknown psql line is refused only with protected text around, also w
     assert.equal(run(`psql -c "${sql.replaceAll('"', '\\"')}"`).decision, 'allow', sql);
     assert.equal(run(`psql -c "${sql.replaceAll('"', '\\"')}; select '/home/u/.claude/settings.json'"`).decision, 'deny', `${sql} + protected`);
   }
+  // (R5 regression: the protected set grew by pipeline-state/codex, .codex/sessions and .codex, and the reruns per assumed directory went past the allowance, refusing the harmless line;
+  // text naming the Codex session logs is still refused, for that text and not for the allowance)
+  const harmless = run('psql -c "select \':x\'"');
+  assert.equal(harmless.decision, 'allow', harmless.reason);
+  const codexLog = run('psql -c "select \':x\'; select \'/home/u/.codex/sessions/x.jsonl\'"');
+  assert.equal(codexLog.decision, 'deny');
+  assert.doesNotMatch(codexLog.reason, /too many commands run/);
 });
 
 // Why (commit review of I and J): the value a word has when the shell runs is the one assigned before it, once; and the SQL placeholder must not be a name a command can set.
