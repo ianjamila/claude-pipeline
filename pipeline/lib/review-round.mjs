@@ -550,7 +550,8 @@ export async function recordRound({ adm, findings, roundFields = {}, gate, after
 }
 
 // #445: the review runs the model of the pipeline.yml at the default branch's fork point, never the working tree's. When the working tree names another one, say so (the round still runs; nothing blocks).
-// `configPath` is the working-tree file: a key it omits reads "unset (built-in default <m>)". -> the note text, or undefined when the working tree agrees with the model that runs.
+// `configPath` is the working-tree file: a key it omits reads "unset (built-in default <m>)". `defaultBranch`: the trusted default branch the caller resolved (required).
+// -> the note text, or undefined when the working tree agrees with the model that runs.
 export function modelNoteFor({ config, configPath, trustedModel, codexModelFrom, defaultBranch }) {
   const wt = config.review.codex_model;
   if (wt === trustedModel) return undefined;
@@ -560,7 +561,7 @@ export function modelNoteFor({ config, configPath, trustedModel, codexModelFrom,
     try { omitted = !/^\s*codex_model\s*:/m.test(readFileSync(configPath, 'utf8')); } catch { /* unreadable: show the value */ }
     if (omitted) shown = `unset (built-in default ${wt})`;
   }
-  const dflt = defaultBranch ?? config.default_branch; // the caller passes the TRUSTED default branch (risk.mjs#hashBranch); the working-tree value is only the fallback
+  const dflt = defaultBranch; // the TRUSTED default branch (risk.mjs#hashBranch), required: never the working-tree value a PR can edit (anchor-default-branch.test.mjs pins every config read)
   const source = codexModelFrom === 'built-in' ? `the built-in default (the pipeline.yml at ${dflt}'s fork point could not be used)`
     : codexModelFrom === 'anchored-fork-point' ? `the value at ${dflt}'s genuine fork point (the working tree moved default_branch)`
       : `the value at ${dflt}'s fork point`;
