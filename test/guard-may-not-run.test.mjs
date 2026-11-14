@@ -1,3 +1,40 @@
+// (#352 R17: the R16 rule was keyed on the segment, but `[[ a && b ]]` is split by the && into two; a `{ }` group closed in argument position (zsh) ends a condition too; a word after `]]` / `repeat N` hides
+// the body in the argv of `[[` / `repeat`; `case W { pat) cmd }` ends the case at the `{`. None of these is followed: the line is refused)
+test('#352 R17-F1: a && inside [[ ]] does not hide the ]] that ends the condition of a zsh condition-then-body form', () => {
+  denies('R17-F1: until C && [[ a && b ]] { push; break }', `until cd /work/other2 && [[ -n a && -n b ]] { ${SHIP}; break }`);
+  denies('R17-F1: if C && [[ a && b ]] { : } else { push }', `if false && cd /work/other2 && [[ -n a && -n b ]] { : } else { ${SHIP} }`);
+  denies('R17-F1: while C && [[ a || b ]] { push; break }', `while cd /work/other2 && [[ -n a || -n b ]] { ${SHIP}; break }`);
+  denies('R17-F1: until C && [[ a && b && c ]] { push; break }', `until cd /work/other2 && [[ -n a && -n b && -n c ]] { ${SHIP}; break }`);
+  allows('twin: cd d && if [[ a && b ]]; then :; fi && push', `cd /work/other2 && if [[ -n a && -n b ]]; then :; fi && ${SHIP}`);
+  allows('twin: cd d && [[ a && b ]] && push', `cd /work/other2 && [[ -n a && -n b ]] && ${SHIP}`);
+});
+
+test('#352 R17-F2/F4: an unquoted { or } word in argument position (a zsh group ending a condition, a case body) is not followed', () => {
+  denies('R17-F2: until C && { true } { push; break }', `until cd /work/other2 && { true } { ${SHIP}; break }`);
+  denies('R17-F2: until { false && cd } { push; break }', `until { false && cd /work/other2 } { ${SHIP}; break }`);
+  denies('R17-F2: if { false && cd } { : } else { push }', `if { false && cd /work/other2 } { : } else { ${SHIP} }`);
+  denies('R17-F2: while C && { true } short body', `while cd /work/other2 && { true } ${SHIP}`);
+  denies('R17-F4: case x { y) switch }; push', `case x { y) ${RESET} }; ${SHIP}`);
+  denies('R17-F4: case x { y) cd d }; push (from the other worktree)', `case x { y) cd /work/main }; ${SHIP}`, {}, '/work/other2');
+  denies('R17-F4: case x { y) : ;; } ; push after a switch', `${RESET}; case x { y) : }; ${SHIP}`, {}, MAIN_DIR);
+  // everyday lines that carry a { or } as an argument keep their verdict
+  allows('twin: find . -exec rm {} + ; push', `find . -exec rm {} + && ${SHIP}`, {}, '/work/other2');
+  allows('twin: find . -exec echo {} \; push', `find . -exec echo {} \; && ${SHIP}`, {}, '/work/other2');
+  allows('twin: git log --format={} ; push', `git log --format={} && ${SHIP}`, {}, '/work/other2');
+  allows('twin: echo ${HOME} {a,b} x{1..3} ; push', `echo ${HOME} {a,b} x{1..3} && ${SHIP}`, {}, '/work/other2');
+  allows('twin: echo "{" "}" ; push', `echo "{" "}" && ${SHIP}`, {}, '/work/other2');
+});
+
+test('#352 R17-F3: a word after the ]] that ends a condition, or after repeat N, hides the body in an argv: the line is refused', () => {
+  denies('R17-F3: if [[ ]] push (main)', `if [[ -n x ]] ${SHIP}`);
+  denies('R17-F3: until C && [[ ]] push', `until cd /work/other2 && [[ -n x ]] ${SHIP}`);
+  denies('R17-F3: if [[ ]] cd main; push (from the other worktree)', `if [[ -n x ]] cd /work/main; ${SHIP}`, {}, '/work/other2');
+  denies('R17-F3: repeat 1 push', `repeat 1 ${SHIP}`);
+  denies('R17-F3: repeat 1 cd main; push (from the other worktree)', `repeat 1 cd /work/main; ${SHIP}`, {}, '/work/other2');
+  denies('R17-F3: cd d && repeat 1 push', `cd /work/other2 && repeat 1 ${SHIP}`);
+  allows('twin: if [[ ]]; then :; fi; push', `if [[ -n x ]]; then :; fi; ${SHIP}`, {}, '/work/other2');
+});
+
 // Why (#352 R8): "may this command not run, and did it change state?" is ONE rule. A command that may not run (in an if / loop body, after && or ||, after the closer of a construct that may have skipped
 // its body, in a subshell, behind ||) and that changed git state (a branch, an alias, config, a directory: judged by comparing the state before and after, so a package script or a script file that switches
 // the branch counts as well as `git switch`) leaves that state UNKNOWN for every later command, whatever the separator, except for the trusted chain `cd d && x`. The flags of that rule (uncertain, orChanged)
