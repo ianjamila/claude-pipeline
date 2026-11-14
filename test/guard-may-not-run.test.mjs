@@ -420,3 +420,54 @@ test('#352 R15-F1: the } of a zsh alternate-form body ends its until / if, so a 
   allows('twin: switch; until (true) { push; break; }', `${RESET}; until (true) { ${SHIP}; break; }`);
   allows('twin: switch && until (true) { true; } && push', `${RESET} && until (true) { true; } && ${SHIP}`);
 });
+
+// (#352 R16: the zsh "condition then body" forms (`if C (sub) { B }`, `until C [[ x ]] B`, `if C { } else { }`, `repeat N { }`, `for x in a b { }`) are not followed: while an if / while / until condition is open, a WORD after the ) / )) / ]] that ends it
+// (or a `}` straight followed by else / elif without a `then`) makes the whole line's directory and branch unknown, so a later push is refused)
+test('#352 R16-B1/F3: a zsh `if C { } else { }` whose else comes after blanks, a long gap or a line continuation is not followed: the push is refused', () => {
+  denies('R16-B1: 40+ blanks before else', `if (true) { :; }${' '.repeat(45)}else { :; ${RESET}; }; ${SHIP}`);
+  denies('R16-B1: 40+ blanks before else, switch without ;', `if (true) { :; }${' '.repeat(45)}else { :; ${RESET} }; ${SHIP}`);
+  denies('R16-F3: backslash-newline before else', `if (true) { :; } \\\nelse { :; ${RESET} }; ${SHIP}`);
+  denies('R16-F3: backslash-newline, switch with ;', `if (true) { :; } \\\nelse { :; ${RESET}; }; ${SHIP}`);
+});
+
+test('#352 R16-F1: a plain POSIX if / then / else with a brace group in the else branch keeps the if open until fi', () => {
+  denies('R16-F1: else { :; }; switch; { :; } fi', `if true; then :; else { :; }; ${RESET}; { :; } fi; ${SHIP}`);
+  denies('R16-F1 twin: else { switch; }; fi', `if true; then :; else { ${RESET}; }; fi; ${SHIP}`);
+  denies('R16-F1 twin: else { :; }; switch; fi', `if true; then :; else { :; }; ${RESET}; fi; ${SHIP}`);
+  allows('twin: then cd d; else { :; }; D; fi; push in its own line', `if true; then :; else { :; }; fi; cd /work/other2 && ${SHIP}`);
+});
+
+test('#352 R16-F2: a redirect, a {fd} redirect or a blank-only ( ) before the { of a zsh condition-then-body form is not followed', () => {
+  denies('R16-F2: until C && (true) >/dev/null { push; break; }', `until cd /work/other2 && (true) >/dev/null { ${SHIP}; break; }`);
+  denies('R16-F2: until C && (true) 2>&1 { push; break; }', `until cd /work/other2 && (true) 2>&1 { ${SHIP}; break; }`);
+  denies('R16-F2: if C && (true) >/dev/null { : } else { push }', `if cd /work/other2 && (true) >/dev/null { : } else { ${SHIP} }`);
+  denies('R16-F2: until C && (true) {fd}>/dev/null { push; break; }', `until cd /work/other2 && (true) {fd}>/dev/null { ${SHIP}; break; }`);
+  denies('R16-F2: until C && ( ) { push; break; }', `until cd /work/other2 && ( ) { ${SHIP}; break; }`);
+});
+
+test('#352 R16-F4: a zsh `} else {` or a brace body the parser does not open is not followed, so its } cannot close an outer function or group', () => {
+  denies('R16-F4: f() { if (true) { :; } else { :; }; switch; : }; push', `f() { if (true) { :; } else { :; }; ${RESET}; : }; ${SHIP}`);
+  denies('R16-F4: false && { if (true) { :; } else { :; }; switch; : }; push', `false && { if (true) { :; } else { :; }; ${RESET}; : }; ${SHIP}`);
+  denies('R16-F4: f() { repeat 1 { :; }; switch; : }; push', `f() { repeat 1 { :; }; ${RESET}; : }; ${SHIP}`);
+  denies('R16-F4: f() { for x in a b { :; }; switch; : }; push', `f() { for x in a b { :; }; ${RESET}; : }; ${SHIP}`);
+  denies('repeat 1 { switch; }; push', `repeat 1 { ${RESET}; }; ${SHIP}`);
+  denies('for x in a b { switch; }; push', `for x in a b { ${RESET}; }; ${SHIP}`);
+});
+
+test('#352 R16-#432: a [[ ]] ending a zsh condition followed by a brace body is not followed', () => {
+  denies('until C && [[ ]] { push }', `until cd /work/other2 && [[ -n x ]] { ${SHIP} }`);
+  denies('if C && [[ ]] { : } else { push }', `if cd /work/other2 && [[ -n x ]] { : } else { ${SHIP} }`);
+  denies('until C && [[ ]] { push; break; }', `until cd /work/other2 && [[ -n x ]] { ${SHIP}; break; }`);
+  denies('while C && (( 1 )) short body', `while cd /work/other2 && ((1)) ${SHIP}`);
+  // a condition-then-body form is not followed (R16): these became refusals under the rule
+  denies('cd d && until (false) { push; break; } (condition-then-body)', `cd /work/other2 && until (false) { ${SHIP}; break; }`);
+  denies('cd d && if (true) { push } (condition-then-body)', `cd /work/other2 && if (true) { ${SHIP} }`);
+  denies('cd d && if (true) echo hi && push (condition-then-body)', `cd /work/other2 && if (true) echo hi && ${SHIP}`);
+  // lines that use no condition-then-body form keep their verdict
+  allows('twin: cd d && (npm test) && push', `cd /work/other2 && (npm test) && ${SHIP}`);
+  allows('twin: if [ -f x ]; then cd d; fi; push', `if [ -f x ]; then cd /work/other2; fi; ${SHIP}`);
+  allows('twin: cd d && if (true); then echo hi; fi && push', `cd /work/other2 && if (true); then echo hi; fi && ${SHIP}`);
+  allows('twin: cd d && if [[ -n x ]]; then echo hi; fi && push', `cd /work/other2 && if [[ -n x ]]; then echo hi; fi && ${SHIP}`);
+  allows('twin: cd d && () { push; } (anonymous function)', `cd /work/other2 && () { ${SHIP}; }`);
+  allows('twin: cd d && if ((1)); then :; fi && push', `cd /work/other2 && if ((1)); then :; fi && ${SHIP}`);
+});
