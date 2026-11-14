@@ -619,7 +619,7 @@ post the review-complete comment (and remove awaiting-review) once the review is
 
 ```
 pipeline review-complete --pr N [--repo DIR]   -> exit 0 {ok:true, posted|reused, comment:{id, url}, review, removed, recheck, recheckError?, warnings?}; exit 1 {ok:false, reason} when the review is not valid
-  the trusted default branch (GitHub's default) as origin/<branch> (and the remote's own default branch when that is another one: the trusted fork point of the model and lanes) is fetched first (best effort: offline keeps the cached ref, and a coverage refusal then says it could not be refreshed), so a PR updated
+  the trusted default branch (GitHub's default) as origin/<branch> is fetched first (best effort: offline keeps the cached ref, and a coverage refusal then says it could not be refreshed), so a PR updated
   from its base branch and pulled is judged against the main that was merged in
   after the validity checks it also refuses (exit 1) while a Claude-ruled follow-up has no issue or a fix made outside the file the finding names is not yet
   confirmed by a later round, and (exit 1 {error:closing-keywords}) a PR body that lists several issues after one closing keyword ("Closes #1, #2" closes only #1),
