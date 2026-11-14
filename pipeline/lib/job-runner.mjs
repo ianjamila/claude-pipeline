@@ -2,7 +2,10 @@
 // so a long command is started through this wrapper instead: it outlives its starter, sends the
 // command's stdout+stderr to <jobDir>/log (stdout also, whole, to <jobDir>/stdout, capped at 4 MiB), and leaves
 // exit.json behind when the command ends. exit.json is written only AFTER the stdout capture is flushed, so a job
-// that reads as done always has its complete output. Usage: node job-runner.mjs <jobDir> <command>
+// that reads as done has its complete output, with one exception: a process the command left holding stdout open past the
+// drain deadline (DRAIN_GRACE_MS) is cut off from the CAPTURE only, and exit.json says so (drainTimedOut: true). The pipe
+// itself is never closed on it: the runner lingers as a drainer and keeps copying that process's lines to the log until the
+// pipe closes, so a background process the command left running is never SIGPIPE'd. Usage: node job-runner.mjs <jobDir> <command>
 import { spawn } from 'node:child_process';
 import { openSync, closeSync, writeSync, readFileSync, writeFileSync, renameSync } from 'node:fs';
 import { STDOUT_CAP_BYTES, STDOUT_FILE } from './job-output.mjs';
@@ -23,6 +26,7 @@ let outFd = null;
 let outBytes = 0;
 let outputTruncated = false;
 let outputCaptured = false;
+let drainTimedOut = false;
 let finished = false;
 let child = null;
 
@@ -30,7 +34,12 @@ let child = null;
 // handled once main() returns (when child is set), never the default action that kills this runner on the spot: that
 // left no exit.json (the job read as lost) and the command running on as an orphan, the moment child.json appeared.
 for (const sig of ['SIGTERM', 'SIGINT', 'SIGHUP']) {
-  process.on(sig, () => { if (!finished && child) child.kill(sig); });
+  process.on(sig, () => {
+    if (!finished) { if (child) child.kill(sig); return; }
+    // Done already, only draining a leftover process's output: a signal ends the drainer.
+    closeLog();
+    process.exit(0);
+  });
 }
 
 function note(message) {
@@ -40,20 +49,25 @@ function note(message) {
   } catch { /* nowhere left to report to */ }
 }
 
-// exit.json is written once; whichever of 'exit' / 'error' fires first wins.
-function finish(code, signal) {
+function closeLog() {
+  if (logFd === null) return;
+  try { closeSync(logFd); } catch { /* ignore */ }
+  logFd = null;
+}
+
+// exit.json is written once; whichever of 'exit' / 'error' fires first wins. The stdout pipe is left alone: when it is still open
+// (the drain deadline) it keeps feeding the log until it closes; the log is closed then, not here.
+function finish(code, signal, { deadline = false } = {}) {
   if (finished) return;
   finished = true;
-  try { child?.stdout?.destroy(); } catch { /* ignore */ }
+  drainTimedOut = deadline;
   if (outFd !== null) {
     try { closeSync(outFd); } catch { /* ignore */ }
     outFd = null;
   }
-  const capture = outputCaptured ? { outputBytes: outBytes, outputTruncated } : {};
+  const capture = outputCaptured ? { outputBytes: outBytes, outputTruncated, ...(drainTimedOut ? { drainTimedOut: true } : {}) } : {};
   writeJsonAtomic(path.join(jobDir, 'exit.json'), { code, signal, finishedAt: new Date().toISOString(), ...capture });
-  if (logFd !== null) {
-    try { closeSync(logFd); } catch { /* ignore */ }
-  }
+  if (child?.stdout === null || child?.stdout === undefined || child.stdout.destroyed) closeLog();
 }
 
 function main() {
@@ -77,7 +91,7 @@ function main() {
 
   let exited = null;
   let drained = false;
-  const settle = () => { if (exited && !finished) finish(exited.code, exited.signal); };
+  const settle = (deadline = false) => { if (exited && !finished) finish(exited.code, exited.signal, { deadline }); };
   child.stdout.on('data', (chunk) => {
     try { writeSync(logFd, chunk); } catch { /* the log is a convenience */ }
     const room = STDOUT_CAP_BYTES - outBytes;
@@ -88,8 +102,9 @@ function main() {
     }
   });
   // 'close' fires once the pipe is drained: only then is the capture complete. A grandchild that inherited the pipe can keep it
-  // open after the command exits, so after 'exit' the drain is waited for only briefly.
-  child.stdout.on('close', () => { drained = true; settle(); });
+  // open after the command exits, so after 'exit' the drain is waited for only briefly; at the deadline the capture is closed and
+  // flagged drainTimedOut, and the pipe stays open (and keeps being copied to the log) until its last writer is gone.
+  child.stdout.on('close', () => { drained = true; settle(); if (finished) closeLog(); });
 
   child.on('error', (err) => {
     note(`failed to start command: ${err.message}`);
@@ -98,7 +113,7 @@ function main() {
   child.on('exit', (code, signal) => {
     exited = { code, signal };
     if (drained) settle();
-    else setTimeout(settle, DRAIN_GRACE_MS);
+    else setTimeout(() => settle(true), DRAIN_GRACE_MS);
   });
 
   if (child.pid) {

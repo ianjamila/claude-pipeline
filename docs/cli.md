@@ -365,7 +365,7 @@ pipeline job wait  [--repo DIR] [--run-id ID] NAME [--timeout SEC]   (default 54
 pipeline job wait  [--repo DIR] [--run-id ID] --until-done [--max-minutes M] NAME   (M default 60, max 120) -> same shape; BACKGROUND ONLY (Bash run_in_background): a foreground call is killed at 600 s,
   which ends only the wait (the job keeps running; wait again to pick it up). Without --until-done the 570 s cap above applies. Still running after M minutes -> state "running", exit 0
 pipeline job read  [--repo DIR] [--run-id ID] [--full] NAME   -> same shape, without waiting
-  --full (read, wait): a finished job also returns {output, outputTruncated}: the command's whole stdout (first 4 MiB); output is null for a job an older runner started
+  --full (read, wait): a finished job also returns {output, outputTruncated, drainTimedOut?}: the command's whole stdout (first 4 MiB); output is null for a job an older runner started; drainTimedOut:true = a process the command left running still held stdout open 3 s after it exited (its later lines are in the log only; it keeps logging)
   --run-id ID: the runId start returned; if the job name was started again since, state is "replaced" ({ok:false}, exit 1)
   exit 0: running, or done with exit code 0 · exit 1: done non-zero, lost, replaced, refused, name already running · exit 2: no such job / usage
   CMD is the argument list after "--"; arguments with spaces, quotes or shell metacharacters are quoted for the shell

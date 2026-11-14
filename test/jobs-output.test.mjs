@@ -96,6 +96,35 @@ test('a command that exits while a grandchild still holds stdout open does not h
   assert.ok(Date.now() - t0 < 7000);
 });
 
+test('a process the command leaves logging past the drain deadline keeps logging; the capture is flagged drainTimedOut, not outputTruncated', { skip: process.platform === 'win32' }, async (t) => {
+  const cwd = scratch(t);
+  const pidFile = join(cwd, 'loop.pid');
+  t.after(() => {
+    try { process.kill(Number(readFileSync(pidFile, 'utf8').trim()), 'SIGKILL'); } catch { /* already gone */ }
+  });
+  start('tick', `sh -c 'echo ready; (while :; do echo tick; sleep 1; done) & echo $! > ${pidFile}; exit 0'`, { cwd });
+  const r = await waitJob('tick', { cwd, timeoutMs: 20_000, full: true, ...FAST });
+  assert.equal(r.state, 'done');
+  assert.match(r.output, /^ready\n/);
+  assert.equal(r.outputTruncated, false);
+  assert.equal(r.drainTimedOut, true);
+  const exit = JSON.parse(readFileSync(join(jobDirOf(cwd, 'tick'), 'exit.json'), 'utf8'));
+  assert.equal(exit.drainTimedOut, true);
+  assert.equal(exit.outputTruncated, false);
+  const ticks = () => (readFileSync(join(jobDirOf(cwd, 'tick'), 'log'), 'utf8').match(/tick/g) ?? []).length;
+  const before = ticks();
+  await new Promise((resolve) => setTimeout(resolve, 2600));
+  assert.ok(ticks() > before, 'the leftover process must still be logging after the job read done');
+  process.kill(Number(readFileSync(pidFile, 'utf8').trim()), 0); // not killed by SIGPIPE
+});
+
+test('a normal job carries no drainTimedOut marker', async (t) => {
+  const cwd = scratch(t);
+  start('plain2', node("console.log('x')"), { cwd });
+  const r = await waitJob('plain2', { cwd, timeoutMs: 15_000, full: true, ...FAST });
+  assert.equal('drainTimedOut' in r, false);
+});
+
 function cliSync(cwd, args) {
   const r = spawnSync(process.execPath, [bin, ...args], { cwd, encoding: 'utf8', env: ENV });
   let json = null;

@@ -223,12 +223,13 @@ function exitCodeOf({ code, signal }) {
   return num ? 128 + num : 1; // killed by a signal: report it the way a shell does
 }
 
-// The captured stdout of a finished job: { output: string, outputTruncated } or { output: null } when this run has none (an older runner).
+// The captured stdout of a finished job: { output: string, outputTruncated, drainTimedOut? } or { output: null } when this run has none (an older runner).
+// drainTimedOut: a process the command left running still held stdout open when the runner's drain deadline passed, so later output is in the log only.
 function fullOutput(jobDir, exit) {
   if (!Number.isInteger(exit.outputBytes)) return { output: null, outputTruncated: false };
   try {
     const buf = readFileSync(path.join(jobDir, STDOUT_FILE));
-    return { output: buf.subarray(0, STDOUT_CAP_BYTES).toString('utf8'), outputTruncated: exit.outputTruncated === true };
+    return { output: buf.subarray(0, STDOUT_CAP_BYTES).toString('utf8'), outputTruncated: exit.outputTruncated === true, ...(exit.drainTimedOut === true ? { drainTimedOut: true } : {}) };
   } catch {
     return { output: null, outputTruncated: false };
   }
