@@ -214,3 +214,22 @@ test('strictestRouteConfig: a mismatch with an anchored (genuine) base config ta
   const plain = strictestRouteConfig(wt, { ok: false, reason: 'untrusted' });
   assert.equal(plain.codexModel, DEFAULTS.review.codex_model);
 });
+
+test('strictestRouteConfig names where each lane and the model came from (#445): working tree on a tie, the fork point, the anchored fork point, or the built-in lane', () => {
+  const cfg = (effort, model) => ({ review: { effort: { small_fix_lines: 40, ...effort }, codex_round_budget: 6, codex_budget: { soft: 75, hard: 90 }, substitute: { mode: 'auto', min_wait_minutes: 0, max_packet_mb: 8 }, codex_model: model } });
+  const wt = cfg({ low: 'xhigh', medium: 'low', high: 'high', followup: 'medium', small_fix: 'low' }, 'wt-model');
+  const base = cfg({ low: 'medium', medium: 'high', high: 'high', followup: 'high', small_fix: 'low' }, 'base-model');
+  const both = strictestRouteConfig(wt, { ok: true, config: base });
+  assert.deepEqual(both.effortFrom, { low: 'working-tree', medium: 'fork-point', high: 'working-tree', followup: 'fork-point', small_fix: 'working-tree' });
+  assert.equal(both.codexModelFrom, 'fork-point');
+  const unreadable = strictestRouteConfig(wt, { ok: false, reason: 'x' });
+  assert.deepEqual(unreadable.effortFrom, { low: 'working-tree', medium: 'built-in', high: 'working-tree', followup: 'working-tree', small_fix: 'working-tree' });
+  assert.equal(unreadable.codexModelFrom, 'built-in');
+  // a trusted anchor with another default_branch name: the anchored config's lanes and model win where they are higher, and say so
+  const anchored = strictestRouteConfig(wt, { ok: false, reason: 'default_branch differs', anchoredConfig: cfg({ low: 'low', medium: 'xhigh', high: 'low', followup: 'low', small_fix: 'low' }, 'anchor-model') });
+  assert.equal(anchored.codexModel, 'anchor-model');
+  assert.equal(anchored.codexModelFrom, 'anchored-fork-point');
+  assert.equal(anchored.effort.medium, 'xhigh');
+  assert.equal(anchored.effortFrom.medium, 'anchored-fork-point');
+  assert.equal(anchored.effortFrom.low, 'working-tree');
+});
