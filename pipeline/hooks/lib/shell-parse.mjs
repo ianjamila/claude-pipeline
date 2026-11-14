@@ -2361,12 +2361,15 @@ class Parser {
     this.subAcc = [];
     const base = this.ctlBase;
     this.ctlBase = this.ctlStack.length;
+    const dblOuter = this.dblOpen; // (a nested level's [[ ]] cannot clear or set the outer one: #352 R18-F2)
+    this.dblOpen = false;
     const outerOp = this.lexOp;
     try { this.lex(depth, stopAtParen, noRedir); } finally {
       this.lexOp = outerOp;
       ctx.nest--; this.subAcc = saved;
       while (this.ctlStack.length > this.ctlBase) this.popCtl(); // (left open: ends with the level)
       this.ctlBase = base;
+      this.dblOpen = dblOuter;
     }
   }
 
@@ -2525,6 +2528,15 @@ class Parser {
       }
       const top = cs[cs.length - 1];
       const cmdPos = seg.kwOnly !== false; // every word before this one is an unquoted keyword or `{` (kept as it goes: a rescan per word is quadratic)
+      // (#352 R18: independent of how the R16 watch was armed: a plain word after the unquoted `]]` that closes a [[ ]] command (a `[[` in command position of this segment, or the `]]` itself in command position
+      // because a ( ) / && inside the [[ ]] split the segment) is zsh's short-form body, in the argv of `]]`, no command of its own. The whole line is refused. Not words here: then / do / else / elif / fi / done /
+      // esac / { / }, a `{fd}` redirect; `echo ]] x` (no [[ ]] command) is no condition end)
+      if (seg.afterDbl === true) {
+        seg.afterDbl = false;
+        if (!(q < 0 && (text === '{' || text === 'do' || text === 'elif' || AFTER_PAREN_RESERVED.has(text) || (/^\{[A-Za-z_]\w*\}$/.test(text) && /[<>]/.test(s[this.i] ?? ''))))) ctx.truncated = true;
+      }
+      if (q < 0 && text === ']]' && (cmdPos || seg.dblSeen === true)) seg.afterDbl = true;
+      if (q < 0 && text === '[[' && cmdPos) seg.dblSeen = true;
       if (cmdPos && q < 0 && text === '!') seg.negLead = true; // (R9-F3: a `!` in front: the command, group, pipeline or construct that follows is negated)
       // (`time` and its options before a compound command: `time if ...; fi` -- review of #50)
       // (#352 R17-F3: `repeat N BODY`: the body is in the argv of `repeat`, no command of its own; the line is refused (truncated). R17-F2: a bare { or } word that is no command is the brace group or body of a zsh
